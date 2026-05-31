@@ -28,7 +28,7 @@ def main():
     max_input_len = 1024                    # 输入最长长度，后面会随机采样，prefill
     max_ouput_len = 1024                    # 输出最长长度，后面会随机采样，decode
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")  
+    path = os.path.expanduser(os.environ.get("MODEL_PATH", "~/models/Qwen3-0.6B/"))
     llm = LLM(path, enforce_eager=False, max_model_len=4096)    # 初始化推理引擎，enforce_eager：允许走更偏性能优化的执行路径，max_model_len：允许的最大上下文窗口
                                                                 # max_model_len 比较重要，会影响 KV cache，显存调用，调度空间，顾此失彼
 

@@ -197,3 +197,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local project memory and raw experiment artifacts
+.agent/
+experiment-data/

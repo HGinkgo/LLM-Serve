@@ -36,9 +36,39 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.request_metrics = {}
+        self.last_step_events = {}
+        self._exited = False
         atexit.register(self.exit)
 
+    @staticmethod
+    def _percentile(values: list[float], percentile: float):
+        if not values:
+            return None
+        values = sorted(values)
+        if len(values) == 1:
+            return values[0]
+        rank = (len(values) - 1) * percentile / 100
+        low = int(rank)
+        high = min(low + 1, len(values) - 1)
+        weight = rank - low
+        return values[low] * (1 - weight) + values[high] * weight
+
+    @classmethod
+    def _summary(cls, values: list[float]):
+        if not values:
+            return {"mean": None, "p50": None, "p99": None, "max": None}
+        return {
+            "mean": sum(values) / len(values),
+            "p50": cls._percentile(values, 50),
+            "p99": cls._percentile(values, 99),
+            "max": max(values),
+        }
+
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -49,15 +79,147 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        now = perf_counter()
+        self.request_metrics[seq.seq_id] = {
+            "seq_id": seq.seq_id,
+            "arrival_time": now,
+            "first_token_time": None,
+            "token_times": [],
+            "finish_time": None,
+            "prompt_tokens": len(prompt),
+            "output_tokens": 0,
+            "success": False,
+            "failure_reason": None,
+        }
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
+        step_start = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        before_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        step_end = perf_counter()
+
+        first_token_seq_ids = []
+        decode_seq_ids = []
+        finished_seq_ids = []
+        for seq in seqs:
+            metric = self.request_metrics.get(seq.seq_id)
+            if metric is None:
+                continue
+            before = before_completion_tokens[seq.seq_id]
+            after = seq.num_completion_tokens
+            if after > before:
+                if metric["first_token_time"] is None:
+                    metric["first_token_time"] = step_end
+                    first_token_seq_ids.append(seq.seq_id)
+                decode_seq_ids.append(seq.seq_id)
+                metric["token_times"].extend([step_end] * (after - before))
+                metric["output_tokens"] = after
+            if seq.is_finished and metric["finish_time"] is None:
+                metric["finish_time"] = step_end
+                metric["success"] = True
+                finished_seq_ids.append(seq.seq_id)
+
+        self.last_step_events = {
+            "step_start": step_start,
+            "step_end": step_end,
+            "is_prefill": is_prefill,
+            "num_tokens": num_tokens,
+            "scheduled_seq_ids": [seq.seq_id for seq in seqs],
+            "first_token_seq_ids": first_token_seq_ids,
+            "decode_seq_ids": decode_seq_ids,
+            "finished_seq_ids": finished_seq_ids,
+        }
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
+
+    def get_metrics(self):
+        now = perf_counter()
+        requests = []
+        ttfts = []
+        itls = []
+        request_latencies = []
+        tpots = []
+        arrival_times = []
+        finish_or_now_times = []
+        total_output_tokens = 0
+
+        for metric in self.request_metrics.values():
+            arrival_time = metric["arrival_time"]
+            first_token_time = metric["first_token_time"]
+            token_times = metric["token_times"]
+            finish_time = metric["finish_time"]
+            output_tokens = metric["output_tokens"]
+            success = metric["success"]
+            failure_reason = metric["failure_reason"]
+
+            arrival_times.append(arrival_time)
+            finish_or_now_times.append(finish_time if finish_time is not None else now)
+            total_output_tokens += output_tokens
+
+            ttft = None
+            if first_token_time is not None:
+                ttft = first_token_time - arrival_time
+                ttfts.append(ttft)
+
+            request_itls = [
+                token_times[i] - token_times[i - 1]
+                for i in range(1, len(token_times))
+            ]
+            itls.extend(request_itls)
+
+            latency = None
+            if finish_time is not None:
+                latency = finish_time - arrival_time
+                request_latencies.append(latency)
+                if output_tokens > 1 and first_token_time is not None:
+                    tpot = (finish_time - first_token_time) / (output_tokens - 1)
+                    tpots.append(tpot)
+                elif output_tokens == 1:
+                    tpots.append(0.0)
+            elif not success:
+                failure_reason = failure_reason or "unfinished"
+
+            requests.append({
+                "seq_id": metric["seq_id"],
+                "prompt_tokens": metric["prompt_tokens"],
+                "output_tokens": output_tokens,
+                "success": success,
+                "failure_reason": None if success else failure_reason,
+                "arrival_time": arrival_time,
+                "first_token_time": first_token_time,
+                "token_times": token_times,
+                "finish_time": finish_time,
+                "ttft": ttft,
+                "itl": request_itls,
+                "latency": latency,
+            })
+
+        wall_time = 0.0
+        if arrival_times:
+            wall_time = max(finish_or_now_times) - min(arrival_times)
+
+        num_requests = len(requests)
+        num_finished = sum(1 for request in requests if request["success"])
+        return {
+            "summary": {
+                "num_requests": num_requests,
+                "num_finished": num_finished,
+                "num_failed": num_requests - num_finished,
+                "total_output_tokens": total_output_tokens,
+                "wall_time": wall_time,
+                "throughput": total_output_tokens / wall_time if wall_time > 0 else 0.0,
+                "ttft": self._summary(ttfts),
+                "itl": self._summary(itls),
+                "tpot": self._summary(tpots),
+                "request_latency": self._summary(request_latencies),
+            },
+            "requests": sorted(requests, key=lambda request: request["seq_id"]),
+        }
 
     def is_finished(self):
         return self.scheduler.is_finished()
