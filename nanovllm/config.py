@@ -12,6 +12,10 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    # ===== 2026-06-07 chunked prefill =====
+    # Stage 2 的实验调度开关；默认关闭，保留原始 baseline 行为。
+    enable_chunked_prefill: bool = False
+    # ===== 2026-06-07 chunked prefill =====
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

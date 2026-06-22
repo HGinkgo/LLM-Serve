@@ -97,10 +97,21 @@ class LLMEngine:
     def step(self):
         step_start = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # ===== 2026-06-07 chunked prefill =====
+        num_tokens = sum(max(seq.num_scheduled_tokens, 0) for seq in seqs) if is_prefill else -len(seqs)
+        # ===== 2026-06-07 chunked prefill =====
         before_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # ===== 2026-06-07 chunked prefill =====
+        num_prefill_seqs = self.scheduler.last_num_prefill_seqs if is_prefill else 0
+        # mixed chunked-prefill 输出顺序是 [prefill..., decode...]。
+        # 分段调用 postprocess，可以复用原有 prefill/decode 处理语义。
+        if is_prefill and 0 < num_prefill_seqs < len(seqs):
+            self.scheduler.postprocess(seqs[:num_prefill_seqs], token_ids[:num_prefill_seqs], True)
+            self.scheduler.postprocess(seqs[num_prefill_seqs:], token_ids[num_prefill_seqs:], False)
+        else:
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # ===== 2026-06-07 chunked prefill =====
         step_end = perf_counter()
 
         first_token_seq_ids = []
@@ -144,8 +155,8 @@ class LLMEngine:
         itls = []
         request_latencies = []
         tpots = []
-        arrival_times = []
-        finish_or_now_times = []
+        wall_start = None
+        wall_end = None
         total_output_tokens = 0
 
         for metric in self.request_metrics.values():
@@ -157,8 +168,9 @@ class LLMEngine:
             success = metric["success"]
             failure_reason = metric["failure_reason"]
 
-            arrival_times.append(arrival_time)
-            finish_or_now_times.append(finish_time if finish_time is not None else now)
+            wall_start = arrival_time if wall_start is None else min(wall_start, arrival_time)
+            finish_or_now_time = finish_time if finish_time is not None else now
+            wall_end = finish_or_now_time if wall_end is None else max(wall_end, finish_or_now_time)
             total_output_tokens += output_tokens
 
             ttft = None
@@ -200,8 +212,8 @@ class LLMEngine:
             })
 
         wall_time = 0.0
-        if arrival_times:
-            wall_time = max(finish_or_now_times) - min(arrival_times)
+        if wall_start is not None and wall_end is not None:
+            wall_time = wall_end - wall_start
 
         num_requests = len(requests)
         num_finished = sum(1 for request in requests if request["success"])

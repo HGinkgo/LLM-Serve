@@ -140,11 +140,16 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
+            # ===== 2026-06-07 chunked prefill =====
+            # mixed batch 里 decode 请求按 1-token prefill 处理，
+            # 这样 attention 可以走 flash_attn_varlen_func + block_table。
+            is_decode = seq.num_scheduled_tokens < 0
             seqlen = len(seq)
-            start = min(seq.num_cached_tokens, seqlen - 1)
-            seqlen_q = seq.num_scheduled_tokens
-            seqlen_k = seqlen
+            start = seqlen - 1 if is_decode else min(seq.num_cached_tokens, seqlen - 1)
+            seqlen_q = 1 if is_decode else seq.num_scheduled_tokens
             end = start + seqlen_q
+            seqlen_k = end
+            # ===== 2026-06-07 chunked prefill =====
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)

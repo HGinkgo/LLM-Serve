@@ -1,8 +1,8 @@
 """
-Serving benchmark for nano-vllm-runtime.
+Serving benchmark for ThrustLM.
 
-This benchmark records request-level serving metrics. It does not change
-scheduler, model runner, attention, or kernel behavior.
+This benchmark records request-level serving metrics. It preserves baseline
+runtime behavior by default and can enable experimental features via flags.
 """
 
 import argparse
@@ -16,7 +16,7 @@ from nanovllm import LLM, SamplingParams
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Request-level serving benchmark for nano-vllm-runtime")
+    parser = argparse.ArgumentParser(description="Request-level serving benchmark for ThrustLM")
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH", "~/models/Qwen3-0.6B/"))
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--input-len", type=int, default=256)
@@ -24,6 +24,10 @@ def parse_args():
     parser.add_argument("--arrival", choices=["all", "poisson"], default="all")
     parser.add_argument("--request-rate", type=float, default=4.0, help="Requests per second for poisson arrival")
     parser.add_argument("--enforce-eager", action="store_true")
+    # ===== 2026-06-07 chunked prefill =====
+    # 默认关闭，方便同一个脚本做 baseline / chunked prefill A/B。
+    parser.add_argument("--enable-chunked-prefill", action="store_true")
+    # ===== 2026-06-07 chunked prefill =====
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -106,6 +110,9 @@ def run_benchmark(args):
     engine = LLM(
         model_path,
         enforce_eager=args.enforce_eager,
+        # ===== 2026-06-07 chunked prefill =====
+        enable_chunked_prefill=args.enable_chunked_prefill,
+        # ===== 2026-06-07 chunked prefill =====
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
     )
@@ -137,6 +144,9 @@ def run_benchmark(args):
             "arrival": args.arrival,
             "request_rate": args.request_rate if args.arrival == "poisson" else None,
             "enforce_eager": args.enforce_eager,
+            # ===== 2026-06-07 chunked prefill =====
+            "enable_chunked_prefill": args.enable_chunked_prefill,
+            # ===== 2026-06-07 chunked prefill =====
             "max_model_len": args.max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "temperature": args.temperature,

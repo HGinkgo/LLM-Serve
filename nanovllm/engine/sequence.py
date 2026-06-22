@@ -44,6 +44,21 @@ class Sequence:
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
 
+    # ===== 2026-06-07 chunked prefill =====
+    # chunked prefill 直接复用已有的 KV cache 进度计数，避免新增一套状态。
+    @property
+    def num_computed_tokens(self):
+        return self.num_cached_tokens
+
+    @property
+    def is_prefilling(self):
+        return self.num_cached_tokens < self.num_tokens
+
+    @property
+    def num_uncomputed_tokens(self):
+        return max(self.num_tokens - self.num_cached_tokens, 0)
+    # ===== 2026-06-07 chunked prefill =====
+
     @property
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens

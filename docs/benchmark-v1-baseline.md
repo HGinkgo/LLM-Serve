@@ -4,7 +4,7 @@ Date: 2026-05-31
 
 ## Goal
 
-Add online serving observability to `nano-vllm-runtime` without changing scheduler, model runner, attention, or kernel logic.
+Add online serving observability to `ThrustLM` without changing scheduler, model runner, attention, or kernel logic.
 
 ## Scope
 
