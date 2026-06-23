@@ -66,15 +66,9 @@ python bench_serving.py \
   --enable-chunked-prefill
 ```
 
-Benchmark documentation:
-
-- `docs/benchmark-v1-baseline.md`
-- `docs/chunked-prefill-stage2.md`
-- `docs/env-3090-ubuntu22.md`
-
 ## Notes
 
-- Raw local experiment artifacts are kept under `experiment-data/` and are not committed.
+- Local benchmark notes and raw experiment artifacts are kept outside the public repo.
 - Agent/project memory is kept under `.agent/` and is not committed.
 - Some historical commands still use the local conda environment name `nano-vllm`; that is just the environment label, not the project/package name.
 - The codebase retains the original MIT license.

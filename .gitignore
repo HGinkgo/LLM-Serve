@@ -198,6 +198,12 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local-only project materials
+.agent/
+experiment-data/
+docs/
+roadmap.md
+
 # Local project memory and raw experiment artifacts
 .agent/
 experiment-data/
