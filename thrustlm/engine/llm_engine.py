@@ -9,11 +9,11 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer                  # prompt 编码，输出 token 编码
 import torch.multiprocessing as mp
 
-from nanovllm.config import Config
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from thrustlm.config import Config
+from thrustlm.sampling_params import SamplingParams
+from thrustlm.engine.sequence import Sequence
+from thrustlm.engine.scheduler import Scheduler
+from thrustlm.engine.model_runner import ModelRunner
 
 
 class LLMEngine:

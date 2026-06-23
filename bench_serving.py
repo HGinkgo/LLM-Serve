@@ -12,7 +12,7 @@ import time
 from collections import deque
 from random import Random
 
-from nanovllm import LLM, SamplingParams
+from thrustlm import LLM, SamplingParams
 
 
 def parse_args():
