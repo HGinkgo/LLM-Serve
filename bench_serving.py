@@ -166,6 +166,28 @@ def print_summary(result):
         print(f"draft/step:     {format_float(speculative.get('draft_tokens_per_step'))}")
         print(f"accept-all:     {speculative['accept_all_count']}")
         print()
+        timing = speculative.get("timing") or {}
+        if timing:
+            print("Speculative Timing (ms)")
+            print("-----------------------")
+            for name, label in [
+                ("target_decode_time", "target decode"),
+                ("draft_proposal_time", "draft proposal"),
+                ("target_verify_time", "target verify"),
+                ("accept_time", "accept/reject"),
+                ("kv_update_time", "kv update"),
+                ("trace_time", "trace"),
+                ("total_time", "total"),
+            ]:
+                stats = timing.get(name)
+                if not stats:
+                    continue
+                print(
+                    f"{label:<16} "
+                    f"total={format_ms(stats['total']):>10} "
+                    f"mean={format_ms(stats['mean']):>10}"
+                )
+            print()
 
 
 def run_benchmark(args):

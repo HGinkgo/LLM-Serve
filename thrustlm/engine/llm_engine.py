@@ -96,6 +96,7 @@ class LLMEngine:
             "speculative_emitted_tokens": 0,
             "speculative_accept_all_count": 0,
             "speculative_trace": [],
+            "speculative_timing": {},
         }
         self.scheduler.add(seq)
         return seq.seq_id
@@ -124,6 +125,24 @@ class LLMEngine:
             if key in debug:
                 entry[key] = debug[key]
         return entry
+
+    @staticmethod
+    def _accumulate_speculative_timing(metric: dict, timing: dict | None):
+        if not timing:
+            return
+        bucket = metric.setdefault("speculative_timing", {})
+        for name, value in timing.items():
+            bucket[name] = bucket.get(name, 0.0) + float(value)
+
+    @staticmethod
+    def _summarize_speculative_timing(timing: dict, steps: int):
+        return {
+            name: {
+                "total": value,
+                "mean": value / steps if steps > 0 else None,
+            }
+            for name, value in sorted(timing.items())
+        }
 
     def step(self):
         step_start = perf_counter()
@@ -161,6 +180,7 @@ class LLMEngine:
                     metric["speculative_accepted_tokens"] += speculative_output.num_accepted
                     metric["speculative_emitted_tokens"] += emitted_tokens
                     metric["speculative_accept_all_count"] += int(speculative_output.accepted_all)
+                    self._accumulate_speculative_timing(metric, speculative_output.timing)
                     if speculative_output.debug is not None:
                         metric.setdefault("speculative_trace", []).append(
                             self._build_speculative_trace_entry(
@@ -274,6 +294,7 @@ class LLMEngine:
         total_speculative_accepted_tokens = 0
         total_speculative_emitted_tokens = 0
         total_speculative_accept_all_count = 0
+        total_speculative_timing = {}
 
         for metric in self.request_metrics.values():
             arrival_time = metric["arrival_time"]
@@ -289,6 +310,7 @@ class LLMEngine:
             speculative_emitted_tokens = metric.get("speculative_emitted_tokens", 0)
             speculative_accept_all_count = metric.get("speculative_accept_all_count", 0)
             speculative_trace = metric.get("speculative_trace", [])
+            speculative_timing = metric.get("speculative_timing", {})
 
             wall_start = arrival_time if wall_start is None else min(wall_start, arrival_time)
             finish_or_now_time = finish_time if finish_time is not None else now
@@ -299,6 +321,8 @@ class LLMEngine:
             total_speculative_accepted_tokens += speculative_accepted_tokens
             total_speculative_emitted_tokens += speculative_emitted_tokens
             total_speculative_accept_all_count += speculative_accept_all_count
+            for name, value in speculative_timing.items():
+                total_speculative_timing[name] = total_speculative_timing.get(name, 0.0) + value
 
             ttft = None
             if first_token_time is not None:
@@ -342,6 +366,7 @@ class LLMEngine:
                 "speculative_emitted_tokens": speculative_emitted_tokens,
                 "speculative_accept_all_count": speculative_accept_all_count,
                 "speculative_trace": speculative_trace,
+                "speculative_timing": speculative_timing,
             })
 
         wall_time = 0.0
@@ -384,6 +409,10 @@ class LLMEngine:
                         if total_speculative_steps > 0 else None
                     ),
                     "accept_all_count": total_speculative_accept_all_count,
+                    "timing": self._summarize_speculative_timing(
+                        total_speculative_timing,
+                        total_speculative_steps,
+                    ),
                 },
             },
             "requests": sorted(requests, key=lambda request: request["seq_id"]),

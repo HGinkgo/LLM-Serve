@@ -4,6 +4,7 @@ import torch.distributed as dist
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from time import perf_counter
 
 from thrustlm.config import Config
 from thrustlm.engine.sequence import Sequence
@@ -35,6 +36,7 @@ class SpeculativeDecodeOutput:
     num_accepted: int
     accepted_all: bool
     emitted_tokens: int
+    timing: dict | None = None
     debug: dict | None = None
 
 
@@ -334,6 +336,9 @@ class ModelRunner:
     @torch.inference_mode()
     def run_speculative_single(self, seq: Sequence) -> SpeculativeDecodeOutput:
         assert self.draft_model is not None
+        total_start = perf_counter()
+        target_decode_time = 0.0
+        trace_time = 0.0
         prev_correction = getattr(self, "_prev_correction", {})
         merged = seq.seq_id in prev_correction
         if merged:
@@ -341,8 +346,10 @@ class ModelRunner:
             # 本轮复用它作为 start token，并在 verify 阶段从 len(seq)-1 覆盖该 KV 槽。
             start_token_id, start_aux_hidden = prev_correction[seq.seq_id]
         else:
+            stage_start = perf_counter()
             target_decode = self.run_target_decode_with_eagle3_aux([seq])
             reset_context()
+            target_decode_time = perf_counter() - stage_start
             start_token_id = target_decode.token_ids[0]
             start_aux_hidden = target_decode.aux_hidden.view(1, 1, -1)
         temperature = seq.temperature
@@ -355,6 +362,7 @@ class ModelRunner:
             draft_kv_len = int(target_decode.positions[-1].item()) + 1
         start_position = draft_kv_len
         accept_mode = getattr(self, "speculative_accept_mode", "greedy")
+        stage_start = perf_counter()
         draft_sequence = generate_eagle3_draft_tokens(
             self.draft_model,
             start_token_id=start_token_id,
@@ -366,12 +374,16 @@ class ModelRunner:
             kv_valid_len=draft_kv_len if draft_past_kv is not None else None,
             draft_sampling_mode="greedy" if accept_mode == "greedy" else "sample",
         )
+        draft_proposal_time = perf_counter() - stage_start
+        stage_start = perf_counter()
         verify_output = self.run_target_verify_with_eagle3_aux(
             seq,
             start_token_id,
             draft_sequence.draft_token_ids,
             base_offset=-1 if merged else 0,
         )
+        target_verify_time = perf_counter() - stage_start
+        stage_start = perf_counter()
         draft_token_ids = torch.tensor(
             draft_sequence.draft_token_ids,
             dtype=torch.long,
@@ -400,8 +412,10 @@ class ModelRunner:
             sample_result.final_token_id,
             correction_aux.detach(),
         )
+        accept_time = perf_counter() - stage_start
         debug = None
         if getattr(self, "speculative_trace", False):
+            stage_start = perf_counter()
             debug = self._build_speculative_debug(
                 accept_mode=accept_mode,
                 start_token_id=start_token_id,
@@ -412,6 +426,8 @@ class ModelRunner:
                 accepted_all=sample_result.accepted_all,
                 draft_kv_len=draft_kv_len,
             )
+            trace_time = perf_counter() - stage_start
+        stage_start = perf_counter()
         self._update_single_draft_kv(
             seq,
             draft_sequence.past_kv,
@@ -420,12 +436,23 @@ class ModelRunner:
             verify_output.target_aux_hidden,
             sample_result.num_accepted,
         )
+        kv_update_time = perf_counter() - stage_start
+        timing = {
+            "target_decode_time": target_decode_time,
+            "draft_proposal_time": draft_proposal_time,
+            "target_verify_time": target_verify_time,
+            "accept_time": accept_time,
+            "kv_update_time": kv_update_time,
+            "trace_time": trace_time,
+            "total_time": perf_counter() - total_start,
+        }
         return SpeculativeDecodeOutput(
             token_ids=token_ids,
             num_draft_tokens=len(draft_sequence.draft_token_ids),
             num_accepted=sample_result.num_accepted,
             accepted_all=sample_result.accepted_all,
             emitted_tokens=len(token_ids),
+            timing=timing,
             debug=debug,
         )
 
