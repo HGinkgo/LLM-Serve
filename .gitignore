@@ -182,8 +182,7 @@ cython_debug/
 .vscode/
 
 # Local tooling / local notes
-.codex
-=2.4.0
+.codex/
 
 # Ruff stuff:
 .ruff_cache/
@@ -203,7 +202,5 @@ cython_debug/
 experiment-data/
 docs/
 roadmap.md
-
-# Local project memory and raw experiment artifacts
-.agent/
-experiment-data/
+tests/
+check_speculative_correctness.py

@@ -172,3 +172,25 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    # ===== 2026-07-07 EAGLE speculative decoding =====
+    def postprocess_speculative(self, seq: Sequence, token_ids: list[int]):
+        remaining = max(seq.max_tokens - seq.num_completion_tokens, 0)
+        token_ids = token_ids[:remaining]
+        for token_id in token_ids:
+            seq.append_token(token_id)
+            seq.num_cached_tokens += 1
+            if not seq.ignore_eos and token_id == self.eos:
+                break
+        self.block_manager.finalize_full_blocks(seq)
+        self.block_manager.release_extra_slots(seq)
+        seq.num_scheduled_tokens = 0
+        if (
+            seq.num_completion_tokens == seq.max_tokens
+            or (not seq.ignore_eos and seq.completion_token_ids and seq.completion_token_ids[-1] == self.eos)
+        ):
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            if seq in self.running:
+                self.running.remove(seq)
+    # ===== 2026-07-07 EAGLE speculative decoding =====

@@ -16,6 +16,10 @@ class Config:
     # Stage 2 的实验调度开关；默认关闭，保留原始 baseline 行为。
     enable_chunked_prefill: bool = False
     # ===== 2026-06-07 chunked prefill =====
+    speculative_model: str | None = None
+    speculative_gamma: int = 3
+    speculative_accept_mode: str = "greedy"
+    speculative_trace: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -25,5 +29,9 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.speculative_gamma > 0
+        assert self.speculative_accept_mode in {"greedy", "rejection"}
+        if self.speculative_model is not None:
+            assert os.path.isdir(self.speculative_model)
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

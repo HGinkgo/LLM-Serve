@@ -1,6 +1,10 @@
 # ThrustLM
 
-ThrustLM is a single-GPU LLM inference engine built from the ground up for understanding how high-throughput serving works under the hood. It implements paged KV cache management, continuous batching, chunked prefill, and serving-oriented benchmarking from scratch. The initial skeleton was informed by the vLLM PagedAttention paper and the `nano-vllm` educational codebase; all subsequent scheduler, chunked prefill, benchmark, and current speculative decoding work is being independently designed and implemented in this repository.
+English | [简体中文](README.zh-CN.md)
+
+ThrustLM is a single-GPU LLM inference engine built from the ground up for understanding how high-throughput serving works under the hood. It implements paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and an experimental EAGLE-style speculative decoding path.
+
+The initial skeleton was informed by the vLLM PagedAttention paper and the `nano-vllm` educational codebase. The scheduler changes, chunked prefill path, benchmark tooling, and speculative decoding runtime are independently designed and implemented in this repository.
 
 The repository name and Python package are aligned as `ThrustLM` / `thrustlm`.
 
@@ -10,15 +14,13 @@ The repository name and Python package are aligned as `ThrustLM` / `thrustlm`.
 - Continuous batching with an iteration-level scheduler.
 - Chunked prefill with decode-first scheduling, allowing long prompt prefill work to share iterations with active decode requests.
 - Serving benchmark tooling with request-level metrics including throughput, TTFT, ITL, TPOT, request latency, wall time, and success/failure counts.
-- Qwen3 model path for local single-GPU experiments.
+- Qwen3 model support for local single-GPU experiments.
 
-## In Development
+## Experimental
 
-- Speculative decoding with draft/target model verification.
-
-## Architecture
-
-A request enters ThrustLM through `LLMEngine`, is represented as a `Sequence`, and is admitted into the scheduler's waiting queue. The scheduler repeatedly builds iteration-level batches from waiting prefill work and running decode work. KV memory is assigned through a block-based manager, so each sequence carries a logical block table instead of owning contiguous KV storage. `ModelRunner` then prepares prefill, decode, or mixed chunked-prefill inputs, executes the model, samples the next token, and returns results to the engine. After each iteration, the scheduler updates cached-token progress, appends generated tokens, releases finished KV blocks, and the engine records request-level serving metrics.
+- EAGLE-style speculative decoding MVP with draft proposal, target verification, draft KV state, merged correction handling, and acceptance metrics.
+- Greedy/top-k style verification is the primary path for current hot-vocabulary EAGLE3 draft checkpoints.
+- Probability rejection sampling utilities are kept for algorithm study and controlled experiments, but are not the recommended path for 32K hot-vocabulary draft heads.
 
 ## Quick Start
 
@@ -66,9 +68,23 @@ python bench_serving.py \
   --enable-chunked-prefill
 ```
 
+Run the experimental EAGLE speculative path with a compatible draft checkpoint:
+
+```bash
+export SPECULATIVE_MODEL=/path/to/eagle3-draft
+
+python bench_serving.py \
+  --model "$MODEL_PATH" \
+  --speculative-model "$SPECULATIVE_MODEL" \
+  --speculative-gamma 3 \
+  --speculative-accept-mode greedy \
+  --num-requests 1 \
+  --input-len 128 \
+  --output-len 64 \
+  --arrival all \
+  --enforce-eager
+```
+
 ## Notes
 
-- Local benchmark notes and raw experiment artifacts are kept outside the public repo.
-- Agent/project memory is kept under `.agent/` and is not committed.
-- Some historical commands still use the local conda environment name `nano-vllm`; that is just the environment label, not the project/package name.
 - The codebase retains the original MIT license.

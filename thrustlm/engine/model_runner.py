@@ -1,15 +1,41 @@
 import pickle
 import torch
 import torch.distributed as dist
+from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from thrustlm.config import Config
 from thrustlm.engine.sequence import Sequence
+from thrustlm.models.eagle3 import (
+    Eagle3Speculator,
+    Eagle3TargetVerifyOutput,
+    generate_eagle3_draft_tokens,
+    speculative_accept_greedy_from_logits,
+    speculative_accept_reject_from_logits,
+)
 from thrustlm.models.qwen3 import Qwen3ForCausalLM
 from thrustlm.layers.sampler import Sampler
 from thrustlm.utils.context import set_context, get_context, reset_context
 from thrustlm.utils.loader import load_model
+
+
+@dataclass(slots=True)
+class TargetDecodeAuxOutput:
+    token_ids: list[int]
+    logits: torch.Tensor
+    aux_hidden: torch.Tensor
+    positions: torch.Tensor
+
+
+@dataclass(slots=True)
+class SpeculativeDecodeOutput:
+    token_ids: list[int]
+    num_draft_tokens: int
+    num_accepted: int
+    accepted_all: bool
+    emitted_tokens: int
+    debug: dict | None = None
 
 
 class ModelRunner:
@@ -30,6 +56,13 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        self.draft_model = self.load_draft_model()
+        self.speculative_gamma = config.speculative_gamma
+        self.speculative_accept_mode = config.speculative_accept_mode
+        self.speculative_trace = config.speculative_trace
+        self.draft_kv_cache = {}
+        self._prefill_aux_chunks = {}
+        self._prev_correction = {}
         self.sampler = Sampler()
         self.warmup_model()
         # 真正跑一次模型，把模型执行的峰值显存测出来，计算给 KV cache 留多少空间
@@ -89,6 +122,313 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def load_draft_model(self):
+        if self.config.speculative_model is None:
+            return None
+        draft_model = Eagle3Speculator.from_pretrained(
+            self.config.speculative_model,
+            target_model_path=self.config.model,
+        )
+        return draft_model.eval()
+
+    @torch.inference_mode()
+    def _draft_prefill(self, seq: Sequence, prompt_aux_hidden: torch.Tensor):
+        if self.draft_model is None:
+            return
+        if not hasattr(self, "draft_kv_cache"):
+            self.draft_kv_cache = {}
+        if seq.num_prompt_tokens <= 1:
+            return
+        device = prompt_aux_hidden.device
+        # EAGLE draft 输入 token x_t 应搭配 target 在上一位置预测出它的 hidden h_{t-1}。
+        # prompt prefill 因此使用 x_1..x_n 和 h_0..h_{n-1}，避免同位置 hidden/token 错位。
+        prompt_ids = torch.tensor(seq.prompt_token_ids[1:], dtype=torch.long, device=device).unsqueeze(0)
+        positions = torch.arange(seq.num_prompt_tokens - 1, dtype=torch.long, device=device).unsqueeze(0)
+        aux_hidden = prompt_aux_hidden[:-1].unsqueeze(0)
+        _, _, draft_kv = self.draft_model(prompt_ids, aux_hidden, positions, past_kv=None)
+        self.draft_kv_cache[seq.seq_id] = (draft_kv[0], draft_kv[1])
+
+    @torch.inference_mode()
+    def _accumulate_draft_prefill(self, seqs: list[Sequence], aux_hidden: torch.Tensor):
+        if self.draft_model is None:
+            return
+        if not hasattr(self, "_prefill_aux_chunks"):
+            self._prefill_aux_chunks = {}
+        offset = 0
+        for seq in seqs:
+            is_decode = seq.num_scheduled_tokens < 0
+            chunk = 1 if is_decode else seq.num_scheduled_tokens
+            if not is_decode and seq.num_cached_tokens < seq.num_prompt_tokens:
+                chunk_aux = aux_hidden[offset:offset + chunk]
+                self._prefill_aux_chunks.setdefault(seq.seq_id, []).append(chunk_aux)
+                if seq.num_cached_tokens + chunk >= seq.num_prompt_tokens:
+                    chunks = self._prefill_aux_chunks.pop(seq.seq_id)
+                    prompt_aux_hidden = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+                    self._draft_prefill(seq, prompt_aux_hidden)
+            offset += chunk
+
+    def _get_single_draft_kv(self, seq: Sequence):
+        if not hasattr(self, "draft_kv_cache"):
+            self.draft_kv_cache = {}
+        return self.draft_kv_cache.get(seq.seq_id)
+
+    def _update_single_draft_kv(
+        self,
+        seq: Sequence,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None,
+        old_len: int,
+        emitted_token_ids: list[int],
+        verify_aux_hidden: torch.Tensor,
+        num_accepted: int,
+    ):
+        if past_kv is None:
+            return
+        if not hasattr(self, "draft_kv_cache"):
+            self.draft_kv_cache = {}
+
+        # EAGLE 的 draft KV 只覆盖“已经喂进 draft layer 的 token”。
+        # 如果 target 最后返回 correction/bonus token，这些 token 已经进入 Sequence，
+        # 但还没有进入 draft KV；这里先裁掉未接受分支，再把缺失尾部补回去。
+        keep = old_len + min(num_accepted + 1, self.speculative_gamma)
+        keep = min(keep, past_kv[0].shape[2])
+        current_kv = (
+            past_kv[0][:, :, :keep, :].contiguous(),
+            past_kv[1][:, :, :keep, :].contiguous(),
+        )
+
+        self.draft_kv_cache[seq.seq_id] = current_kv
+
+    @torch.inference_mode()
+    def _fill_prefill_sampled_tokens(
+        self,
+        seqs: list[Sequence],
+        aux_hidden: torch.Tensor,
+        token_ids: list[int] | None,
+    ):
+        if self.draft_model is None or token_ids is None:
+            return
+        offset = 0
+        for index, seq in enumerate(seqs):
+            is_decode = seq.num_scheduled_tokens < 0
+            chunk = 1 if is_decode else seq.num_scheduled_tokens
+            if (
+                not is_decode
+                and seq.num_completion_tokens == 0
+                and seq.num_cached_tokens < seq.num_prompt_tokens
+                and seq.num_cached_tokens + chunk >= seq.num_prompt_tokens
+            ):
+                draft_kv = self._get_single_draft_kv(seq)
+                if draft_kv is not None:
+                    device = draft_kv[0].device
+                    current_len = draft_kv[0].shape[2]
+                    input_ids = torch.tensor([[int(token_ids[index])]], dtype=torch.long, device=device)
+                    positions = torch.tensor([[current_len]], dtype=torch.long, device=device)
+                    token_aux = aux_hidden[offset + chunk - 1].to(device).view(1, 1, -1)
+                    kv_valid_lens = torch.tensor([current_len], dtype=torch.long, device=device)
+                    _, _, draft_kv = self.draft_model(
+                        input_ids,
+                        token_aux,
+                        positions,
+                        past_kv=draft_kv,
+                        kv_valid_lens=kv_valid_lens,
+                    )
+                    self.draft_kv_cache[seq.seq_id] = draft_kv
+            offset += chunk
+
+    def _build_speculative_debug(
+        self,
+        *,
+        accept_mode: str,
+        start_token_id: int,
+        draft_token_ids: list[int],
+        target_logits: torch.Tensor,
+        sample_token_ids: list[int],
+        num_accepted: int,
+        accepted_all: bool,
+        draft_kv_len: int,
+    ) -> dict:
+        target_argmax = target_logits.argmax(dim=-1).tolist()
+        matches = [
+            int(target_argmax[i]) == int(draft_token_ids[i])
+            for i in range(len(draft_token_ids))
+        ]
+        logits = target_logits.float()
+        ranks = []
+        target_logits_for_draft_tokens = []
+        for i, token_id in enumerate(draft_token_ids):
+            if token_id < 0 or token_id >= logits.size(1):
+                ranks.append(None)
+                target_logits_for_draft_tokens.append(None)
+                continue
+            token_logit = logits[i, token_id]
+            ranks.append(int((logits[i] > token_logit).sum().item()) + 1)
+            target_logits_for_draft_tokens.append(float(token_logit.item()))
+        top_k = min(5, logits.size(1))
+        target_top = torch.topk(logits, k=top_k, dim=-1)
+        return {
+            "accept_mode": accept_mode,
+            "start_token_id": int(start_token_id),
+            "draft_token_ids": [int(x) for x in draft_token_ids],
+            "target_argmax_token_ids": [int(x) for x in target_argmax],
+            "matches": matches,
+            "num_accepted": int(num_accepted),
+            "accepted_all": bool(accepted_all),
+            "emitted_token_ids": [int(x) for x in sample_token_ids],
+            "draft_kv_len_before": int(draft_kv_len),
+            "draft_token_target_ranks": ranks,
+            "draft_token_target_logits": target_logits_for_draft_tokens,
+            "target_top_token_ids": target_top.indices.tolist(),
+            "target_top_logits": target_top.values.tolist(),
+        }
+
+    @torch.inference_mode()
+    def run_target_decode_with_eagle3_aux(self, seqs: list[Sequence]) -> TargetDecodeAuxOutput:
+        assert len(seqs) == 1
+        input_ids, positions = self.prepare_decode(seqs)
+        temperatures = self.prepare_sample(seqs)
+        hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
+        logits = self.model.compute_logits(hidden_states)
+        token_ids = self.sampler(logits, temperatures).tolist() if getattr(self, "rank", 0) == 0 else None
+        return TargetDecodeAuxOutput(token_ids, logits, aux_hidden, positions)
+
+    @torch.inference_mode()
+    def run_target_verify_with_eagle3_aux(
+        self,
+        seq: Sequence,
+        start_token_id: int,
+        draft_token_ids: list[int],
+        base_offset: int = 0,
+    ) -> Eagle3TargetVerifyOutput:
+        verify_token_ids = [start_token_id] + draft_token_ids
+        num_verify = len(verify_token_ids)
+        base_pos = len(seq) + base_offset
+        if base_pos < 0:
+            raise ValueError(f"invalid speculative verify base_pos: {base_pos}")
+        input_ids = torch.tensor(verify_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.arange(base_pos, base_pos + num_verify, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+        slot_mapping = []
+        for absolute_pos in range(base_pos, base_pos + num_verify):
+            block_idx = absolute_pos // self.block_size
+            offset = absolute_pos % self.block_size
+            slot_mapping.append(seq.block_table[block_idx] * self.block_size + offset)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor([0, num_verify], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor([0, base_pos + num_verify], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables([seq])
+
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=num_verify,
+            max_seqlen_k=base_pos + num_verify,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+        )
+        hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
+        logits = self.model.compute_logits(hidden_states, all_tokens=True)
+        reset_context()
+        return Eagle3TargetVerifyOutput(logits, aux_hidden)
+
+    @torch.inference_mode()
+    def run_speculative_single(self, seq: Sequence) -> SpeculativeDecodeOutput:
+        assert self.draft_model is not None
+        prev_correction = getattr(self, "_prev_correction", {})
+        merged = seq.seq_id in prev_correction
+        if merged:
+            # 上轮 correction/bonus 已经追加到 Sequence，但 target KV 里还没有对应 token。
+            # 本轮复用它作为 start token，并在 verify 阶段从 len(seq)-1 覆盖该 KV 槽。
+            start_token_id, start_aux_hidden = prev_correction[seq.seq_id]
+        else:
+            target_decode = self.run_target_decode_with_eagle3_aux([seq])
+            reset_context()
+            start_token_id = target_decode.token_ids[0]
+            start_aux_hidden = target_decode.aux_hidden.view(1, 1, -1)
+        temperature = seq.temperature
+        draft_past_kv = self._get_single_draft_kv(seq)
+        if draft_past_kv is not None:
+            draft_kv_len = draft_past_kv[0].shape[2]
+        elif merged:
+            draft_kv_len = len(seq)
+        else:
+            draft_kv_len = int(target_decode.positions[-1].item()) + 1
+        start_position = draft_kv_len
+        accept_mode = getattr(self, "speculative_accept_mode", "greedy")
+        draft_sequence = generate_eagle3_draft_tokens(
+            self.draft_model,
+            start_token_id=start_token_id,
+            start_aux_hidden=start_aux_hidden.view(1, 1, -1),
+            start_position=start_position,
+            gamma=self.speculative_gamma,
+            temperature=temperature,
+            past_kv=draft_past_kv,
+            kv_valid_len=draft_kv_len if draft_past_kv is not None else None,
+            draft_sampling_mode="greedy" if accept_mode == "greedy" else "sample",
+        )
+        verify_output = self.run_target_verify_with_eagle3_aux(
+            seq,
+            start_token_id,
+            draft_sequence.draft_token_ids,
+            base_offset=-1 if merged else 0,
+        )
+        draft_token_ids = torch.tensor(
+            draft_sequence.draft_token_ids,
+            dtype=torch.long,
+            device=verify_output.target_logits.device,
+        )
+        if accept_mode == "greedy":
+            sample_result = speculative_accept_greedy_from_logits(
+                verify_output.target_logits,
+                draft_token_ids,
+            )
+        elif accept_mode == "rejection":
+            sample_result = speculative_accept_reject_from_logits(
+                verify_output.target_logits,
+                draft_sequence.draft_target_logits,
+                draft_token_ids,
+                temperature=temperature,
+            )
+        else:
+            raise ValueError(f"unsupported speculative_accept_mode: {accept_mode}")
+        reset_context()
+        token_ids = ([] if merged else [start_token_id]) + sample_result.token_ids
+        if not hasattr(self, "_prev_correction"):
+            self._prev_correction = {}
+        correction_aux = verify_output.target_aux_hidden[sample_result.num_accepted]
+        self._prev_correction[seq.seq_id] = (
+            sample_result.final_token_id,
+            correction_aux.detach(),
+        )
+        debug = None
+        if getattr(self, "speculative_trace", False):
+            debug = self._build_speculative_debug(
+                accept_mode=accept_mode,
+                start_token_id=start_token_id,
+                draft_token_ids=draft_sequence.draft_token_ids,
+                target_logits=verify_output.target_logits,
+                sample_token_ids=token_ids,
+                num_accepted=sample_result.num_accepted,
+                accepted_all=sample_result.accepted_all,
+                draft_kv_len=draft_kv_len,
+            )
+        self._update_single_draft_kv(
+            seq,
+            draft_sequence.past_kv,
+            draft_kv_len,
+            token_ids,
+            verify_output.target_aux_hidden,
+            sample_result.num_accepted,
+        )
+        return SpeculativeDecodeOutput(
+            token_ids=token_ids,
+            num_draft_tokens=len(draft_sequence.draft_token_ids),
+            num_accepted=sample_result.num_accepted,
+            accepted_all=sample_result.accepted_all,
+            emitted_tokens=len(token_ids),
+            debug=debug,
+        )
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -99,6 +439,9 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
+        self.draft_kv_cache.clear()
+        self._prefill_aux_chunks.clear()
+        self._prev_correction.clear()
         torch.cuda.empty_cache()
 
     # 把预热用过的临时显存清掉
@@ -221,11 +564,19 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        if is_prefill and self.draft_model is not None:
+            hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
+            self._accumulate_draft_prefill(seqs, aux_hidden)
+        else:
+            logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if is_prefill and self.draft_model is not None:
+            self._fill_prefill_sampled_tokens(seqs, aux_hidden, token_ids)
         reset_context()
         return token_ids
 

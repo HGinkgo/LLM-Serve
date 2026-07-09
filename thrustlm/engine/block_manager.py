@@ -107,6 +107,52 @@ class BlockManager:
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
+    # ===== 2026-07-07 EAGLE speculative decoding =====
+    def num_required_blocks(self, seq: Sequence, num_tokens: int) -> int:
+        future_num_tokens = len(seq) + num_tokens
+        future_num_blocks = (future_num_tokens + self.block_size - 1) // self.block_size
+        return max(future_num_blocks - len(seq.block_table), 0)
+
+    def can_append_tokens(self, seq: Sequence, num_tokens: int) -> bool:
+        return len(self.free_block_ids) >= self.num_required_blocks(seq, num_tokens)
+
+    def _finalize_block_hash(self, seq: Sequence, block_idx: int):
+        block_id = seq.block_table[block_idx]
+        block = self.blocks[block_id]
+        if block.hash != -1:
+            return
+        token_ids = seq.block(block_idx)
+        if len(token_ids) != self.block_size:
+            return
+        prefix = self.blocks[seq.block_table[block_idx - 1]].hash if block_idx > 0 else -1
+        h = self.compute_hash(token_ids, prefix)
+        block.update(h, token_ids)
+        self.hash_to_block_id[h] = block_id
+
+    def ensure_slots(self, seq: Sequence, num_tokens: int) -> bool:
+        if not self.can_append_tokens(seq, num_tokens):
+            return False
+        if seq.block_table and len(seq) % self.block_size == 0:
+            self._finalize_block_hash(seq, seq.num_blocks - 1)
+        for _ in range(self.num_required_blocks(seq, num_tokens)):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_table.append(block_id)
+        return True
+
+    def finalize_full_blocks(self, seq: Sequence):
+        for block_idx in range(min(seq.num_blocks, len(seq.block_table))):
+            self._finalize_block_hash(seq, block_idx)
+
+    def release_extra_slots(self, seq: Sequence):
+        while len(seq.block_table) > seq.num_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+    # ===== 2026-07-07 EAGLE speculative decoding =====
+
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]

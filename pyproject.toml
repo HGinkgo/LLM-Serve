@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thrustlm"
-version = "0.2.0"
-authors = [{ name = "pengfei_he" }]
+version = "0.3.0"
+authors = [{ name = "pengfei_he", email = "pengfei_he@foxmail.com" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a single-GPU LLM inference engine focused on serving systems and runtime behavior"
+description = "A single-GPU LLM inference engine focused on serving systems, scheduling, KV cache management, and speculative decoding experiments."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",

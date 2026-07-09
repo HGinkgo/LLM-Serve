@@ -90,6 +90,11 @@ class LLMEngine:
             "output_tokens": 0,
             "success": False,
             "failure_reason": None,
+            "speculative_steps": 0,
+            "speculative_draft_tokens": 0,
+            "speculative_accepted_tokens": 0,
+            "speculative_emitted_tokens": 0,
+            "speculative_accept_all_count": 0,
         }
         self.scheduler.add(seq)
         return seq.seq_id
@@ -97,6 +102,65 @@ class LLMEngine:
     def step(self):
         step_start = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
+        if self._can_run_speculative_step(seqs, is_prefill):
+            seq = seqs[0]
+            num_reserved_tokens = self.model_runner.speculative_gamma + 2
+            if self.scheduler.block_manager.ensure_slots(seq, num_reserved_tokens):
+                before = seq.num_completion_tokens
+                speculative_output = self.model_runner.call("run_speculative_single", seq)
+                self.scheduler.postprocess_speculative(seq, speculative_output.token_ids)
+                step_end = perf_counter()
+
+                metric = self.request_metrics.get(seq.seq_id)
+                first_token_seq_ids = []
+                decode_seq_ids = []
+                finished_seq_ids = []
+                if metric is not None:
+                    after = seq.num_completion_tokens
+                    emitted_tokens = after - before
+                    if after > before:
+                        if metric["first_token_time"] is None:
+                            metric["first_token_time"] = step_end
+                            first_token_seq_ids.append(seq.seq_id)
+                        decode_seq_ids.append(seq.seq_id)
+                        metric["token_times"].extend([step_end] * emitted_tokens)
+                        metric["output_tokens"] = after
+                    metric.setdefault("speculative_steps", 0)
+                    metric.setdefault("speculative_draft_tokens", 0)
+                    metric.setdefault("speculative_accepted_tokens", 0)
+                    metric.setdefault("speculative_emitted_tokens", 0)
+                    metric.setdefault("speculative_accept_all_count", 0)
+                    metric["speculative_steps"] += 1
+                    metric["speculative_draft_tokens"] += speculative_output.num_draft_tokens
+                    metric["speculative_accepted_tokens"] += speculative_output.num_accepted
+                    metric["speculative_emitted_tokens"] += emitted_tokens
+                    metric["speculative_accept_all_count"] += int(speculative_output.accepted_all)
+                    if seq.is_finished and metric["finish_time"] is None:
+                        metric["finish_time"] = step_end
+                        metric["success"] = True
+                        finished_seq_ids.append(seq.seq_id)
+
+                num_tokens = -(seq.num_completion_tokens - before)
+                self.last_step_events = {
+                    "step_start": step_start,
+                    "step_end": step_end,
+                    "is_prefill": False,
+                    "num_tokens": num_tokens,
+                    "scheduled_seq_ids": [seq.seq_id],
+                    "first_token_seq_ids": first_token_seq_ids,
+                    "decode_seq_ids": decode_seq_ids,
+                    "finished_seq_ids": finished_seq_ids,
+                    "speculative": True,
+                    "speculative_num_draft_tokens": speculative_output.num_draft_tokens,
+                    "speculative_num_accepted": speculative_output.num_accepted,
+                    "speculative_accepted_all": speculative_output.accepted_all,
+                    "speculative_emitted_tokens": seq.num_completion_tokens - before,
+                }
+                if speculative_output.debug is not None:
+                    self.last_step_events["speculative_debug"] = speculative_output.debug
+                outputs = [(seq.seq_id, seq.completion_token_ids)] if seq.is_finished else []
+                return outputs, num_tokens
+
         # ===== 2026-06-07 chunked prefill =====
         num_tokens = sum(max(seq.num_scheduled_tokens, 0) for seq in seqs) if is_prefill else -len(seqs)
         # ===== 2026-06-07 chunked prefill =====
@@ -148,6 +212,17 @@ class LLMEngine:
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
+    def _can_run_speculative_step(self, seqs: list[Sequence], is_prefill: bool):
+        if is_prefill or len(seqs) != 1:
+            return False
+        if getattr(self.model_runner, "draft_model", None) is None:
+            return False
+        if not getattr(self.model_runner, "enforce_eager", False):
+            return False
+        if getattr(self.model_runner, "world_size", 1) != 1:
+            return False
+        return True
+
     def get_metrics(self):
         now = perf_counter()
         requests = []
@@ -158,6 +233,11 @@ class LLMEngine:
         wall_start = None
         wall_end = None
         total_output_tokens = 0
+        total_speculative_steps = 0
+        total_speculative_draft_tokens = 0
+        total_speculative_accepted_tokens = 0
+        total_speculative_emitted_tokens = 0
+        total_speculative_accept_all_count = 0
 
         for metric in self.request_metrics.values():
             arrival_time = metric["arrival_time"]
@@ -167,11 +247,21 @@ class LLMEngine:
             output_tokens = metric["output_tokens"]
             success = metric["success"]
             failure_reason = metric["failure_reason"]
+            speculative_steps = metric.get("speculative_steps", 0)
+            speculative_draft_tokens = metric.get("speculative_draft_tokens", 0)
+            speculative_accepted_tokens = metric.get("speculative_accepted_tokens", 0)
+            speculative_emitted_tokens = metric.get("speculative_emitted_tokens", 0)
+            speculative_accept_all_count = metric.get("speculative_accept_all_count", 0)
 
             wall_start = arrival_time if wall_start is None else min(wall_start, arrival_time)
             finish_or_now_time = finish_time if finish_time is not None else now
             wall_end = finish_or_now_time if wall_end is None else max(wall_end, finish_or_now_time)
             total_output_tokens += output_tokens
+            total_speculative_steps += speculative_steps
+            total_speculative_draft_tokens += speculative_draft_tokens
+            total_speculative_accepted_tokens += speculative_accepted_tokens
+            total_speculative_emitted_tokens += speculative_emitted_tokens
+            total_speculative_accept_all_count += speculative_accept_all_count
 
             ttft = None
             if first_token_time is not None:
@@ -209,6 +299,11 @@ class LLMEngine:
                 "ttft": ttft,
                 "itl": request_itls,
                 "latency": latency,
+                "speculative_steps": speculative_steps,
+                "speculative_draft_tokens": speculative_draft_tokens,
+                "speculative_accepted_tokens": speculative_accepted_tokens,
+                "speculative_emitted_tokens": speculative_emitted_tokens,
+                "speculative_accept_all_count": speculative_accept_all_count,
             })
 
         wall_time = 0.0
@@ -229,6 +324,17 @@ class LLMEngine:
                 "itl": self._summary(itls),
                 "tpot": self._summary(tpots),
                 "request_latency": self._summary(request_latencies),
+                "speculative": {
+                    "steps": total_speculative_steps,
+                    "draft_tokens": total_speculative_draft_tokens,
+                    "accepted_tokens": total_speculative_accepted_tokens,
+                    "emitted_tokens": total_speculative_emitted_tokens,
+                    "acceptance_rate": (
+                        total_speculative_accepted_tokens / total_speculative_draft_tokens
+                        if total_speculative_draft_tokens > 0 else None
+                    ),
+                    "accept_all_count": total_speculative_accept_all_count,
+                },
             },
             "requests": sorted(requests, key=lambda request: request["seq_id"]),
         }

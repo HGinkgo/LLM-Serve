@@ -15,12 +15,26 @@ from random import Random
 from thrustlm import LLM, SamplingParams
 
 
+DEFAULT_NATURAL_PROMPTS = [
+    "Explain speculative decoding in one concise paragraph.",
+    "Summarize why paged KV cache improves memory management for LLM serving.",
+    "Write a short Python function that computes the mean of a list.",
+    "Describe the difference between prefill and decode in transformer inference.",
+    "Give three practical tips for debugging CUDA out-of-memory errors.",
+    "Translate this sentence into Chinese: high-throughput inference requires careful scheduling.",
+    "What are the trade-offs of using a smaller draft model for speculative decoding?",
+    "Explain continuous batching to a systems engineering interviewer.",
+]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Request-level serving benchmark for ThrustLM")
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH", "~/models/Qwen3-0.6B/"))
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--input-len", type=int, default=256)
     parser.add_argument("--output-len", type=int, default=128)
+    parser.add_argument("--prompt-mode", choices=["random-token", "natural"], default="random-token")
+    parser.add_argument("--prompt-file", default=None, help="Plain text file with one prompt per non-empty line")
     parser.add_argument("--arrival", choices=["all", "poisson"], default="all")
     parser.add_argument("--request-rate", type=float, default=4.0, help="Requests per second for poisson arrival")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -32,6 +46,9 @@ def parse_args():
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--speculative-model", default=os.environ.get("SPECULATIVE_MODEL"))
+    parser.add_argument("--speculative-gamma", type=int, default=3)
+    parser.add_argument("--speculative-accept-mode", choices=["greedy", "rejection"], default="greedy")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args()
 
@@ -49,13 +66,33 @@ def build_arrivals(num_requests: int, arrival: str, request_rate: float, rng: Ra
     return arrivals
 
 
-def build_workload(args):
-    rng = Random(args.seed)
-    arrivals = build_arrivals(args.num_requests, args.arrival, args.request_rate, rng)
-    prompts = [
+def load_prompt_file(path: str):
+    with open(os.path.expanduser(path), "r") as f:
+        prompts = [line.strip() for line in f if line.strip()]
+    if not prompts:
+        raise ValueError("--prompt-file must contain at least one non-empty prompt")
+    return prompts
+
+
+def repeat_to_length(items: list, length: int):
+    return [items[i % len(items)] for i in range(length)]
+
+
+def build_prompts(args, rng: Random):
+    if args.prompt_file:
+        return repeat_to_length(load_prompt_file(args.prompt_file), args.num_requests)
+    if args.prompt_mode == "natural":
+        return repeat_to_length(DEFAULT_NATURAL_PROMPTS, args.num_requests)
+    return [
         [rng.randint(0, 10000) for _ in range(args.input_len)]
         for _ in range(args.num_requests)
     ]
+
+
+def build_workload(args):
+    rng = Random(args.seed)
+    arrivals = build_arrivals(args.num_requests, args.arrival, args.request_rate, rng)
+    prompts = build_prompts(args, rng)
     sampling_params = [
         SamplingParams(
             temperature=args.temperature,
@@ -71,6 +108,12 @@ def format_ms(value):
     if value is None:
         return "N/A"
     return f"{value * 1000:.2f}"
+
+
+def format_percent(value):
+    if value is None:
+        return "N/A"
+    return f"{value * 100:.2f}%"
 
 
 def print_summary(result):
@@ -102,10 +145,22 @@ def print_summary(result):
             f"max={format_ms(stats['max']):>10}"
         )
     print()
+    speculative = summary.get("speculative")
+    if speculative and speculative["steps"] > 0:
+        print("Speculative Metrics")
+        print("-------------------")
+        print(f"steps:          {speculative['steps']}")
+        print(f"draft tokens:   {speculative['draft_tokens']}")
+        print(f"accepted:       {speculative['accepted_tokens']}")
+        print(f"emitted:        {speculative['emitted_tokens']}")
+        print(f"acceptance:     {format_percent(speculative['acceptance_rate'])}")
+        print(f"accept-all:     {speculative['accept_all_count']}")
+        print()
 
 
 def run_benchmark(args):
     model_path = os.path.expanduser(args.model)
+    speculative_model = os.path.expanduser(args.speculative_model) if args.speculative_model else None
     workload = build_workload(args)
     engine = LLM(
         model_path,
@@ -115,6 +170,9 @@ def run_benchmark(args):
         # ===== 2026-06-07 chunked prefill =====
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        speculative_model=speculative_model,
+        speculative_gamma=args.speculative_gamma,
+        speculative_accept_mode=args.speculative_accept_mode,
     )
 
     start = time.perf_counter()
@@ -141,6 +199,8 @@ def run_benchmark(args):
             "num_requests": args.num_requests,
             "input_len": args.input_len,
             "output_len": args.output_len,
+            "prompt_mode": args.prompt_mode,
+            "prompt_file": os.path.expanduser(args.prompt_file) if args.prompt_file else None,
             "arrival": args.arrival,
             "request_rate": args.request_rate if args.arrival == "poisson" else None,
             "enforce_eager": args.enforce_eager,
@@ -151,6 +211,9 @@ def run_benchmark(args):
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "temperature": args.temperature,
             "seed": args.seed,
+            "speculative_model": speculative_model,
+            "speculative_gamma": args.speculative_gamma,
+            "speculative_accept_mode": args.speculative_accept_mode,
         },
         "metrics": metrics,
     }

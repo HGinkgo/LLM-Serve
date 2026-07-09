@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
@@ -9,6 +10,11 @@ from thrustlm.layers.layernorm import RMSNorm
 from thrustlm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from thrustlm.layers.rotary_embedding import get_rope
 from thrustlm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+
+
+def get_eagle3_aux_layer_ids(num_hidden_layers: int) -> tuple[int, int, int]:
+    assert num_hidden_layers >= 6
+    return (2, num_hidden_layers // 2, num_hidden_layers - 3)
 
 
 class Qwen3Attention(nn.Module):
@@ -174,12 +180,21 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        aux_layer_ids: set[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_hidden_states = []
+        for layer_id, layer in enumerate(self.layers):
+            if aux_layer_ids is not None and layer_id in aux_layer_ids:
+                # SGLang 对 EAGLE3 默认抓指定层的输入，即上一层输出后的 residual stream。
+                aux_hidden_states.append(hidden_states if residual is None else hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_layer_ids is not None:
+            if len(aux_hidden_states) != len(aux_layer_ids):
+                raise ValueError(f"invalid aux_layer_ids: {sorted(aux_layer_ids)}")
+            return hidden_states, torch.cat(aux_hidden_states, dim=-1)
         return hidden_states
 
 
@@ -206,11 +221,23 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        aux_layer_ids: set[int] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.model(input_ids, positions, aux_layer_ids=aux_layer_ids)
+
+    def forward_with_eagle3_aux(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        aux_layer_ids = set(get_eagle3_aux_layer_ids(len(self.model.layers)))
+        return self.model(input_ids, positions, aux_layer_ids=aux_layer_ids)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        all_tokens: bool = False,
     ) -> torch.Tensor:
+        if all_tokens:
+            return F.linear(hidden_states, self.lm_head.weight)
         return self.lm_head(hidden_states)
