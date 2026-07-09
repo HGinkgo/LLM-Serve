@@ -19,6 +19,7 @@ The repository name and Python package are aligned as `ThrustLM` / `thrustlm`.
 ## Experimental
 
 - EAGLE-style speculative decoding MVP with draft proposal, target verification, draft KV state, merged correction handling, and acceptance metrics.
+- Speculative tracing and timing breakdown for inspecting draft tokens, target verification, acceptance length, and per-step runtime cost.
 - Greedy/top-k style verification is the primary path for current hot-vocabulary EAGLE3 draft checkpoints.
 - Probability rejection sampling utilities are kept for algorithm study and controlled experiments, but are not the recommended path for 32K hot-vocabulary draft heads.
 
@@ -85,6 +86,8 @@ python bench_serving.py \
   --arrival all \
   --enforce-eager
 ```
+
+The EAGLE benchmark summary reports acceptance rate, acceptance length, accepted tokens per step, draft tokens per step, and a speculative timing breakdown for draft proposal, target verification, accept/reject, KV update, and trace overhead.
 
 ## Notes
 

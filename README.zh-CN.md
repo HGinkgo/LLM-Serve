@@ -19,6 +19,7 @@ ThrustLM 是一个面向单机单卡场景的 LLM 推理引擎项目，重点关
 ## 实验性功能
 
 - EAGLE 风格 speculative decoding MVP：包含 draft proposal、target verification、draft KV 状态维护、merged correction 处理和 acceptance metrics。
+- Speculative trace 和 timing breakdown：用于观察 draft token、target verification、acceptance length，以及每个 speculative step 的耗时构成。
 - 当前推荐路径是 greedy/top-k 风格 verify，更适合 hot-vocabulary EAGLE3 draft checkpoint。
 - 概率拒绝采样工具保留用于算法学习和受控实验，但对于 32K hot-vocabulary draft head，它不是当前推荐路径。
 
@@ -85,6 +86,8 @@ python bench_serving.py \
   --arrival all \
   --enforce-eager
 ```
+
+EAGLE benchmark summary 会输出 acceptance rate、acceptance length、accepted tokens per step、draft tokens per step，以及 draft proposal、target verification、accept/reject、KV update 和 trace overhead 的 timing breakdown。
 
 ## 说明
 
