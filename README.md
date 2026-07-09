@@ -78,6 +78,7 @@ python bench_serving.py \
   --speculative-model "$SPECULATIVE_MODEL" \
   --speculative-gamma 3 \
   --speculative-accept-mode greedy \
+  --speculative-trace \
   --num-requests 1 \
   --input-len 128 \
   --output-len 64 \

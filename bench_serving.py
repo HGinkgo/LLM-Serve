@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--speculative-model", default=os.environ.get("SPECULATIVE_MODEL"))
     parser.add_argument("--speculative-gamma", type=int, default=3)
     parser.add_argument("--speculative-accept-mode", choices=["greedy", "rejection"], default="greedy")
+    parser.add_argument("--speculative-trace", action="store_true")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args()
 
@@ -116,6 +117,12 @@ def format_percent(value):
     return f"{value * 100:.2f}%"
 
 
+def format_float(value):
+    if value is None:
+        return "N/A"
+    return f"{value:.2f}"
+
+
 def print_summary(result):
     summary = result["metrics"]["summary"]
     print()
@@ -154,6 +161,9 @@ def print_summary(result):
         print(f"accepted:       {speculative['accepted_tokens']}")
         print(f"emitted:        {speculative['emitted_tokens']}")
         print(f"acceptance:     {format_percent(speculative['acceptance_rate'])}")
+        print(f"accept length:  {format_float(speculative.get('acceptance_length'))}")
+        print(f"accepted/step:  {format_float(speculative.get('accepted_length'))}")
+        print(f"draft/step:     {format_float(speculative.get('draft_tokens_per_step'))}")
         print(f"accept-all:     {speculative['accept_all_count']}")
         print()
 
@@ -173,6 +183,7 @@ def run_benchmark(args):
         speculative_model=speculative_model,
         speculative_gamma=args.speculative_gamma,
         speculative_accept_mode=args.speculative_accept_mode,
+        speculative_trace=args.speculative_trace,
     )
 
     start = time.perf_counter()
@@ -214,6 +225,7 @@ def run_benchmark(args):
             "speculative_model": speculative_model,
             "speculative_gamma": args.speculative_gamma,
             "speculative_accept_mode": args.speculative_accept_mode,
+            "speculative_trace": args.speculative_trace,
         },
         "metrics": metrics,
     }

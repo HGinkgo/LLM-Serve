@@ -95,9 +95,35 @@ class LLMEngine:
             "speculative_accepted_tokens": 0,
             "speculative_emitted_tokens": 0,
             "speculative_accept_all_count": 0,
+            "speculative_trace": [],
         }
         self.scheduler.add(seq)
         return seq.seq_id
+
+    @staticmethod
+    def _build_speculative_trace_entry(
+        debug: dict,
+        step: int,
+        emitted_token_ids: list[int],
+        num_accepted: int,
+        accepted_all: bool,
+    ):
+        entry = {
+            "step": step,
+            "draft_token_ids": debug.get("draft_token_ids"),
+            "matches": debug.get("matches"),
+            "emitted_token_ids": [int(token_id) for token_id in emitted_token_ids],
+            "num_accepted": int(num_accepted),
+            "accepted_all": bool(accepted_all),
+        }
+        for key in (
+            "start_token_id",
+            "target_argmax_token_ids",
+            "draft_token_target_ranks",
+        ):
+            if key in debug:
+                entry[key] = debug[key]
+        return entry
 
     def step(self):
         step_start = perf_counter()
@@ -135,6 +161,16 @@ class LLMEngine:
                     metric["speculative_accepted_tokens"] += speculative_output.num_accepted
                     metric["speculative_emitted_tokens"] += emitted_tokens
                     metric["speculative_accept_all_count"] += int(speculative_output.accepted_all)
+                    if speculative_output.debug is not None:
+                        metric.setdefault("speculative_trace", []).append(
+                            self._build_speculative_trace_entry(
+                                speculative_output.debug,
+                                metric["speculative_steps"],
+                                speculative_output.token_ids,
+                                speculative_output.num_accepted,
+                                speculative_output.accepted_all,
+                            )
+                        )
                     if seq.is_finished and metric["finish_time"] is None:
                         metric["finish_time"] = step_end
                         metric["success"] = True
@@ -252,6 +288,7 @@ class LLMEngine:
             speculative_accepted_tokens = metric.get("speculative_accepted_tokens", 0)
             speculative_emitted_tokens = metric.get("speculative_emitted_tokens", 0)
             speculative_accept_all_count = metric.get("speculative_accept_all_count", 0)
+            speculative_trace = metric.get("speculative_trace", [])
 
             wall_start = arrival_time if wall_start is None else min(wall_start, arrival_time)
             finish_or_now_time = finish_time if finish_time is not None else now
@@ -304,6 +341,7 @@ class LLMEngine:
                 "speculative_accepted_tokens": speculative_accepted_tokens,
                 "speculative_emitted_tokens": speculative_emitted_tokens,
                 "speculative_accept_all_count": speculative_accept_all_count,
+                "speculative_trace": speculative_trace,
             })
 
         wall_time = 0.0
@@ -332,6 +370,18 @@ class LLMEngine:
                     "acceptance_rate": (
                         total_speculative_accepted_tokens / total_speculative_draft_tokens
                         if total_speculative_draft_tokens > 0 else None
+                    ),
+                    "acceptance_length": (
+                        total_speculative_emitted_tokens / total_speculative_steps
+                        if total_speculative_steps > 0 else None
+                    ),
+                    "accepted_length": (
+                        total_speculative_accepted_tokens / total_speculative_steps
+                        if total_speculative_steps > 0 else None
+                    ),
+                    "draft_tokens_per_step": (
+                        total_speculative_draft_tokens / total_speculative_steps
+                        if total_speculative_steps > 0 else None
                     ),
                     "accept_all_count": total_speculative_accept_all_count,
                 },
