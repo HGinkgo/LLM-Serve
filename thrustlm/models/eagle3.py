@@ -216,6 +216,123 @@ def generate_eagle3_draft_tokens(
     return Eagle3DraftSequence(draft_token_ids, draft_logits, past_kv)
 
 
+def _pack_eagle3_draft_kv(
+    past_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
+) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, list[int]]:
+    valid_lengths = [0 if item is None else item[0].size(2) for item in past_kv]
+    max_length = max(valid_lengths, default=0)
+    if max_length == 0:
+        return None, valid_lengths
+
+    template = next(item for item in past_kv if item is not None)
+    packed_k = []
+    packed_v = []
+    for item, valid_length in zip(past_kv, valid_lengths):
+        if item is None:
+            shape = (1, template[0].size(1), max_length, template[0].size(3))
+            packed_k.append(template[0].new_zeros(shape))
+            packed_v.append(template[1].new_zeros(shape))
+            continue
+        if item[0].size(0) != 1 or item[1].size(0) != 1:
+            raise ValueError("per-request draft KV must have batch size 1")
+        padding = max_length - valid_length
+        packed_k.append(F.pad(item[0], (0, 0, 0, padding)))
+        packed_v.append(F.pad(item[1], (0, 0, 0, padding)))
+    return (torch.cat(packed_k, dim=0), torch.cat(packed_v, dim=0)), valid_lengths
+
+
+def _compact_eagle3_draft_kv(
+    packed_past: tuple[torch.Tensor, torch.Tensor] | None,
+    proposed_past: tuple[torch.Tensor, torch.Tensor],
+    valid_lengths: list[int],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    compact = []
+    for index, valid_length in enumerate(valid_lengths):
+        if packed_past is None:
+            old_k = proposed_past[0][index:index + 1, :, :0, :]
+            old_v = proposed_past[1][index:index + 1, :, :0, :]
+        else:
+            old_k = packed_past[0][index:index + 1, :, :valid_length, :]
+            old_v = packed_past[1][index:index + 1, :, :valid_length, :]
+        new_k = proposed_past[0][index:index + 1, :, -1:, :]
+        new_v = proposed_past[1][index:index + 1, :, -1:, :]
+        compact.append((
+            torch.cat([old_k, new_k], dim=2).contiguous(),
+            torch.cat([old_v, new_v], dim=2).contiguous(),
+        ))
+    return compact
+
+
+def generate_eagle3_draft_tokens_batched(
+    draft_model,
+    start_token_ids: list[int],
+    start_aux_hidden: torch.Tensor,
+    start_positions: list[int],
+    gamma: int,
+    temperature: float,
+    past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+    draft_sampling_mode: str = "sample",
+) -> list[Eagle3DraftSequence]:
+    """用 gamma 次 batched forward 为整批请求生成 draft token。"""
+    assert gamma > 0
+    assert draft_sampling_mode in {"sample", "greedy"}
+    batch_size = len(start_token_ids)
+    if batch_size == 0:
+        return []
+    if len(start_positions) != batch_size or start_aux_hidden.size(0) != batch_size:
+        raise ValueError("batched draft inputs have inconsistent sizes")
+
+    device = start_aux_hidden.device
+    input_ids = torch.tensor(start_token_ids, dtype=torch.long, device=device).view(batch_size, 1)
+    positions = torch.tensor(start_positions, dtype=torch.long, device=device).view(batch_size, 1)
+    aux_hidden = start_aux_hidden
+    compact_past = list(past_kv) if past_kv is not None else [None] * batch_size
+    if len(compact_past) != batch_size:
+        raise ValueError("batched draft KV count does not match batch size")
+    draft_token_ids = [[] for _ in range(batch_size)]
+    draft_target_logits = [[] for _ in range(batch_size)]
+
+    for _ in range(gamma):
+        packed_past, valid_lengths = _pack_eagle3_draft_kv(compact_past)
+        kv_valid_lens = None
+        if packed_past is not None:
+            kv_valid_lens = torch.tensor(valid_lengths, dtype=torch.long, device=device)
+        output = draft_model.propose(
+            input_ids,
+            aux_hidden,
+            positions,
+            temperature=temperature,
+            past_kv=packed_past,
+            kv_valid_lens=kv_valid_lens,
+        )
+        if draft_sampling_mode == "greedy":
+            next_token_ids = draft_model.greedy_sample(output.draft_logits[:, -1:, :])
+        else:
+            next_token_ids = output.token_ids
+
+        for index in range(batch_size):
+            draft_token_ids[index].append(int(next_token_ids[index, -1].item()))
+            draft_target_logits[index].append(output.target_logits[index, -1])
+
+        compact_past = _compact_eagle3_draft_kv(
+            packed_past,
+            output.past_kv,
+            valid_lengths,
+        )
+        input_ids = next_token_ids[:, -1:].to(device)
+        aux_hidden = output.hidden_states[:, -1:, :]
+        positions = positions + 1
+
+    return [
+        Eagle3DraftSequence(
+            draft_token_ids[index],
+            torch.stack(draft_target_logits[index], dim=0),
+            compact_past[index],
+        )
+        for index in range(batch_size)
+    ]
+
+
 def run_eagle3_speculative_cycle(
     draft_model,
     start_token_id: int,

@@ -12,6 +12,7 @@ from thrustlm.models.eagle3 import (
     Eagle3Speculator,
     Eagle3TargetVerifyOutput,
     generate_eagle3_draft_tokens,
+    generate_eagle3_draft_tokens_batched,
     speculative_accept_greedy_from_logits,
     speculative_accept_reject_from_logits,
 )
@@ -61,6 +62,7 @@ class ModelRunner:
         self.draft_model = self.load_draft_model()
         self.speculative_gamma = config.speculative_gamma
         self.speculative_accept_mode = config.speculative_accept_mode
+        self.speculative_batched_draft = config.speculative_batched_draft
         self.speculative_trace = config.speculative_trace
         self.draft_kv_cache = {}
         self._prefill_aux_chunks = {}
@@ -174,6 +176,12 @@ class ModelRunner:
             self.draft_kv_cache = {}
         return self.draft_kv_cache.get(seq.seq_id)
 
+    def clear_speculative_state(self, seq_ids: list[int]):
+        for seq_id in seq_ids:
+            self.draft_kv_cache.pop(seq_id, None)
+            self._prefill_aux_chunks.pop(seq_id, None)
+            self._prev_correction.pop(seq_id, None)
+
     def _update_single_draft_kv(
         self,
         seq: Sequence,
@@ -285,13 +293,114 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_target_decode_with_eagle3_aux(self, seqs: list[Sequence]) -> TargetDecodeAuxOutput:
-        assert len(seqs) == 1
+        assert seqs
         input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs)
         hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
         logits = self.model.compute_logits(hidden_states)
         token_ids = self.sampler(logits, temperatures).tolist() if getattr(self, "rank", 0) == 0 else None
         return TargetDecodeAuxOutput(token_ids, logits, aux_hidden, positions)
+
+    def _build_target_verify_batch_metadata(
+        self,
+        seqs: list[Sequence],
+        start_token_ids: list[int],
+        draft_token_ids: list[list[int]],
+        base_offsets: list[int],
+    ) -> dict:
+        if not (len(seqs) == len(start_token_ids) == len(draft_token_ids) == len(base_offsets)):
+            raise ValueError("speculative verify batch metadata has inconsistent sizes")
+        if not seqs:
+            raise ValueError("speculative verify batch cannot be empty")
+
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        verify_lengths = []
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+
+        for seq, start_token_id, drafts, base_offset in zip(
+            seqs,
+            start_token_ids,
+            draft_token_ids,
+            base_offsets,
+        ):
+            verify_tokens = [start_token_id] + drafts
+            num_verify = len(verify_tokens)
+            base_pos = len(seq) + base_offset
+            if base_pos < 0:
+                raise ValueError(f"invalid speculative verify base_pos: {base_pos}")
+
+            input_ids.extend(verify_tokens)
+            positions.extend(range(base_pos, base_pos + num_verify))
+            verify_lengths.append(num_verify)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + num_verify)
+            seqlen_k = base_pos + num_verify
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(max_seqlen_q, num_verify)
+            max_seqlen_k = max(max_seqlen_k, seqlen_k)
+
+            for absolute_pos in range(base_pos, base_pos + num_verify):
+                block_idx = absolute_pos // self.block_size
+                offset = absolute_pos % self.block_size
+                slot_mapping.append(seq.block_table[block_idx] * self.block_size + offset)
+
+        return {
+            "input_ids": input_ids,
+            "positions": positions,
+            "slot_mapping": slot_mapping,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "verify_lengths": verify_lengths,
+        }
+
+    @torch.inference_mode()
+    def run_target_verify_batch_with_eagle3_aux(
+        self,
+        seqs: list[Sequence],
+        start_token_ids: list[int],
+        draft_token_ids: list[list[int]],
+        base_offsets: list[int],
+    ) -> list[Eagle3TargetVerifyOutput]:
+        metadata = self._build_target_verify_batch_metadata(
+            seqs,
+            start_token_ids,
+            draft_token_ids,
+            base_offsets,
+        )
+        input_ids = torch.tensor(metadata["input_ids"], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(metadata["positions"], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(metadata["slot_mapping"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(metadata["cu_seqlens_q"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(metadata["cu_seqlens_k"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=metadata["max_seqlen_q"],
+            max_seqlen_k=metadata["max_seqlen_k"],
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+        )
+        try:
+            hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states, all_tokens=True)
+        finally:
+            reset_context()
+
+        logits_by_seq = torch.split(logits, metadata["verify_lengths"], dim=0)
+        aux_by_seq = torch.split(aux_hidden, metadata["verify_lengths"], dim=0)
+        return [
+            Eagle3TargetVerifyOutput(seq_logits, seq_aux)
+            for seq_logits, seq_aux in zip(logits_by_seq, aux_by_seq)
+        ]
 
     @torch.inference_mode()
     def run_target_verify_with_eagle3_aux(
@@ -301,37 +410,12 @@ class ModelRunner:
         draft_token_ids: list[int],
         base_offset: int = 0,
     ) -> Eagle3TargetVerifyOutput:
-        verify_token_ids = [start_token_id] + draft_token_ids
-        num_verify = len(verify_token_ids)
-        base_pos = len(seq) + base_offset
-        if base_pos < 0:
-            raise ValueError(f"invalid speculative verify base_pos: {base_pos}")
-        input_ids = torch.tensor(verify_token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.arange(base_pos, base_pos + num_verify, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-
-        slot_mapping = []
-        for absolute_pos in range(base_pos, base_pos + num_verify):
-            block_idx = absolute_pos // self.block_size
-            offset = absolute_pos % self.block_size
-            slot_mapping.append(seq.block_table[block_idx] * self.block_size + offset)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor([0, num_verify], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor([0, base_pos + num_verify], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables([seq])
-
-        set_context(
-            True,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=num_verify,
-            max_seqlen_k=base_pos + num_verify,
-            slot_mapping=slot_mapping,
-            block_tables=block_tables,
-        )
-        hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
-        logits = self.model.compute_logits(hidden_states, all_tokens=True)
-        reset_context()
-        return Eagle3TargetVerifyOutput(logits, aux_hidden)
+        return self.run_target_verify_batch_with_eagle3_aux(
+            [seq],
+            [start_token_id],
+            [draft_token_ids],
+            [base_offset],
+        )[0]
 
     @torch.inference_mode()
     def run_speculative_single(self, seq: Sequence) -> SpeculativeDecodeOutput:
@@ -455,6 +539,204 @@ class ModelRunner:
             timing=timing,
             debug=debug,
         )
+
+    @torch.inference_mode()
+    def _generate_speculative_draft_sequences(self, states: list[dict], accept_mode: str):
+        seqs = [state["seq"] for state in states]
+        use_batched_draft = (
+            accept_mode == "greedy"
+            and getattr(self, "speculative_batched_draft", True)
+        )
+        if use_batched_draft:
+            stage_start = perf_counter()
+            draft_sequences = generate_eagle3_draft_tokens_batched(
+                self.draft_model,
+                start_token_ids=[state["start_token_id"] for state in states],
+                start_aux_hidden=torch.cat([state["start_aux_hidden"] for state in states], dim=0),
+                start_positions=[state["draft_kv_len"] for state in states],
+                gamma=self.speculative_gamma,
+                temperature=seqs[0].temperature,
+                past_kv=[state["draft_past_kv"] for state in states],
+                draft_sampling_mode="greedy",
+            )
+            proposal_time_share = (perf_counter() - stage_start) / len(seqs)
+            for state, draft_sequence in zip(states, draft_sequences):
+                state["draft_sequence"] = draft_sequence
+                state["draft_proposal_time"] = proposal_time_share
+            return
+
+        for state in states:
+            seq = state["seq"]
+            stage_start = perf_counter()
+            state["draft_sequence"] = generate_eagle3_draft_tokens(
+                self.draft_model,
+                start_token_id=state["start_token_id"],
+                start_aux_hidden=state["start_aux_hidden"],
+                start_position=state["draft_kv_len"],
+                gamma=self.speculative_gamma,
+                temperature=seq.temperature,
+                past_kv=state["draft_past_kv"],
+                kv_valid_len=(
+                    state["draft_kv_len"]
+                    if state["draft_past_kv"] is not None else None
+                ),
+                draft_sampling_mode="greedy" if accept_mode == "greedy" else "sample",
+            )
+            state["draft_proposal_time"] = perf_counter() - stage_start
+
+    @torch.inference_mode()
+    def run_speculative_batch(self, seqs: list[Sequence]) -> list[SpeculativeDecodeOutput]:
+        """合批生成 draft，再把所有候选打包成一次 target verify。"""
+        assert self.draft_model is not None
+        if not seqs:
+            return []
+        if len(seqs) == 1:
+            return [self.run_speculative_single(seqs[0])]
+
+        total_start = perf_counter()
+        if not hasattr(self, "_prev_correction"):
+            self._prev_correction = {}
+        prev_correction = getattr(self, "_prev_correction", {})
+        merged_by_seq = {seq.seq_id: seq.seq_id in prev_correction for seq in seqs}
+        decode_seqs = [seq for seq in seqs if not merged_by_seq[seq.seq_id]]
+        target_decode_time = 0.0
+        decoded_starts = {}
+
+        if decode_seqs:
+            stage_start = perf_counter()
+            target_decode = self.run_target_decode_with_eagle3_aux(decode_seqs)
+            reset_context()
+            target_decode_time = perf_counter() - stage_start
+            for index, seq in enumerate(decode_seqs):
+                decoded_starts[seq.seq_id] = (
+                    target_decode.token_ids[index],
+                    target_decode.aux_hidden[index].view(1, 1, -1),
+                    int(target_decode.positions[index].item()),
+                )
+
+        states = []
+        accept_mode = getattr(self, "speculative_accept_mode", "greedy")
+        for seq in seqs:
+            merged = merged_by_seq[seq.seq_id]
+            if merged:
+                start_token_id, start_aux_hidden = prev_correction[seq.seq_id]
+                start_aux_hidden = start_aux_hidden.view(1, 1, -1)
+                decoded_position = None
+            else:
+                start_token_id, start_aux_hidden, decoded_position = decoded_starts[seq.seq_id]
+
+            draft_past_kv = self._get_single_draft_kv(seq)
+            if draft_past_kv is not None:
+                draft_kv_len = draft_past_kv[0].shape[2]
+            elif merged:
+                draft_kv_len = len(seq)
+            else:
+                draft_kv_len = decoded_position + 1
+
+            states.append({
+                "seq": seq,
+                "merged": merged,
+                "start_token_id": start_token_id,
+                "start_aux_hidden": start_aux_hidden,
+                "draft_kv_len": draft_kv_len,
+                "draft_past_kv": draft_past_kv,
+            })
+
+        self._generate_speculative_draft_sequences(states, accept_mode)
+
+        stage_start = perf_counter()
+        verify_outputs = self.run_target_verify_batch_with_eagle3_aux(
+            seqs,
+            [state["start_token_id"] for state in states],
+            [state["draft_sequence"].draft_token_ids for state in states],
+            [-1 if state["merged"] else 0 for state in states],
+        )
+        target_verify_time = perf_counter() - stage_start
+        target_decode_share = target_decode_time / len(decode_seqs) if decode_seqs else 0.0
+        target_verify_share = target_verify_time / len(seqs)
+
+        outputs = []
+        for state, verify_output in zip(states, verify_outputs):
+            seq = state["seq"]
+            draft_sequence = state["draft_sequence"]
+            stage_start = perf_counter()
+            draft_ids = torch.tensor(
+                draft_sequence.draft_token_ids,
+                dtype=torch.long,
+                device=verify_output.target_logits.device,
+            )
+            if accept_mode == "greedy":
+                sample_result = speculative_accept_greedy_from_logits(
+                    verify_output.target_logits,
+                    draft_ids,
+                )
+            elif accept_mode == "rejection":
+                sample_result = speculative_accept_reject_from_logits(
+                    verify_output.target_logits,
+                    draft_sequence.draft_target_logits,
+                    draft_ids,
+                    temperature=seq.temperature,
+                )
+            else:
+                raise ValueError(f"unsupported speculative_accept_mode: {accept_mode}")
+
+            token_ids = ([] if state["merged"] else [state["start_token_id"]]) + sample_result.token_ids
+            correction_aux = verify_output.target_aux_hidden[sample_result.num_accepted]
+            self._prev_correction[seq.seq_id] = (
+                sample_result.final_token_id,
+                correction_aux.detach(),
+            )
+            accept_time = perf_counter() - stage_start
+
+            trace_time = 0.0
+            debug = None
+            if getattr(self, "speculative_trace", False):
+                stage_start = perf_counter()
+                debug = self._build_speculative_debug(
+                    accept_mode=accept_mode,
+                    start_token_id=state["start_token_id"],
+                    draft_token_ids=draft_sequence.draft_token_ids,
+                    target_logits=verify_output.target_logits,
+                    sample_token_ids=token_ids,
+                    num_accepted=sample_result.num_accepted,
+                    accepted_all=sample_result.accepted_all,
+                    draft_kv_len=state["draft_kv_len"],
+                )
+                trace_time = perf_counter() - stage_start
+
+            stage_start = perf_counter()
+            self._update_single_draft_kv(
+                seq,
+                draft_sequence.past_kv,
+                state["draft_kv_len"],
+                token_ids,
+                verify_output.target_aux_hidden,
+                sample_result.num_accepted,
+            )
+            kv_update_time = perf_counter() - stage_start
+            timing = {
+                "target_decode_time": target_decode_share if not state["merged"] else 0.0,
+                "draft_proposal_time": state["draft_proposal_time"],
+                "target_verify_time": target_verify_share,
+                "accept_time": accept_time,
+                "kv_update_time": kv_update_time,
+                "trace_time": trace_time,
+                "total_time": 0.0,
+            }
+            outputs.append(SpeculativeDecodeOutput(
+                token_ids=token_ids,
+                num_draft_tokens=len(draft_sequence.draft_token_ids),
+                num_accepted=sample_result.num_accepted,
+                accepted_all=sample_result.accepted_all,
+                emitted_tokens=len(token_ids),
+                timing=timing,
+                debug=debug,
+            ))
+
+        total_time_share = (perf_counter() - total_start) / len(seqs)
+        for output in outputs:
+            output.timing["total_time"] = total_time_share
+        return outputs
 
     def warmup_model(self):
         torch.cuda.empty_cache()

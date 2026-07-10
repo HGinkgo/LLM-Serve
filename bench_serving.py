@@ -12,6 +12,8 @@ import time
 from collections import deque
 from random import Random
 
+import torch
+
 from thrustlm import LLM, SamplingParams
 
 
@@ -25,6 +27,11 @@ DEFAULT_NATURAL_PROMPTS = [
     "What are the trade-offs of using a smaller draft model for speculative decoding?",
     "Explain continuous batching to a systems engineering interviewer.",
 ]
+
+
+class ArgmaxSampler:
+    def __call__(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        return logits.argmax(dim=-1)
 
 
 def parse_args():
@@ -49,6 +56,8 @@ def parse_args():
     parser.add_argument("--speculative-model", default=os.environ.get("SPECULATIVE_MODEL"))
     parser.add_argument("--speculative-gamma", type=int, default=3)
     parser.add_argument("--speculative-accept-mode", choices=["greedy", "rejection"], default="greedy")
+    parser.add_argument("--disable-batched-draft", action="store_true")
+    parser.add_argument("--argmax-sampler", action="store_true")
     parser.add_argument("--speculative-trace", action="store_true")
     parser.add_argument("--output-json", default=None)
     return parser.parse_args()
@@ -157,6 +166,9 @@ def print_summary(result):
         print("Speculative Metrics")
         print("-------------------")
         print(f"steps:          {speculative['steps']}")
+        print(f"batch calls:    {speculative.get('batch_calls', 0)}")
+        print(f"mean batch:     {format_float(speculative.get('mean_batch_size'))}")
+        print(f"max batch:      {speculative.get('max_batch_size', 0)}")
         print(f"draft tokens:   {speculative['draft_tokens']}")
         print(f"accepted:       {speculative['accepted_tokens']}")
         print(f"emitted:        {speculative['emitted_tokens']}")
@@ -205,8 +217,11 @@ def run_benchmark(args):
         speculative_model=speculative_model,
         speculative_gamma=args.speculative_gamma,
         speculative_accept_mode=args.speculative_accept_mode,
+        speculative_batched_draft=not args.disable_batched_draft,
         speculative_trace=args.speculative_trace,
     )
+    if args.argmax_sampler:
+        engine.model_runner.sampler = ArgmaxSampler()
 
     start = time.perf_counter()
     while workload or not engine.is_finished():
@@ -247,6 +262,8 @@ def run_benchmark(args):
             "speculative_model": speculative_model,
             "speculative_gamma": args.speculative_gamma,
             "speculative_accept_mode": args.speculative_accept_mode,
+            "speculative_batched_draft": not args.disable_batched_draft,
+            "argmax_sampler": args.argmax_sampler,
             "speculative_trace": args.speculative_trace,
         },
         "metrics": metrics,

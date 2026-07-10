@@ -140,6 +140,16 @@ class BlockManager:
             seq.block_table.append(block_id)
         return True
 
+    def ensure_slots_batch(self, seqs: list[Sequence], num_tokens: int) -> bool:
+        """先检查整批容量，再为每条序列预留 speculative KV slots。"""
+        required_blocks = sum(self.num_required_blocks(seq, num_tokens) for seq in seqs)
+        if required_blocks > len(self.free_block_ids):
+            return False
+        for seq in seqs:
+            if not self.ensure_slots(seq, num_tokens):
+                raise RuntimeError("speculative batch reservation became non-atomic")
+        return True
+
     def finalize_full_blocks(self, seq: Sequence):
         for block_idx in range(min(seq.num_blocks, len(seq.block_table))):
             self._finalize_block_hash(seq, block_idx)

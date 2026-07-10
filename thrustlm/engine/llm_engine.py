@@ -38,6 +38,9 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         self.request_metrics = {}
         self.last_step_events = {}
+        self.speculative_batch_calls = 0
+        self.speculative_batch_sequences = 0
+        self.speculative_max_batch_size = 0
         self._exited = False
         atexit.register(self.exit)
 
@@ -148,74 +151,24 @@ class LLMEngine:
         step_start = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
         if self._can_run_speculative_step(seqs, is_prefill):
-            seq = seqs[0]
             num_reserved_tokens = self.model_runner.speculative_gamma + 2
-            if self.scheduler.block_manager.ensure_slots(seq, num_reserved_tokens):
-                before = seq.num_completion_tokens
-                speculative_output = self.model_runner.call("run_speculative_single", seq)
-                self.scheduler.postprocess_speculative(seq, speculative_output.token_ids)
-                step_end = perf_counter()
-
-                metric = self.request_metrics.get(seq.seq_id)
-                first_token_seq_ids = []
-                decode_seq_ids = []
-                finished_seq_ids = []
-                if metric is not None:
-                    after = seq.num_completion_tokens
-                    emitted_tokens = after - before
-                    if after > before:
-                        if metric["first_token_time"] is None:
-                            metric["first_token_time"] = step_end
-                            first_token_seq_ids.append(seq.seq_id)
-                        decode_seq_ids.append(seq.seq_id)
-                        metric["token_times"].extend([step_end] * emitted_tokens)
-                        metric["output_tokens"] = after
-                    metric.setdefault("speculative_steps", 0)
-                    metric.setdefault("speculative_draft_tokens", 0)
-                    metric.setdefault("speculative_accepted_tokens", 0)
-                    metric.setdefault("speculative_emitted_tokens", 0)
-                    metric.setdefault("speculative_accept_all_count", 0)
-                    metric["speculative_steps"] += 1
-                    metric["speculative_draft_tokens"] += speculative_output.num_draft_tokens
-                    metric["speculative_accepted_tokens"] += speculative_output.num_accepted
-                    metric["speculative_emitted_tokens"] += emitted_tokens
-                    metric["speculative_accept_all_count"] += int(speculative_output.accepted_all)
-                    self._accumulate_speculative_timing(metric, speculative_output.timing)
-                    if speculative_output.debug is not None:
-                        metric.setdefault("speculative_trace", []).append(
-                            self._build_speculative_trace_entry(
-                                speculative_output.debug,
-                                metric["speculative_steps"],
-                                speculative_output.token_ids,
-                                speculative_output.num_accepted,
-                                speculative_output.accepted_all,
-                            )
-                        )
-                    if seq.is_finished and metric["finish_time"] is None:
-                        metric["finish_time"] = step_end
-                        metric["success"] = True
-                        finished_seq_ids.append(seq.seq_id)
-
-                num_tokens = -(seq.num_completion_tokens - before)
-                self.last_step_events = {
-                    "step_start": step_start,
-                    "step_end": step_end,
-                    "is_prefill": False,
-                    "num_tokens": num_tokens,
-                    "scheduled_seq_ids": [seq.seq_id],
-                    "first_token_seq_ids": first_token_seq_ids,
-                    "decode_seq_ids": decode_seq_ids,
-                    "finished_seq_ids": finished_seq_ids,
-                    "speculative": True,
-                    "speculative_num_draft_tokens": speculative_output.num_draft_tokens,
-                    "speculative_num_accepted": speculative_output.num_accepted,
-                    "speculative_accepted_all": speculative_output.accepted_all,
-                    "speculative_emitted_tokens": seq.num_completion_tokens - before,
-                }
-                if speculative_output.debug is not None:
-                    self.last_step_events["speculative_debug"] = speculative_output.debug
-                outputs = [(seq.seq_id, seq.completion_token_ids)] if seq.is_finished else []
-                return outputs, num_tokens
+            block_manager = self.scheduler.block_manager
+            if len(seqs) == 1:
+                slots_ready = block_manager.ensure_slots(seqs[0], num_reserved_tokens)
+            else:
+                slots_ready = block_manager.ensure_slots_batch(seqs, num_reserved_tokens)
+            if slots_ready:
+                if len(seqs) == 1:
+                    speculative_outputs = [
+                        self.model_runner.call("run_speculative_single", seqs[0])
+                    ]
+                else:
+                    speculative_outputs = self.model_runner.call("run_speculative_batch", seqs)
+                return self._postprocess_speculative_step(
+                    seqs,
+                    speculative_outputs,
+                    step_start,
+                )
 
         # ===== 2026-06-07 chunked prefill =====
         num_tokens = sum(max(seq.num_scheduled_tokens, 0) for seq in seqs) if is_prefill else -len(seqs)
@@ -268,8 +221,117 @@ class LLMEngine:
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
+    def _postprocess_speculative_step(
+        self,
+        seqs: list[Sequence],
+        speculative_outputs,
+        step_start: float,
+    ):
+        if len(seqs) != len(speculative_outputs):
+            raise ValueError("speculative output count does not match scheduled sequences")
+
+        before_completion_tokens = {
+            seq.seq_id: seq.num_completion_tokens for seq in seqs
+        }
+        for seq, speculative_output in zip(seqs, speculative_outputs):
+            self.scheduler.postprocess_speculative(seq, speculative_output.token_ids)
+        step_end = perf_counter()
+
+        self.speculative_batch_calls = getattr(self, "speculative_batch_calls", 0) + 1
+        self.speculative_batch_sequences = getattr(self, "speculative_batch_sequences", 0) + len(seqs)
+        self.speculative_max_batch_size = max(
+            getattr(self, "speculative_max_batch_size", 0),
+            len(seqs),
+        )
+
+        first_token_seq_ids = []
+        decode_seq_ids = []
+        finished_seq_ids = []
+        debug_by_seq = {}
+        total_draft_tokens = 0
+        total_accepted_tokens = 0
+        total_emitted_tokens = 0
+
+        for seq, speculative_output in zip(seqs, speculative_outputs):
+            before = before_completion_tokens[seq.seq_id]
+            after = seq.num_completion_tokens
+            emitted_tokens = after - before
+            total_draft_tokens += speculative_output.num_draft_tokens
+            total_accepted_tokens += speculative_output.num_accepted
+            total_emitted_tokens += emitted_tokens
+
+            metric = self.request_metrics.get(seq.seq_id)
+            if metric is not None:
+                if emitted_tokens > 0:
+                    if metric["first_token_time"] is None:
+                        metric["first_token_time"] = step_end
+                        first_token_seq_ids.append(seq.seq_id)
+                    decode_seq_ids.append(seq.seq_id)
+                    metric["token_times"].extend([step_end] * emitted_tokens)
+                    metric["output_tokens"] = after
+                metric.setdefault("speculative_steps", 0)
+                metric.setdefault("speculative_draft_tokens", 0)
+                metric.setdefault("speculative_accepted_tokens", 0)
+                metric.setdefault("speculative_emitted_tokens", 0)
+                metric.setdefault("speculative_accept_all_count", 0)
+                metric["speculative_steps"] += 1
+                metric["speculative_draft_tokens"] += speculative_output.num_draft_tokens
+                metric["speculative_accepted_tokens"] += speculative_output.num_accepted
+                metric["speculative_emitted_tokens"] += emitted_tokens
+                metric["speculative_accept_all_count"] += int(speculative_output.accepted_all)
+                self._accumulate_speculative_timing(metric, speculative_output.timing)
+                if speculative_output.debug is not None:
+                    metric.setdefault("speculative_trace", []).append(
+                        self._build_speculative_trace_entry(
+                            speculative_output.debug,
+                            metric["speculative_steps"],
+                            speculative_output.token_ids,
+                            speculative_output.num_accepted,
+                            speculative_output.accepted_all,
+                        )
+                    )
+                if seq.is_finished and metric["finish_time"] is None:
+                    metric["finish_time"] = step_end
+                    metric["success"] = True
+                    finished_seq_ids.append(seq.seq_id)
+            if speculative_output.debug is not None:
+                debug_by_seq[seq.seq_id] = speculative_output.debug
+
+        num_tokens = -total_emitted_tokens
+        self.last_step_events = {
+            "step_start": step_start,
+            "step_end": step_end,
+            "is_prefill": False,
+            "num_tokens": num_tokens,
+            "scheduled_seq_ids": [seq.seq_id for seq in seqs],
+            "first_token_seq_ids": first_token_seq_ids,
+            "decode_seq_ids": decode_seq_ids,
+            "finished_seq_ids": finished_seq_ids,
+            "speculative": True,
+            "speculative_batch_size": len(seqs),
+            "speculative_num_draft_tokens": total_draft_tokens,
+            "speculative_num_accepted": total_accepted_tokens,
+            "speculative_accepted_all": all(output.accepted_all for output in speculative_outputs),
+            "speculative_emitted_tokens": total_emitted_tokens,
+        }
+        if debug_by_seq:
+            self.last_step_events["speculative_debug_by_seq"] = debug_by_seq
+            if len(seqs) == 1:
+                self.last_step_events["speculative_debug"] = debug_by_seq[seqs[0].seq_id]
+
+        finished_state_ids = [seq.seq_id for seq in seqs if seq.is_finished]
+        if finished_state_ids:
+            self.model_runner.call("clear_speculative_state", finished_state_ids)
+
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids)
+            for seq in seqs
+            if seq.is_finished
+        ]
+        return outputs, num_tokens
+
     def _can_run_speculative_step(self, seqs: list[Sequence], is_prefill: bool):
-        if is_prefill or len(seqs) != 1:
+        if is_prefill or not seqs:
             return False
         if getattr(self.model_runner, "draft_model", None) is None:
             return False
@@ -389,6 +451,13 @@ class LLMEngine:
                 "request_latency": self._summary(request_latencies),
                 "speculative": {
                     "steps": total_speculative_steps,
+                    "batch_calls": getattr(self, "speculative_batch_calls", 0),
+                    "mean_batch_size": (
+                        getattr(self, "speculative_batch_sequences", 0)
+                        / getattr(self, "speculative_batch_calls", 0)
+                        if getattr(self, "speculative_batch_calls", 0) > 0 else None
+                    ),
+                    "max_batch_size": getattr(self, "speculative_max_batch_size", 0),
                     "draft_tokens": total_speculative_draft_tokens,
                     "accepted_tokens": total_speculative_accepted_tokens,
                     "emitted_tokens": total_speculative_emitted_tokens,

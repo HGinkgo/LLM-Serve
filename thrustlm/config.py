@@ -19,6 +19,7 @@ class Config:
     speculative_model: str | None = None
     speculative_gamma: int = 3
     speculative_accept_mode: str = "greedy"
+    speculative_batched_draft: bool = True
     speculative_trace: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
