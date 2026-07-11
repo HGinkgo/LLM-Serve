@@ -18,8 +18,8 @@ class Config:
     # ===== 2026-06-07 chunked prefill =====
     speculative_model: str | None = None
     speculative_gamma: int = 3
+    speculative_tree_nodes: int = 0
     speculative_accept_mode: str = "greedy"
-    speculative_batched_draft: bool = True
     speculative_trace: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -31,6 +31,11 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.speculative_gamma > 0
+        assert self.speculative_tree_nodes in {0, 6, 10}
+        if self.speculative_tree_nodes:
+            assert self.speculative_gamma == 3
+            assert self.speculative_accept_mode == "greedy"
+            assert self.speculative_model is not None
         assert self.speculative_accept_mode in {"greedy", "rejection"}
         if self.speculative_model is not None:
             assert os.path.isdir(self.speculative_model)

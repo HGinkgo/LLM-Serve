@@ -1,428 +1,75 @@
 import json
 import os
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
+from thrustlm.speculative.draft import (
+    _compact_eagle3_draft_kv,
+    _pack_eagle3_draft_kv,
+    generate_eagle3_draft_tokens,
+    generate_eagle3_draft_tokens_batched,
+    run_eagle3_offline_step,
+    run_eagle3_speculative_cycle,
+    run_eagle3_target_verify,
+)
+from thrustlm.speculative.sampling import (
+    correction_distribution,
+    sample_from_logits,
+    sample_from_probs,
+    speculative_accept_greedy_from_logits,
+    speculative_accept_reject,
+    speculative_accept_reject_from_logits,
+)
+from thrustlm.speculative.types import (
+    Eagle3CycleResult,
+    Eagle3DraftOutput,
+    Eagle3DraftSequence,
+    Eagle3OfflineStepResult,
+    Eagle3TargetVerifyOutput,
+    SpeculativeSampleResult,
+)
 
 
-@dataclass(slots=True)
-class Eagle3DraftOutput:
-    hidden_states: torch.Tensor
-    draft_logits: torch.Tensor
-    target_logits: torch.Tensor
-    token_ids: torch.Tensor
-    past_kv: tuple[torch.Tensor, torch.Tensor]
+def normalize_eagle3_config(config: dict) -> dict:
+    layer_config = config.get("transformer_layer_config")
+    if layer_config is None:
+        return dict(config)
+
+    for name, value in layer_config.items():
+        if name in config and config[name] != value:
+            raise ValueError(f"conflicting EAGLE3 config field: {name}")
+    normalized = dict(layer_config)
+    for name in ("draft_vocab_size", "target_hidden_size", "norm_before_residual"):
+        if name in config:
+            normalized[name] = config[name]
+    return normalized
 
 
-@dataclass(slots=True)
-class SpeculativeSampleResult:
-    token_ids: list[int]
-    accepted_token_ids: list[int]
-    final_token_id: int
-    num_accepted: int
-    accepted_all: bool
+def normalize_eagle3_weight_name(name: str) -> str:
+    if name.startswith("layers.0."):
+        return "midlayer." + name[len("layers.0."):]
+    return name
 
 
-@dataclass(slots=True)
-class Eagle3CycleResult:
-    draft_token_ids: list[int]
-    draft_target_logits: torch.Tensor
-    sample_result: SpeculativeSampleResult
-    past_kv: tuple[torch.Tensor, torch.Tensor]
-
-
-@dataclass(slots=True)
-class Eagle3DraftSequence:
-    draft_token_ids: list[int]
-    draft_target_logits: torch.Tensor
-    past_kv: tuple[torch.Tensor, torch.Tensor]
-
-
-@dataclass(slots=True)
-class Eagle3TargetVerifyOutput:
-    target_logits: torch.Tensor
-    target_aux_hidden: torch.Tensor
-
-
-@dataclass(slots=True)
-class Eagle3OfflineStepResult:
-    draft_token_ids: list[int]
-    draft_target_logits: torch.Tensor
-    verify_output: Eagle3TargetVerifyOutput
-    sample_result: SpeculativeSampleResult
-    past_kv: tuple[torch.Tensor, torch.Tensor]
-
-
-def sample_from_logits(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    assert temperature > 1e-10
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    flat_probs = probs.reshape(-1, probs.size(-1))
-    sampled = torch.multinomial(flat_probs, num_samples=1)
-    return sampled.view(*logits.shape[:-1])
-
-
-def sample_from_probs(probs: torch.Tensor) -> int:
-    return int(torch.multinomial(probs.float(), num_samples=1).item())
-
-
-def correction_distribution(target_probs: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
-    diff = torch.clamp(target_probs.float() - draft_probs.float(), min=0)
-    total = diff.sum()
-    if total <= 0:
-        return target_probs.float() / target_probs.float().sum()
-    return diff / total
-
-
-def speculative_accept_reject(
-    target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
-    draft_token_ids: torch.Tensor,
-    random_values: torch.Tensor | None = None,
-) -> SpeculativeSampleResult:
-    num_draft_tokens = int(draft_token_ids.numel())
-    assert target_probs.ndim == 2
-    assert draft_probs.ndim == 2
-    assert target_probs.size(0) == num_draft_tokens + 1
-    assert draft_probs.size(0) == num_draft_tokens
-
-    accepted: list[int] = []
-    for i in range(num_draft_tokens):
-        token_id = int(draft_token_ids[i].item())
-        p = float(target_probs[i, token_id].item())
-        q = float(draft_probs[i, token_id].item())
-        accept_prob = 1.0 if q <= 0 else min(1.0, p / q)
-        u = float(random_values[i].item()) if random_values is not None else float(torch.rand(()).item())
-        if u <= accept_prob:
-            accepted.append(token_id)
-            continue
-        correction_probs = correction_distribution(target_probs[i], draft_probs[i])
-        correction_token = sample_from_probs(correction_probs)
-        return SpeculativeSampleResult(
-            token_ids=accepted + [correction_token],
-            accepted_token_ids=accepted,
-            final_token_id=correction_token,
-            num_accepted=len(accepted),
-            accepted_all=False,
+def validate_eagle3_target_config(draft_config: dict, target_config: dict):
+    draft_config = normalize_eagle3_config(draft_config)
+    target_hidden_size = target_config["hidden_size"]
+    expected_hidden_size = draft_config.get("target_hidden_size") or draft_config["hidden_size"]
+    if target_hidden_size != expected_hidden_size:
+        raise ValueError(
+            f"target hidden_size {target_hidden_size} does not match "
+            f"draft target_hidden_size {expected_hidden_size}"
         )
-
-    bonus_token = sample_from_probs(target_probs[num_draft_tokens])
-    return SpeculativeSampleResult(
-        token_ids=accepted + [bonus_token],
-        accepted_token_ids=accepted,
-        final_token_id=bonus_token,
-        num_accepted=len(accepted),
-        accepted_all=True,
-    )
-
-
-def speculative_accept_reject_from_logits(
-    target_logits: torch.Tensor,
-    draft_logits: torch.Tensor,
-    draft_token_ids: torch.Tensor,
-    temperature: float,
-    random_values: torch.Tensor | None = None,
-) -> SpeculativeSampleResult:
-    # draft_logits 这里必须已经映射到 target vocab；不能直接传 32000 维 raw draft logits。
-    assert temperature > 1e-10
-    target_probs = torch.softmax(target_logits.float() / temperature, dim=-1)
-    draft_probs = torch.softmax(draft_logits.float() / temperature, dim=-1)
-    return speculative_accept_reject(target_probs, draft_probs, draft_token_ids, random_values=random_values)
-
-
-def speculative_accept_greedy_from_logits(
-    target_logits: torch.Tensor,
-    draft_token_ids: torch.Tensor,
-) -> SpeculativeSampleResult:
-    num_draft_tokens = int(draft_token_ids.numel())
-    assert target_logits.ndim == 2
-    assert target_logits.size(0) == num_draft_tokens + 1
-
-    target_token_ids = target_logits.argmax(dim=-1)
-    accepted: list[int] = []
-    for i in range(num_draft_tokens):
-        draft_token_id = int(draft_token_ids[i].item())
-        target_token_id = int(target_token_ids[i].item())
-        if target_token_id != draft_token_id:
-            return SpeculativeSampleResult(
-                token_ids=accepted + [target_token_id],
-                accepted_token_ids=accepted,
-                final_token_id=target_token_id,
-                num_accepted=len(accepted),
-                accepted_all=False,
-            )
-        accepted.append(draft_token_id)
-
-    bonus_token = int(target_token_ids[num_draft_tokens].item())
-    return SpeculativeSampleResult(
-        token_ids=accepted + [bonus_token],
-        accepted_token_ids=accepted,
-        final_token_id=bonus_token,
-        num_accepted=len(accepted),
-        accepted_all=True,
-    )
-
-
-def generate_eagle3_draft_tokens(
-    draft_model,
-    start_token_id: int,
-    start_aux_hidden: torch.Tensor,
-    start_position: int,
-    gamma: int,
-    temperature: float,
-    past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-    kv_valid_len: int | None = None,
-    draft_sampling_mode: str = "sample",
-):
-    assert gamma > 0
-    assert draft_sampling_mode in {"sample", "greedy"}
-
-    device = start_aux_hidden.device
-    input_ids = torch.tensor([[start_token_id]], dtype=torch.long, device=device)
-    positions = torch.tensor([[start_position]], dtype=torch.long, device=device)
-    aux_hidden = start_aux_hidden
-    draft_token_ids: list[int] = []
-    draft_target_logits = []
-
-    for step in range(gamma):
-        kv_valid_lens = None
-        if kv_valid_len is not None:
-            kv_valid_lens = torch.tensor([kv_valid_len + step], dtype=torch.long, device=device)
-        output = draft_model.propose(
-            input_ids,
-            aux_hidden,
-            positions,
-            temperature=temperature,
-            past_kv=past_kv,
-            kv_valid_lens=kv_valid_lens,
+    target_vocab_size = target_config["vocab_size"]
+    if target_vocab_size != draft_config["vocab_size"]:
+        raise ValueError(
+            f"target vocab_size {target_vocab_size} does not match "
+            f"draft vocab_size {draft_config['vocab_size']}"
         )
-        if draft_sampling_mode == "greedy":
-            next_token_ids = draft_model.greedy_sample(output.draft_logits[:, -1:, :])
-        else:
-            next_token_ids = output.token_ids
-        token_id = int(next_token_ids.item())
-        draft_token_ids.append(token_id)
-        draft_target_logits.append(output.target_logits[0, -1])
+    if target_config.get("num_hidden_layers", 0) < 6:
+        raise ValueError("EAGLE3 target must have at least 6 hidden layers")
 
-        input_ids = next_token_ids[:, -1:].to(device)
-        # 第一步使用 target 的 3H aux hidden；后续 draft 自回归用上一轮 draft hidden 的 H 表示。
-        aux_hidden = output.hidden_states[:, -1:, :]
-        positions = positions + 1
-        past_kv = output.past_kv
-
-    draft_logits = torch.stack(draft_target_logits, dim=0)
-    return Eagle3DraftSequence(draft_token_ids, draft_logits, past_kv)
-
-
-def _pack_eagle3_draft_kv(
-    past_kv: list[tuple[torch.Tensor, torch.Tensor] | None],
-) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, list[int]]:
-    valid_lengths = [0 if item is None else item[0].size(2) for item in past_kv]
-    max_length = max(valid_lengths, default=0)
-    if max_length == 0:
-        return None, valid_lengths
-
-    template = next(item for item in past_kv if item is not None)
-    packed_k = []
-    packed_v = []
-    for item, valid_length in zip(past_kv, valid_lengths):
-        if item is None:
-            shape = (1, template[0].size(1), max_length, template[0].size(3))
-            packed_k.append(template[0].new_zeros(shape))
-            packed_v.append(template[1].new_zeros(shape))
-            continue
-        if item[0].size(0) != 1 or item[1].size(0) != 1:
-            raise ValueError("per-request draft KV must have batch size 1")
-        padding = max_length - valid_length
-        packed_k.append(F.pad(item[0], (0, 0, 0, padding)))
-        packed_v.append(F.pad(item[1], (0, 0, 0, padding)))
-    return (torch.cat(packed_k, dim=0), torch.cat(packed_v, dim=0)), valid_lengths
-
-
-def _compact_eagle3_draft_kv(
-    packed_past: tuple[torch.Tensor, torch.Tensor] | None,
-    proposed_past: tuple[torch.Tensor, torch.Tensor],
-    valid_lengths: list[int],
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    compact = []
-    for index, valid_length in enumerate(valid_lengths):
-        if packed_past is None:
-            old_k = proposed_past[0][index:index + 1, :, :0, :]
-            old_v = proposed_past[1][index:index + 1, :, :0, :]
-        else:
-            old_k = packed_past[0][index:index + 1, :, :valid_length, :]
-            old_v = packed_past[1][index:index + 1, :, :valid_length, :]
-        new_k = proposed_past[0][index:index + 1, :, -1:, :]
-        new_v = proposed_past[1][index:index + 1, :, -1:, :]
-        compact.append((
-            torch.cat([old_k, new_k], dim=2).contiguous(),
-            torch.cat([old_v, new_v], dim=2).contiguous(),
-        ))
-    return compact
-
-
-def generate_eagle3_draft_tokens_batched(
-    draft_model,
-    start_token_ids: list[int],
-    start_aux_hidden: torch.Tensor,
-    start_positions: list[int],
-    gamma: int,
-    temperature: float,
-    past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-    draft_sampling_mode: str = "sample",
-) -> list[Eagle3DraftSequence]:
-    """用 gamma 次 batched forward 为整批请求生成 draft token。"""
-    assert gamma > 0
-    assert draft_sampling_mode in {"sample", "greedy"}
-    batch_size = len(start_token_ids)
-    if batch_size == 0:
-        return []
-    if len(start_positions) != batch_size or start_aux_hidden.size(0) != batch_size:
-        raise ValueError("batched draft inputs have inconsistent sizes")
-
-    device = start_aux_hidden.device
-    input_ids = torch.tensor(start_token_ids, dtype=torch.long, device=device).view(batch_size, 1)
-    positions = torch.tensor(start_positions, dtype=torch.long, device=device).view(batch_size, 1)
-    aux_hidden = start_aux_hidden
-    compact_past = list(past_kv) if past_kv is not None else [None] * batch_size
-    if len(compact_past) != batch_size:
-        raise ValueError("batched draft KV count does not match batch size")
-    draft_token_ids = [[] for _ in range(batch_size)]
-    draft_target_logits = [[] for _ in range(batch_size)]
-
-    for _ in range(gamma):
-        packed_past, valid_lengths = _pack_eagle3_draft_kv(compact_past)
-        kv_valid_lens = None
-        if packed_past is not None:
-            kv_valid_lens = torch.tensor(valid_lengths, dtype=torch.long, device=device)
-        output = draft_model.propose(
-            input_ids,
-            aux_hidden,
-            positions,
-            temperature=temperature,
-            past_kv=packed_past,
-            kv_valid_lens=kv_valid_lens,
-        )
-        if draft_sampling_mode == "greedy":
-            next_token_ids = draft_model.greedy_sample(output.draft_logits[:, -1:, :])
-        else:
-            next_token_ids = output.token_ids
-
-        for index in range(batch_size):
-            draft_token_ids[index].append(int(next_token_ids[index, -1].item()))
-            draft_target_logits[index].append(output.target_logits[index, -1])
-
-        compact_past = _compact_eagle3_draft_kv(
-            packed_past,
-            output.past_kv,
-            valid_lengths,
-        )
-        input_ids = next_token_ids[:, -1:].to(device)
-        aux_hidden = output.hidden_states[:, -1:, :]
-        positions = positions + 1
-
-    return [
-        Eagle3DraftSequence(
-            draft_token_ids[index],
-            torch.stack(draft_target_logits[index], dim=0),
-            compact_past[index],
-        )
-        for index in range(batch_size)
-    ]
-
-
-def run_eagle3_speculative_cycle(
-    draft_model,
-    start_token_id: int,
-    start_aux_hidden: torch.Tensor,
-    start_position: int,
-    target_verify_logits: torch.Tensor,
-    gamma: int,
-    temperature: float,
-    random_values: torch.Tensor | None = None,
-) -> Eagle3CycleResult:
-    assert gamma > 0
-    assert target_verify_logits.ndim == 2
-    assert target_verify_logits.size(0) == gamma + 1
-
-    draft_sequence = generate_eagle3_draft_tokens(
-        draft_model,
-        start_token_id=start_token_id,
-        start_aux_hidden=start_aux_hidden,
-        start_position=start_position,
-        gamma=gamma,
-        temperature=temperature,
-    )
-    sample_result = speculative_accept_reject_from_logits(
-        target_verify_logits,
-        draft_sequence.draft_target_logits,
-        torch.tensor(draft_sequence.draft_token_ids, dtype=torch.long, device=target_verify_logits.device),
-        temperature=temperature,
-        random_values=random_values,
-    )
-    return Eagle3CycleResult(
-        draft_sequence.draft_token_ids,
-        draft_sequence.draft_target_logits,
-        sample_result,
-        draft_sequence.past_kv,
-    )
-
-
-def run_eagle3_target_verify(
-    target_model,
-    start_token_id: int,
-    draft_token_ids: list[int],
-    start_position: int,
-) -> Eagle3TargetVerifyOutput:
-    token_ids = [start_token_id] + list(draft_token_ids)
-    device = next(target_model.parameters()).device if isinstance(target_model, nn.Module) else torch.device("cpu")
-    input_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
-    positions = torch.arange(start_position, start_position + len(token_ids), dtype=torch.long, device=device)
-    hidden_states, aux_hidden = target_model.forward_with_eagle3_aux(input_ids, positions)
-    target_logits = target_model.compute_logits(hidden_states)
-    return Eagle3TargetVerifyOutput(target_logits, aux_hidden)
-
-
-def run_eagle3_offline_step(
-    target_model,
-    draft_model,
-    start_token_id: int,
-    start_aux_hidden: torch.Tensor,
-    start_position: int,
-    gamma: int,
-    temperature: float,
-    random_values: torch.Tensor | None = None,
-) -> Eagle3OfflineStepResult:
-    draft_sequence = generate_eagle3_draft_tokens(
-        draft_model,
-        start_token_id=start_token_id,
-        start_aux_hidden=start_aux_hidden,
-        start_position=start_position,
-        gamma=gamma,
-        temperature=temperature,
-    )
-    verify_output = run_eagle3_target_verify(
-        target_model,
-        start_token_id=start_token_id,
-        draft_token_ids=draft_sequence.draft_token_ids,
-        start_position=start_position,
-    )
-    sample_result = speculative_accept_reject_from_logits(
-        verify_output.target_logits,
-        draft_sequence.draft_target_logits,
-        torch.tensor(draft_sequence.draft_token_ids, dtype=torch.long, device=verify_output.target_logits.device),
-        temperature=temperature,
-        random_values=random_values,
-    )
-    return Eagle3OfflineStepResult(
-        draft_token_ids=draft_sequence.draft_token_ids,
-        draft_target_logits=draft_sequence.draft_target_logits,
-        verify_output=verify_output,
-        sample_result=sample_result,
-        past_kv=draft_sequence.past_kv,
-    )
 
 
 class Eagle3RMSNorm(nn.Module):
@@ -549,9 +196,11 @@ class Eagle3DecoderLayer(nn.Module):
         max_position: int,
         rope_theta: float,
         rms_norm_eps: float,
+        norm_before_residual: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.norm_before_residual = norm_before_residual
         self.input_layernorm = Eagle3RMSNorm(hidden_size, eps=rms_norm_eps)
         self.hidden_norm = Eagle3RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = Eagle3RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -568,8 +217,12 @@ class Eagle3DecoderLayer(nn.Module):
         embeds = hidden_states[:, :, :self.hidden_size]
         hidden = hidden_states[:, :, self.hidden_size:]
 
-        residual = hidden
-        hidden = self.hidden_norm(hidden)
+        if self.norm_before_residual:
+            hidden = self.hidden_norm(hidden)
+            residual = hidden
+        else:
+            residual = hidden
+            hidden = self.hidden_norm(hidden)
         embeds = self.input_layernorm(embeds)
         attn_input = torch.cat([embeds, hidden], dim=-1)
 
@@ -585,11 +238,12 @@ class Eagle3Speculator(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
         self.hidden_size = config["hidden_size"]
+        self.target_hidden_size = config.get("target_hidden_size") or self.hidden_size
         self.draft_vocab_size = config.get("draft_vocab_size", 32000)
         self.target_vocab_size = config["vocab_size"]
 
         self.embed_tokens = nn.Embedding(self.target_vocab_size, self.hidden_size)
-        self.fc = nn.Linear(3 * self.hidden_size, self.hidden_size, bias=False)
+        self.fc = nn.Linear(3 * self.target_hidden_size, self.hidden_size, bias=False)
         self.midlayer = Eagle3DecoderLayer(
             hidden_size=self.hidden_size,
             num_heads=config["num_attention_heads"],
@@ -599,6 +253,7 @@ class Eagle3Speculator(nn.Module):
             max_position=config.get("max_position_embeddings", 40960),
             rope_theta=config.get("rope_theta", 1000000),
             rms_norm_eps=config.get("rms_norm_eps", 1e-6),
+            norm_before_residual=config.get("norm_before_residual", False),
         )
         self.norm = Eagle3RMSNorm(self.hidden_size, eps=config.get("rms_norm_eps", 1e-6))
         self.lm_head = nn.Linear(self.hidden_size, self.draft_vocab_size, bias=False)
@@ -610,7 +265,12 @@ class Eagle3Speculator(nn.Module):
     @classmethod
     def from_pretrained(cls, path: str, target_model_path: str | None = None) -> "Eagle3Speculator":
         with open(os.path.join(path, "config.json")) as f:
-            config = json.load(f)
+            raw_config = json.load(f)
+        config = normalize_eagle3_config(raw_config)
+        if target_model_path is not None:
+            with open(os.path.join(target_model_path, "config.json")) as f:
+                target_config = json.load(f)
+            validate_eagle3_target_config(config, target_config)
         model = cls(config)
         state = {}
         for file_name in os.listdir(path):
@@ -618,7 +278,10 @@ class Eagle3Speculator(nn.Module):
                 continue
             with safe_open(os.path.join(path, file_name), framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    state[key] = f.get_tensor(key)
+                    normalized_key = normalize_eagle3_weight_name(key)
+                    if normalized_key in state:
+                        raise RuntimeError(f"duplicate EAGLE3 weight after normalization: {normalized_key}")
+                    state[normalized_key] = f.get_tensor(key)
         missing, unexpected = model.load_state_dict(state, strict=False)
         if unexpected:
             raise RuntimeError(f"unexpected EAGLE3 weights: {unexpected}")

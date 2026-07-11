@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 import triton
 import triton.language as tl
@@ -55,10 +56,47 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.tree_k = self.tree_v = torch.tensor([])
+
+    def _forward_tree(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context):
+        self.tree_k = k
+        self.tree_v = v
+        prefix_slots = context.tree_prefix_slots.to(device=k.device, dtype=torch.long)
+        flat_k_cache = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
+        flat_v_cache = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
+        prefix_k = flat_k_cache.index_select(0, prefix_slots)
+        prefix_v = flat_v_cache.index_select(0, prefix_slots)
+        all_k = torch.cat([prefix_k, k], dim=0)
+        all_v = torch.cat([prefix_v, v], dim=0)
+        if self.num_heads != self.num_kv_heads:
+            groups = self.num_heads // self.num_kv_heads
+            all_k = all_k.repeat_interleave(groups, dim=1)
+            all_v = all_v.repeat_interleave(groups, dim=1)
+
+        num_prefix = prefix_slots.numel()
+        prefix_mask = torch.ones(
+            (q.size(0), num_prefix),
+            dtype=torch.bool,
+            device=q.device,
+        )
+        tree_mask = context.tree_attention_mask.to(device=q.device, dtype=torch.bool)
+        attention_mask = torch.cat([prefix_mask, tree_mask], dim=1)[None, None]
+        output = F.scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0),
+            all_k.transpose(0, 1).unsqueeze(0),
+            all_v.transpose(0, 1).unsqueeze(0),
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scale,
+        )
+        return output.squeeze(0).transpose(0, 1).contiguous()
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        if context.tree_attention_mask is not None:
+            return self._forward_tree(q, k, v, context)
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:

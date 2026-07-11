@@ -98,6 +98,7 @@ class LLMEngine:
             "speculative_accepted_tokens": 0,
             "speculative_emitted_tokens": 0,
             "speculative_accept_all_count": 0,
+            "speculative_gamma_counts": {},
             "speculative_trace": [],
             "speculative_timing": {},
         }
@@ -159,8 +160,13 @@ class LLMEngine:
                 slots_ready = block_manager.ensure_slots_batch(seqs, num_reserved_tokens)
             if slots_ready:
                 if len(seqs) == 1:
+                    method_name = (
+                        "run_speculative_tree_single"
+                        if getattr(self.model_runner, "speculative_tree_nodes", 0)
+                        else "run_speculative_single"
+                    )
                     speculative_outputs = [
-                        self.model_runner.call("run_speculative_single", seqs[0])
+                        self.model_runner.call(method_name, seqs[0])
                     ]
                 else:
                     speculative_outputs = self.model_runner.call("run_speculative_batch", seqs)
@@ -274,11 +280,16 @@ class LLMEngine:
                 metric.setdefault("speculative_accepted_tokens", 0)
                 metric.setdefault("speculative_emitted_tokens", 0)
                 metric.setdefault("speculative_accept_all_count", 0)
+                metric.setdefault("speculative_gamma_counts", {})
                 metric["speculative_steps"] += 1
                 metric["speculative_draft_tokens"] += speculative_output.num_draft_tokens
                 metric["speculative_accepted_tokens"] += speculative_output.num_accepted
                 metric["speculative_emitted_tokens"] += emitted_tokens
                 metric["speculative_accept_all_count"] += int(speculative_output.accepted_all)
+                gamma_key = str(speculative_output.num_draft_tokens)
+                metric["speculative_gamma_counts"][gamma_key] = (
+                    metric["speculative_gamma_counts"].get(gamma_key, 0) + 1
+                )
                 self._accumulate_speculative_timing(metric, speculative_output.timing)
                 if speculative_output.debug is not None:
                     metric.setdefault("speculative_trace", []).append(
@@ -356,6 +367,7 @@ class LLMEngine:
         total_speculative_accepted_tokens = 0
         total_speculative_emitted_tokens = 0
         total_speculative_accept_all_count = 0
+        total_speculative_gamma_counts = {}
         total_speculative_timing = {}
 
         for metric in self.request_metrics.values():
@@ -371,6 +383,7 @@ class LLMEngine:
             speculative_accepted_tokens = metric.get("speculative_accepted_tokens", 0)
             speculative_emitted_tokens = metric.get("speculative_emitted_tokens", 0)
             speculative_accept_all_count = metric.get("speculative_accept_all_count", 0)
+            speculative_gamma_counts = metric.get("speculative_gamma_counts", {})
             speculative_trace = metric.get("speculative_trace", [])
             speculative_timing = metric.get("speculative_timing", {})
 
@@ -383,6 +396,10 @@ class LLMEngine:
             total_speculative_accepted_tokens += speculative_accepted_tokens
             total_speculative_emitted_tokens += speculative_emitted_tokens
             total_speculative_accept_all_count += speculative_accept_all_count
+            for gamma, count in speculative_gamma_counts.items():
+                total_speculative_gamma_counts[gamma] = (
+                    total_speculative_gamma_counts.get(gamma, 0) + count
+                )
             for name, value in speculative_timing.items():
                 total_speculative_timing[name] = total_speculative_timing.get(name, 0.0) + value
 
@@ -427,6 +444,9 @@ class LLMEngine:
                 "speculative_accepted_tokens": speculative_accepted_tokens,
                 "speculative_emitted_tokens": speculative_emitted_tokens,
                 "speculative_accept_all_count": speculative_accept_all_count,
+                "speculative_gamma_counts": dict(
+                    sorted(speculative_gamma_counts.items(), key=lambda item: int(item[0]))
+                ),
                 "speculative_trace": speculative_trace,
                 "speculative_timing": speculative_timing,
             })
@@ -478,6 +498,9 @@ class LLMEngine:
                         if total_speculative_steps > 0 else None
                     ),
                     "accept_all_count": total_speculative_accept_all_count,
+                    "gamma_counts": dict(
+                        sorted(total_speculative_gamma_counts.items(), key=lambda item: int(item[0]))
+                    ),
                     "timing": self._summarize_speculative_timing(
                         total_speculative_timing,
                         total_speculative_steps,

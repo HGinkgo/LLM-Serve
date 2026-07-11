@@ -1,50 +1,52 @@
 # ThrustLM
 
-English | [简体中文](README.zh-CN.md)
+[English](README.en.md) | [简体中文](README.md)
 
-ThrustLM is a single-GPU LLM inference engine built from the ground up for understanding how high-throughput serving works under the hood. It implements paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and an experimental EAGLE-style speculative decoding path.
+ThrustLM 是一个面向单机单卡场景的 LLM 推理引擎项目，重点关注高吞吐 serving 背后的核心系统机制：Paged KV Cache、continuous batching、chunked prefill、serving benchmark，以及实验性的 EAGLE 风格投机解码路径。
 
-The initial skeleton was informed by the vLLM PagedAttention paper and the `nano-vllm` educational codebase. The scheduler changes, chunked prefill path, benchmark tooling, and speculative decoding runtime are independently designed and implemented in this repository.
+项目早期骨架参考了 vLLM PagedAttention 论文和 `nano-vllm` 教学实现。后续的 scheduler 改造、chunked prefill、benchmark 工具和 speculative decoding runtime 都是在本仓库中独立设计和实现的。
 
-The repository name and Python package are aligned as `ThrustLM` / `thrustlm`.
+仓库名和 Python 包名分别为 `ThrustLM` / `thrustlm`。
 
-## Features
+## 功能
 
-- PagedAttention-style KV cache management with block tables, reusable KV blocks, and prefix-cache-aware block allocation.
-- Continuous batching with an iteration-level scheduler.
-- Chunked prefill with decode-first scheduling, allowing long prompt prefill work to share iterations with active decode requests.
-- Serving benchmark tooling with request-level metrics including throughput, TTFT, ITL, TPOT, request latency, wall time, and success/failure counts.
-- Qwen3 model support for local single-GPU experiments.
+- PagedAttention 风格的 KV cache 管理：block table、可复用 KV block、prefix-cache-aware block 分配。
+- Continuous batching：以 iteration-level scheduler 组织 prefill 和 decode。
+- Chunked prefill：decode 优先，把剩余 token budget 分给长 prompt 的 prefill chunk，避免长 prompt 长时间阻塞 decode。
+- Serving benchmark：记录 throughput、TTFT、ITL、TPOT、request latency，并提供区分 warmup、measurement 和 drain 的 closed-loop 稳态测量模式。
+- Qwen3 模型支持，用于本地单卡实验。
 
-## Experimental
+## 代码结构
 
-- EAGLE-style speculative decoding MVP with draft proposal, target verification, draft KV state, merged correction handling, and acceptance metrics.
-- Batched EAGLE draft proposal and packed variable-length target verification, with per-request KV lengths, acceptance, and rollback kept independent.
-- Speculative tracing and timing breakdown for inspecting draft tokens, target verification, acceptance length, and per-step runtime cost.
-- Greedy/top-k style verification is the primary path for current hot-vocabulary EAGLE3 draft checkpoints.
-- Probability rejection sampling utilities are kept for algorithm study and controlled experiments, but are not the recommended path for 32K hot-vocabulary draft heads.
+- `thrustlm/engine/`：请求调度、KV block 管理、target 模型执行和投机解码流程编排。
+- `thrustlm/models/`：Qwen3 与 EAGLE3 网络定义及 checkpoint 加载。
+- `thrustlm/speculative/`：draft 生成、验证采样、固定候选树算法、Tree KV 管理和共享结果类型。
+- `thrustlm/layers/`：attention、sampling 和模型基础组件。
+- `bench_serving.py`：有限 workload 与 closed-loop serving benchmark。
 
-## Quick Start
+`ModelRunner` 持有 target 模型执行资源，`SpeculativeExecutor` 组合这些资源完成 EAGLE decode；与 runtime 无关的算法集中在 `thrustlm/speculative/`。
 
-Install the package in editable mode:
+## 快速开始
+
+以 editable 模式安装：
 
 ```bash
 pip install -e .
 ```
 
-Set a local model path:
+设置本地模型路径：
 
 ```bash
-export MODEL_PATH=/path/to/Qwen3-0.6B
+export MODEL_PATH=/path/to/Qwen3-8B
 ```
 
-Run a small generation example:
+运行一个简单生成示例：
 
 ```bash
 python example.py
 ```
 
-Run a small serving benchmark:
+运行一个小型 serving benchmark：
 
 ```bash
 python bench_serving.py \
@@ -55,7 +57,22 @@ python bench_serving.py \
   --arrival all
 ```
 
-Run the chunked prefill path:
+以固定并发测量 continuous batching 的稳态性能：
+
+```bash
+python bench_serving.py \
+  --model "$MODEL_PATH" \
+  --arrival closed-loop \
+  --max-concurrency 8 \
+  --warmup-seconds 5 \
+  --measurement-seconds 15 \
+  --prompt-mode natural \
+  --output-len 64
+```
+
+closed-loop 模式会在请求完成后立即补位，直到 measurement window 结束才停止接收新请求并 drain。稳态吞吐只统计 measurement window 内产生的 token，同时仍保留整体 summary 供对照。
+
+运行 chunked prefill 路径：
 
 ```bash
 python bench_serving.py \
@@ -70,10 +87,10 @@ python bench_serving.py \
   --enable-chunked-prefill
 ```
 
-Run the experimental EAGLE speculative path with a compatible draft checkpoint:
+运行实验性的 EAGLE speculative decoding 路径：
 
 ```bash
-export SPECULATIVE_MODEL=/path/to/eagle3-draft
+export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
 
 python bench_serving.py \
   --model "$MODEL_PATH" \
@@ -88,10 +105,12 @@ python bench_serving.py \
   --enforce-eager
 ```
 
-The EAGLE benchmark summary reports speculative batch size, acceptance rate, acceptance length, accepted tokens per step, draft tokens per step, and a timing breakdown for draft proposal, target verification, accept/reject, KV update, and trace overhead.
+EAGLE benchmark summary 会输出 speculative batch size、acceptance rate、acceptance length、accepted tokens per step、draft tokens per step，以及 draft proposal、target verification、accept/reject、KV update 和 trace overhead 的 timing breakdown。
 
-For a deterministic draft-batching ablation, add `--argmax-sampler` to both runs and `--disable-batched-draft` to the serial-draft run. Batched draft proposal remains enabled by default.
+已在 24GB 显存上验证的配置是 Qwen3-8B、RedHatAI Qwen3-8B EAGLE3 speculator、BF16 eager 和固定 `gamma=3`。output length 256 的三轮实验中，batch 1 吞吐提升 `1.20x`，batch 4 提升 `1.34x`。
 
-## Notes
+固定候选树是单请求实验能力。在 linear EAGLE 命令上增加 `--speculative-tree-nodes 6 --argmax-sampler` 可运行 Tree-6。该路径使用跨层 Tree KV Manager 和融合提交 kernel，但仍默认关闭，且不支持多请求树。
 
-- The codebase retains the original MIT license.
+## 说明
+
+- 代码保留原始 MIT License。
