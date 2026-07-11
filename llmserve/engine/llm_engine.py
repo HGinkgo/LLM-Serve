@@ -9,11 +9,11 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer                  # prompt 编码，输出 token 编码
 import torch.multiprocessing as mp
 
-from thrustlm.config import Config
-from thrustlm.sampling_params import SamplingParams
-from thrustlm.engine.sequence import Sequence
-from thrustlm.engine.scheduler import Scheduler
-from thrustlm.engine.model_runner import ModelRunner
+from llmserve.config import Config
+from llmserve.sampling_params import SamplingParams
+from llmserve.engine.sequence import Sequence
+from llmserve.engine.scheduler import Scheduler
+from llmserve.engine.model_runner import ModelRunner
 
 
 class LLMEngine:

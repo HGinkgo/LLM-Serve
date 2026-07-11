@@ -1,5 +1,5 @@
 import os
-from thrustlm import LLM, SamplingParams
+from llmserve import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 

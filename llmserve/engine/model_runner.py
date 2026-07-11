@@ -4,15 +4,15 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from thrustlm.config import Config
-from thrustlm.engine.sequence import Sequence
-from thrustlm.engine.speculative_executor import SpeculativeExecutor
-from thrustlm.speculative.tree_kv import TreeKVCacheManager
-from thrustlm.speculative.types import SpeculativeDecodeOutput
-from thrustlm.models.qwen3 import Qwen3ForCausalLM
-from thrustlm.layers.sampler import Sampler
-from thrustlm.utils.context import set_context, get_context, reset_context
-from thrustlm.utils.loader import load_model
+from llmserve.config import Config
+from llmserve.engine.sequence import Sequence
+from llmserve.engine.speculative_executor import SpeculativeExecutor
+from llmserve.speculative.tree_kv import TreeKVCacheManager
+from llmserve.speculative.types import SpeculativeDecodeOutput
+from llmserve.models.qwen3 import Qwen3ForCausalLM
+from llmserve.layers.sampler import Sampler
+from llmserve.utils.context import set_context, get_context, reset_context
+from llmserve.utils.loader import load_model
 
 
 class ModelRunner:
@@ -53,11 +53,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="thrustlm", create=True, size=2**20)
+                self.shm = SharedMemory(name="llmserve", create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="thrustlm")
+                self.shm = SharedMemory(name="llmserve")
                 self.loop()
 
     def exit(self):

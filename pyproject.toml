@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "thrustlm"
+name = "llmserve"
 version = "0.3.0"
 authors = [{ name = "pengfei_he", email = "pengfei_he@foxmail.com" }]
 license = "MIT"
@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/HGinkgo/ThrustLM"
+Homepage="https://github.com/HGinkgo/LLM-Serve"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["thrustlm*"]
+include = ["llmserve*"]

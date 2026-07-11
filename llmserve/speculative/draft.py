@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from thrustlm.speculative.sampling import speculative_accept_reject_from_logits
-from thrustlm.speculative.types import (
+from llmserve.speculative.sampling import speculative_accept_reject_from_logits
+from llmserve.speculative.types import (
     Eagle3CycleResult,
     Eagle3DraftSequence,
     Eagle3OfflineStepResult,

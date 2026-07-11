@@ -1,12 +1,12 @@
-# ThrustLM
+# LLM-Serve
 
 [English](README.en.md) | [简体中文](README.md)
 
-ThrustLM is a single-GPU LLM inference engine built from the ground up for understanding how high-throughput serving works under the hood. It implements paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and EAGLE-style speculative decoding.
+LLM-Serve is a single-GPU LLM inference engine built from the ground up for understanding how high-throughput serving works under the hood. It implements paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and EAGLE-style speculative decoding.
 
 The initial skeleton was informed by the vLLM PagedAttention paper and the `nano-vllm` educational codebase. The scheduler changes, chunked prefill path, benchmark tooling, and speculative decoding runtime are independently designed and implemented in this repository.
 
-The repository name and Python package are aligned as `ThrustLM` / `thrustlm`.
+The repository name and Python package are aligned as `LLM-Serve` / `llmserve`.
 
 ## Features
 
@@ -19,13 +19,13 @@ The repository name and Python package are aligned as `ThrustLM` / `thrustlm`.
 
 ## Code Layout
 
-- `thrustlm/engine/`: request scheduling, KV block management, target-model execution, and speculative runtime orchestration.
-- `thrustlm/models/`: Qwen3 and EAGLE3 neural-network definitions plus checkpoint loading.
-- `thrustlm/speculative/`: draft generation, verification sampling, fixed-tree algorithms, Tree KV management, and shared result types.
-- `thrustlm/layers/`: attention, sampling, and model building blocks.
+- `llmserve/engine/`: request scheduling, KV block management, target-model execution, and speculative runtime orchestration.
+- `llmserve/models/`: Qwen3 and EAGLE3 neural-network definitions plus checkpoint loading.
+- `llmserve/speculative/`: draft generation, verification sampling, fixed-tree algorithms, Tree KV management, and shared result types.
+- `llmserve/layers/`: attention, sampling, and model building blocks.
 - `bench_serving.py`: finite-workload and closed-loop serving benchmarks.
 
-`ModelRunner` owns the target-model execution resources. `SpeculativeExecutor` composes those resources into the EAGLE decode flow, while algorithmic code remains independent under `thrustlm/speculative/`.
+`ModelRunner` owns the target-model execution resources. `SpeculativeExecutor` composes those resources into the EAGLE decode flow, while algorithmic code remains independent under `llmserve/speculative/`.
 
 ## Quick Start
 

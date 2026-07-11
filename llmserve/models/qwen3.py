@@ -4,12 +4,12 @@ from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
 
-from thrustlm.layers.activation import SiluAndMul
-from thrustlm.layers.attention import Attention
-from thrustlm.layers.layernorm import RMSNorm
-from thrustlm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from thrustlm.layers.rotary_embedding import get_rope
-from thrustlm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from llmserve.layers.activation import SiluAndMul
+from llmserve.layers.attention import Attention
+from llmserve.layers.layernorm import RMSNorm
+from llmserve.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from llmserve.layers.rotary_embedding import get_rope
+from llmserve.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 def get_eagle3_aux_layer_ids(num_hidden_layers: int) -> tuple[int, int, int]:

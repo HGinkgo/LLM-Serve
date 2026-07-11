@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from thrustlm.utils.context import get_context
+from llmserve.utils.context import get_context
 
 
 @triton.jit

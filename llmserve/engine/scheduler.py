@@ -5,9 +5,9 @@
 
 from collections import deque
 
-from thrustlm.config import Config
-from thrustlm.engine.sequence import Sequence, SequenceStatus
-from thrustlm.engine.block_manager import BlockManager
+from llmserve.config import Config
+from llmserve.engine.sequence import Sequence, SequenceStatus
+from llmserve.engine.block_manager import BlockManager
 
 
 class Scheduler:

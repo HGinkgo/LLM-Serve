@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from thrustlm.speculative.draft import (
+from llmserve.speculative.draft import (
     _compact_eagle3_draft_kv,
     _pack_eagle3_draft_kv,
 )

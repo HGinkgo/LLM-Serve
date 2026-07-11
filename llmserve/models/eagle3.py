@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from torch import nn
-from thrustlm.speculative.draft import (
+from llmserve.speculative.draft import (
     _compact_eagle3_draft_kv,
     _pack_eagle3_draft_kv,
     generate_eagle3_draft_tokens,
@@ -13,7 +13,7 @@ from thrustlm.speculative.draft import (
     run_eagle3_speculative_cycle,
     run_eagle3_target_verify,
 )
-from thrustlm.speculative.sampling import (
+from llmserve.speculative.sampling import (
     correction_distribution,
     sample_from_logits,
     sample_from_probs,
@@ -21,7 +21,7 @@ from thrustlm.speculative.sampling import (
     speculative_accept_reject,
     speculative_accept_reject_from_logits,
 )
-from thrustlm.speculative.types import (
+from llmserve.speculative.types import (
     Eagle3CycleResult,
     Eagle3DraftOutput,
     Eagle3DraftSequence,

@@ -1,6 +1,6 @@
 import torch
 
-from thrustlm.speculative.types import SpeculativeSampleResult
+from llmserve.speculative.types import SpeculativeSampleResult
 
 
 def sample_from_logits(logits: torch.Tensor, temperature: float) -> torch.Tensor:

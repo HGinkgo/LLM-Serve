@@ -18,7 +18,7 @@
 import os
 import time
 from random import randint, seed
-from thrustlm import LLM, SamplingParams
+from llmserve import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
 
 

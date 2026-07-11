@@ -1,24 +1,24 @@
 import torch
 from time import perf_counter
 
-from thrustlm.engine.sequence import Sequence
-from thrustlm.models.eagle3 import Eagle3Speculator
-from thrustlm.speculative.draft import (
+from llmserve.engine.sequence import Sequence
+from llmserve.models.eagle3 import Eagle3Speculator
+from llmserve.speculative.draft import (
     generate_eagle3_draft_tokens,
     generate_eagle3_draft_tokens_batched,
 )
-from thrustlm.speculative.sampling import (
+from llmserve.speculative.sampling import (
     speculative_accept_greedy_from_logits,
     speculative_accept_reject_from_logits,
 )
-from thrustlm.speculative.types import Eagle3TargetVerifyOutput
-from thrustlm.speculative.types import SpeculativeDecodeOutput, TargetDecodeAuxOutput
-from thrustlm.speculative.tree import (
+from llmserve.speculative.types import Eagle3TargetVerifyOutput
+from llmserve.speculative.types import SpeculativeDecodeOutput, TargetDecodeAuxOutput
+from llmserve.speculative.tree import (
     build_fixed_tree_topology,
     generate_eagle3_draft_tree,
     select_greedy_tree_path,
 )
-from thrustlm.utils.context import set_context, reset_context
+from llmserve.utils.context import set_context, reset_context
 
 
 class SpeculativeExecutor:

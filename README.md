@@ -1,12 +1,12 @@
-# ThrustLM
+# LLM-Serve
 
 [English](README.en.md) | [简体中文](README.md)
 
-ThrustLM 是一个面向单机单卡场景的 LLM 推理引擎项目，重点关注高吞吐 serving 背后的核心系统机制：Paged KV Cache、continuous batching、chunked prefill、serving benchmark，以及 EAGLE 风格投机解码。
+LLM-Serve 是一个面向单机单卡场景的 LLM 推理引擎项目，重点关注高吞吐 serving 背后的核心系统机制：Paged KV Cache、continuous batching、chunked prefill、serving benchmark，以及 EAGLE 风格投机解码。
 
 项目早期骨架参考了 vLLM PagedAttention 论文和 `nano-vllm` 教学实现。后续的 scheduler 改造、chunked prefill、benchmark 工具和 speculative decoding runtime 都是在本仓库中独立设计和实现的。
 
-仓库名和 Python 包名分别为 `ThrustLM` / `thrustlm`。
+仓库名和 Python 包名分别为 `LLM-Serve` / `llmserve`。
 
 ## 功能
 
@@ -19,13 +19,13 @@ ThrustLM 是一个面向单机单卡场景的 LLM 推理引擎项目，重点关
 
 ## 代码结构
 
-- `thrustlm/engine/`：请求调度、KV block 管理、target 模型执行和投机解码流程编排。
-- `thrustlm/models/`：Qwen3 与 EAGLE3 网络定义及 checkpoint 加载。
-- `thrustlm/speculative/`：draft 生成、验证采样、固定候选树算法、Tree KV 管理和共享结果类型。
-- `thrustlm/layers/`：attention、sampling 和模型基础组件。
+- `llmserve/engine/`：请求调度、KV block 管理、target 模型执行和投机解码流程编排。
+- `llmserve/models/`：Qwen3 与 EAGLE3 网络定义及 checkpoint 加载。
+- `llmserve/speculative/`：draft 生成、验证采样、固定候选树算法、Tree KV 管理和共享结果类型。
+- `llmserve/layers/`：attention、sampling 和模型基础组件。
 - `bench_serving.py`：有限 workload 与 closed-loop serving benchmark。
 
-`ModelRunner` 持有 target 模型执行资源，`SpeculativeExecutor` 组合这些资源完成 EAGLE decode；与 runtime 无关的算法集中在 `thrustlm/speculative/`。
+`ModelRunner` 持有 target 模型执行资源，`SpeculativeExecutor` 组合这些资源完成 EAGLE decode；与 runtime 无关的算法集中在 `llmserve/speculative/`。
 
 ## 快速开始
 

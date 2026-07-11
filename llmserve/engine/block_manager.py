@@ -9,7 +9,7 @@ from collections import deque
 import xxhash
 import numpy as np
 
-from thrustlm.engine.sequence import Sequence
+from llmserve.engine.sequence import Sequence
 
 
 class Block:

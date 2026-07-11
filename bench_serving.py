@@ -1,5 +1,5 @@
 """
-Serving benchmark for ThrustLM.
+Serving benchmark for LLM-Serve.
 
 This benchmark records request-level serving metrics. It preserves baseline
 runtime behavior by default and can enable experimental features via flags.
@@ -14,7 +14,7 @@ from random import Random
 
 import torch
 
-from thrustlm import LLM, SamplingParams
+from llmserve import LLM, SamplingParams
 
 
 DEFAULT_NATURAL_PROMPTS = [
@@ -35,7 +35,7 @@ class ArgmaxSampler:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Request-level serving benchmark for ThrustLM")
+    parser = argparse.ArgumentParser(description="Request-level serving benchmark for LLM-Serve")
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH", "~/models/Qwen3-8B/"))
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--input-len", type=int, default=256)
