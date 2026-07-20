@@ -1,13 +1,30 @@
 """
     Scheduler:请求调度器
-    决定这轮该跑哪些 Sequence,这轮走 prefill 还是 decode
+    决定本轮执行哪些 Sequence，并显式划分 prefill/decode 分组
 """
 
 from collections import deque
+from dataclasses import dataclass
 
 from llmserve.config import Config
 from llmserve.engine.sequence import Sequence, SequenceStatus
 from llmserve.engine.block_manager import BlockManager
+
+
+@dataclass(slots=True)
+class SchedulerOutput:
+    """Explicit execution groups and token budget for one scheduler step."""
+
+    scheduled_seqs: list[Sequence]
+    prefill_seqs: list[Sequence]
+    decode_seqs: list[Sequence]
+    num_batched_tokens: int
+
+    def __post_init__(self):
+        if self.scheduled_seqs != self.prefill_seqs + self.decode_seqs:
+            raise ValueError("scheduled sequences must be ordered as prefill then decode")
+        if self.num_batched_tokens < 0:
+            raise ValueError("num_batched_tokens cannot be negative")
 
 
 class Scheduler:
@@ -20,9 +37,6 @@ class Scheduler:
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
-        # mixed chunked-prefill batch 仍复用旧的 `(seqs, is_prefill)` 接口；
-        # 这里记录 prefill/decode 分界，方便 LLMEngine 分段 postprocess。
-        self.last_num_prefill_seqs = 0
     # 调度器启动时会记住调度预算、建好 block 管理器、准备两个队列：waiting 和 running。
 
     def is_finished(self):
@@ -31,13 +45,12 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-    # 挑出本轮要上 GPU 的序列，并告诉外面这是 prefill 轮还是 decode 轮。
+    def schedule(self) -> SchedulerOutput:
+        # 挑出本轮要上 GPU 的序列，并显式区分 prefill/decode 分组。
         # ===== 2026-06-07 chunked prefill =====
         if self.enable_chunked_prefill:
             return self.schedule_chunked_prefill()
 
-        self.last_num_prefill_seqs = 0
         # ===== 2026-06-07 chunked prefill =====
         scheduled_seqs = []
         num_batched_tokens = 0
@@ -61,10 +74,7 @@ class Scheduler:
             scheduled_seqs.append(seq)
             num_batched_tokens += seq.num_scheduled_tokens
         if scheduled_seqs:
-            # ===== 2026-06-07 chunked prefill =====
-            self.last_num_prefill_seqs = len(scheduled_seqs)
-            # ===== 2026-06-07 chunked prefill =====
-            return scheduled_seqs, True
+            return self._build_output(scheduled_seqs, [])
 
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -81,10 +91,20 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return self._build_output([], scheduled_seqs)
+
+    @staticmethod
+    def _build_output(prefill_seqs: list[Sequence], decode_seqs: list[Sequence]):
+        scheduled_seqs = prefill_seqs + decode_seqs
+        return SchedulerOutput(
+            scheduled_seqs=scheduled_seqs,
+            prefill_seqs=prefill_seqs,
+            decode_seqs=decode_seqs,
+            num_batched_tokens=sum(seq.num_scheduled_tokens for seq in scheduled_seqs),
+        )
 
     # ===== 2026-06-07 chunked prefill =====
-    def schedule_chunked_prefill(self) -> tuple[list[Sequence], bool]:
+    def schedule_chunked_prefill(self) -> SchedulerOutput:
         """先调度 decode，再把剩余 token budget 分给 prefill chunk。"""
         scheduled_decodes = []
         scheduled_prefills = []
@@ -141,14 +161,9 @@ class Scheduler:
         self.running.extend(deferred_running)
 
         if scheduled_prefills:
-            self.last_num_prefill_seqs = len(scheduled_prefills)
-            for seq in scheduled_decodes:
-                # 负数表示这个 decode token 被打包进了 prefill 形态的 mixed batch。
-                seq.num_scheduled_tokens = -1
-            return scheduled_prefills + scheduled_decodes, True
+            return self._build_output(scheduled_prefills, scheduled_decodes)
         if scheduled_decodes:
-            self.last_num_prefill_seqs = 0
-            return scheduled_decodes, False
+            return self._build_output([], scheduled_decodes)
         assert False, "scheduler has no sequence to schedule"
     # ===== 2026-06-07 chunked prefill =====
 
@@ -158,20 +173,37 @@ class Scheduler:
         self.waiting.appendleft(seq)
     # 资源不够时，把这条请求先踢下场，清掉它的 KV cache，占位释放出来，然后把它插回等待队列前面
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
-            if is_prefill:
-                seq.num_cached_tokens = min(seq.num_cached_tokens + seq.num_scheduled_tokens, seq.num_tokens)
-                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:    # chunked prefill or re prefill after preemption
-                    seq.num_scheduled_tokens = 0
-                    continue
-            seq.append_token(token_id)
-            seq.num_cached_tokens += 1
-            seq.num_scheduled_tokens = 0
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+    def postprocess(self, output: SchedulerOutput, token_ids: list[int]):
+        if len(output.scheduled_seqs) != len(token_ids):
+            raise ValueError("token count does not match scheduled sequences")
+        num_prefill_seqs = len(output.prefill_seqs)
+        for seq, token_id in zip(
+            output.prefill_seqs,
+            token_ids[:num_prefill_seqs],
+        ):
+            self._postprocess_sequence(seq, token_id, is_prefill=True)
+        for seq, token_id in zip(
+            output.decode_seqs,
+            token_ids[num_prefill_seqs:],
+        ):
+            self._postprocess_sequence(seq, token_id, is_prefill=False)
+
+    def _postprocess_sequence(self, seq: Sequence, token_id: int, is_prefill: bool):
+        if is_prefill:
+            seq.num_cached_tokens = min(
+                seq.num_cached_tokens + seq.num_scheduled_tokens,
+                seq.num_tokens,
+            )
+            if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:
+                seq.num_scheduled_tokens = 0
+                return
+        seq.append_token(token_id)
+        seq.num_cached_tokens += 1
+        seq.num_scheduled_tokens = 0
+        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.running.remove(seq)
 
     # ===== 2026-07-07 EAGLE speculative decoding =====
     def postprocess_speculative(self, seq: Sequence, token_ids: list[int]):

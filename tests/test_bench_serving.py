@@ -31,7 +31,7 @@ class FakeLLM:
 
     def step(self):
         self.pending = False
-        return [], -1
+        return [], 1
 
     def get_metrics(self):
         return {

@@ -75,14 +75,20 @@ class SpeculativeExecutor:
         self.draft_kv_cache[seq.seq_id] = (draft_kv[0], draft_kv[1])
 
     @torch.inference_mode()
-    def _accumulate_draft_prefill(self, seqs: list[Sequence], aux_hidden: torch.Tensor):
+    def _accumulate_draft_prefill(
+        self,
+        seqs: list[Sequence],
+        aux_hidden: torch.Tensor,
+        decode_seqs: list[Sequence] | None = None,
+    ):
         if self.draft_model is None:
             return
         if not hasattr(self, "_prefill_aux_chunks"):
             self._prefill_aux_chunks = {}
+        decode_seq_ids = {seq.seq_id for seq in (decode_seqs or [])}
         offset = 0
         for seq in seqs:
-            is_decode = seq.num_scheduled_tokens < 0
+            is_decode = seq.seq_id in decode_seq_ids
             chunk = 1 if is_decode else seq.num_scheduled_tokens
             if not is_decode and seq.num_cached_tokens < seq.num_prompt_tokens:
                 chunk_aux = aux_hidden[offset:offset + chunk]
@@ -145,12 +151,14 @@ class SpeculativeExecutor:
         seqs: list[Sequence],
         aux_hidden: torch.Tensor,
         token_ids: list[int] | None,
+        decode_seqs: list[Sequence] | None = None,
     ):
         if self.draft_model is None or token_ids is None:
             return
+        decode_seq_ids = {seq.seq_id for seq in (decode_seqs or [])}
         offset = 0
         for index, seq in enumerate(seqs):
-            is_decode = seq.num_scheduled_tokens < 0
+            is_decode = seq.seq_id in decode_seq_ids
             chunk = 1 if is_decode else seq.num_scheduled_tokens
             if (
                 not is_decode

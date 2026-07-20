@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from llmserve.config import Config
 from llmserve.engine.sequence import Sequence
+from llmserve.engine.scheduler import SchedulerOutput
 from llmserve.engine.speculative_executor import SpeculativeExecutor
 from llmserve.speculative.tree_kv import TreeKVCacheManager
 from llmserve.speculative.types import SpeculativeDecodeOutput
@@ -179,7 +180,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run(SchedulerOutput(seqs, seqs, [], seq_len * num_seqs))
         self.draft_kv_cache.clear()
         self._prefill_aux_chunks.clear()
         self._prev_correction.clear()
@@ -221,7 +222,11 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(
+        self,
+        seqs: list[Sequence],
+        decode_seqs: list[Sequence] | None = None,
+    ):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -230,11 +235,11 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        decode_seq_ids = {seq.seq_id for seq in (decode_seqs or [])}
         for seq in seqs:
-            # ===== 2026-06-07 chunked prefill =====
             # mixed batch 里 decode 请求按 1-token prefill 处理，
             # 这样 attention 可以走 flash_attn_varlen_func + block_table。
-            is_decode = seq.num_scheduled_tokens < 0
+            is_decode = seq.seq_id in decode_seq_ids
             seqlen = len(seq)
             start = seqlen - 1 if is_decode else min(seq.num_cached_tokens, seqlen - 1)
             seqlen_q = 1 if is_decode else seq.num_scheduled_tokens
@@ -313,18 +318,26 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, scheduler_output: SchedulerOutput) -> list[int]:
+        seqs = scheduler_output.scheduled_seqs
+        prefill_seqs = scheduler_output.prefill_seqs
+        decode_seqs = scheduler_output.decode_seqs
+        is_prefill = bool(prefill_seqs)
+        input_ids, positions = (
+            self.prepare_prefill(seqs, decode_seqs)
+            if is_prefill
+            else self.prepare_decode(decode_seqs)
+        )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         if is_prefill and self.draft_model is not None:
             hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
             logits = self.model.compute_logits(hidden_states)
-            self._accumulate_draft_prefill(seqs, aux_hidden)
+            self._accumulate_draft_prefill(seqs, aux_hidden, decode_seqs)
         else:
             logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         if is_prefill and self.draft_model is not None:
-            self._fill_prefill_sampled_tokens(seqs, aux_hidden, token_ids)
+            self._fill_prefill_sampled_tokens(seqs, aux_hidden, token_ids, decode_seqs)
         reset_context()
         return token_ids
 

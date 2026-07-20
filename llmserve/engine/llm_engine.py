@@ -152,8 +152,9 @@ class LLMEngine:
 
     def step(self):
         step_start = perf_counter()
-        seqs, is_prefill = self.scheduler.schedule()
-        if self._can_run_speculative_step(seqs, is_prefill):
+        scheduler_output = self.scheduler.schedule()
+        seqs = scheduler_output.scheduled_seqs
+        if self._can_run_speculative_step(scheduler_output):
             num_reserved_tokens = self.model_runner.speculative_gamma + 2
             block_manager = self.scheduler.block_manager
             if len(seqs) == 1:
@@ -178,21 +179,10 @@ class LLMEngine:
                     step_start,
                 )
 
-        # ===== 2026-06-07 chunked prefill =====
-        num_tokens = sum(max(seq.num_scheduled_tokens, 0) for seq in seqs) if is_prefill else -len(seqs)
-        # ===== 2026-06-07 chunked prefill =====
+        num_tokens = scheduler_output.num_batched_tokens
         before_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        # ===== 2026-06-07 chunked prefill =====
-        num_prefill_seqs = self.scheduler.last_num_prefill_seqs if is_prefill else 0
-        # mixed chunked-prefill 输出顺序是 [prefill..., decode...]。
-        # 分段调用 postprocess，可以复用原有 prefill/decode 处理语义。
-        if is_prefill and 0 < num_prefill_seqs < len(seqs):
-            self.scheduler.postprocess(seqs[:num_prefill_seqs], token_ids[:num_prefill_seqs], True)
-            self.scheduler.postprocess(seqs[num_prefill_seqs:], token_ids[num_prefill_seqs:], False)
-        else:
-            self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        # ===== 2026-06-07 chunked prefill =====
+        token_ids = self.model_runner.call("run", scheduler_output)
+        self.scheduler.postprocess(scheduler_output, token_ids)
         step_end = perf_counter()
 
         first_token_seq_ids = []
@@ -220,9 +210,10 @@ class LLMEngine:
         self.last_step_events = {
             "step_start": step_start,
             "step_end": step_end,
-            "is_prefill": is_prefill,
+            "is_prefill": bool(scheduler_output.prefill_seqs),
             "num_tokens": num_tokens,
             "scheduled_seq_ids": [seq.seq_id for seq in seqs],
+            "prefill_seq_ids": [seq.seq_id for seq in scheduler_output.prefill_seqs],
             "first_token_seq_ids": first_token_seq_ids,
             "decode_seq_ids": decode_seq_ids,
             "finished_seq_ids": finished_seq_ids,
@@ -315,13 +306,14 @@ class LLMEngine:
             if speculative_output.debug is not None:
                 debug_by_seq[seq.seq_id] = speculative_output.debug
 
-        num_tokens = -total_emitted_tokens
+        num_tokens = total_emitted_tokens
         self.last_step_events = {
             "step_start": step_start,
             "step_end": step_end,
             "is_prefill": False,
             "num_tokens": num_tokens,
             "scheduled_seq_ids": [seq.seq_id for seq in seqs],
+            "prefill_seq_ids": [],
             "first_token_seq_ids": first_token_seq_ids,
             "decode_seq_ids": decode_seq_ids,
             "finished_seq_ids": finished_seq_ids,
@@ -348,8 +340,8 @@ class LLMEngine:
         ]
         return outputs, num_tokens
 
-    def _can_run_speculative_step(self, seqs: list[Sequence], is_prefill: bool):
-        if is_prefill or not seqs:
+    def _can_run_speculative_step(self, scheduler_output):
+        if scheduler_output.prefill_seqs or not scheduler_output.decode_seqs:
             return False
         if getattr(self.model_runner, "draft_model", None) is None:
             return False
@@ -555,10 +547,10 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
-            if num_tokens > 0:
+            if self.last_step_events.get("prefill_seq_ids"):
                 prefill_throughput = num_tokens / (perf_counter() - t)
             else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+                decode_throughput = num_tokens / (perf_counter() - t)
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",

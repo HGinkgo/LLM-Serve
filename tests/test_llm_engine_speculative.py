@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from llmserve.engine.llm_engine import LLMEngine
 from llmserve.engine.model_runner import SpeculativeDecodeOutput
+from llmserve.engine.scheduler import SchedulerOutput
 from llmserve.engine.sequence import Sequence, SequenceStatus
 
 
@@ -28,7 +29,8 @@ class FakeScheduler:
         self.block_manager = FakeBlockManager()
 
     def schedule(self):
-        return [self.seq], False
+        self.seq.num_scheduled_tokens = 1
+        return SchedulerOutput([self.seq], [], [self.seq], 1)
 
     def postprocess_speculative(self, seq, token_ids):
         for token_id in token_ids:
@@ -44,7 +46,9 @@ class FakeBatchScheduler(FakeScheduler):
         self.block_manager = FakeBlockManager()
 
     def schedule(self):
-        return self.seqs, False
+        for seq in self.seqs:
+            seq.num_scheduled_tokens = 1
+        return SchedulerOutput(self.seqs, [], self.seqs, len(self.seqs))
 
 
 class FakeModelRunner:
@@ -86,6 +90,36 @@ class FakeNormalModelRunner(FakeModelRunner):
         self.calls.append((method_name, args))
         if method_name == "run":
             return [10]
+        raise AssertionError(method_name)
+
+
+class FakeMixedScheduler:
+
+    def __init__(self, output):
+        self.output = output
+        self.block_manager = FakeBlockManager()
+        self.postprocess_output = None
+
+    def schedule(self):
+        return self.output
+
+    def postprocess(self, output, token_ids):
+        self.postprocess_output = output
+        prefill_count = len(output.prefill_seqs)
+        for seq in output.prefill_seqs:
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+        for seq, token_id in zip(output.decode_seqs, token_ids[prefill_count:]):
+            seq.append_token(token_id)
+            seq.num_scheduled_tokens = 0
+
+
+class FakeMixedModelRunner(FakeNormalModelRunner):
+
+    def call(self, method_name, *args):
+        self.calls.append((method_name, args))
+        if method_name == "run":
+            return [10, 20]
         raise AssertionError(method_name)
 
 
@@ -191,7 +225,7 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         outputs, num_tokens = LLMEngine.step(engine)
 
         self.assertEqual(outputs, [])
-        self.assertEqual(num_tokens, -3)
+        self.assertEqual(num_tokens, 3)
         self.assertEqual(seq.completion_token_ids, [10, 11, 12])
         self.assertEqual(engine.scheduler.block_manager.calls, [(seq.seq_id, 5)])
         self.assertEqual(engine.model_runner.calls[0][0], "run_speculative_single")
@@ -276,7 +310,9 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         seq.num_cached_tokens = len(seq)
 
         scheduler = FakeScheduler(seq)
-        scheduler.postprocess = lambda seqs, token_ids, is_prefill: [seqs[0].append_token(token_ids[0])]
+        scheduler.postprocess = lambda output, token_ids: [
+            output.decode_seqs[0].append_token(token_ids[0])
+        ]
 
         engine = LLMEngine.__new__(LLMEngine)
         engine.scheduler = scheduler
@@ -285,12 +321,40 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
 
         _, num_tokens = LLMEngine.step(engine)
 
-        self.assertEqual(num_tokens, -1)
+        self.assertEqual(num_tokens, 1)
         self.assertEqual(seq.completion_token_ids, [10])
         self.assertEqual(engine.model_runner.calls[0][0], "run")
         self.assertEqual(engine.scheduler.block_manager.calls, [])
         self.assertNotIn("speculative", engine.last_step_events)
         self.assertEqual(len(engine.request_metrics[seq.seq_id]["output_event_times"]), 1)
+
+    def test_step_passes_explicit_groups_for_mixed_batch(self):
+        prefill = Sequence([1, 2, 3])
+        prefill.num_scheduled_tokens = 3
+        decode = Sequence([4, 5, 6])
+        decode.status = SequenceStatus.RUNNING
+        decode.num_cached_tokens = len(decode)
+        decode.num_scheduled_tokens = 1
+        scheduler_output = SchedulerOutput(
+            [prefill, decode], [prefill], [decode], 4
+        )
+        scheduler = FakeMixedScheduler(scheduler_output)
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.scheduler = scheduler
+        engine.model_runner = FakeMixedModelRunner()
+        engine.request_metrics = {
+            prefill.seq_id: self.make_metric(prefill),
+            decode.seq_id: self.make_metric(decode),
+        }
+
+        _, num_tokens = LLMEngine.step(engine)
+
+        self.assertEqual(num_tokens, 4)
+        self.assertIs(scheduler.postprocess_output, scheduler_output)
+        self.assertIs(engine.model_runner.calls[0][1][0], scheduler_output)
+        self.assertEqual(engine.last_step_events["prefill_seq_ids"], [prefill.seq_id])
+        self.assertEqual(engine.last_step_events["scheduled_seq_ids"], [prefill.seq_id, decode.seq_id])
+        self.assertEqual(decode.completion_token_ids, [20])
 
     def test_step_runs_batched_speculative_decode_for_multiple_sequences(self):
         seq1 = Sequence([1, 2, 3])
@@ -310,7 +374,7 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         outputs, num_tokens = LLMEngine.step(engine)
 
         self.assertEqual(outputs, [])
-        self.assertEqual(num_tokens, -5)
+        self.assertEqual(num_tokens, 5)
         self.assertEqual(seq1.completion_token_ids, [10, 11, 12])
         self.assertEqual(seq2.completion_token_ids, [20, 21])
         self.assertEqual(
