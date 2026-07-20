@@ -119,6 +119,8 @@ The EAGLE benchmark summary reports speculative batch size, acceptance rate, acc
 
 The validated 24GB configuration is Qwen3-8B with the RedHatAI Qwen3-8B EAGLE3 speculator, BF16 eager mode, and fixed `gamma=3`. In three output-256 runs, throughput improved by `1.20x` at batch 1 and `1.34x` at batch 4.
 
+The Stage 4 three-workload evidence, 18 formal runs, summary CSV, and sanitized representative JSON files are in [`benchmarks/results/`](benchmarks/results/).
+
 ## Tests
 
 CPU unit tests do not require FlashAttention or local model checkpoints:

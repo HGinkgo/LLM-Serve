@@ -119,6 +119,8 @@ EAGLE benchmark summary 会输出 speculative batch size、acceptance rate、acc
 
 已在 24GB 显存上验证的配置是 Qwen3-8B、RedHatAI Qwen3-8B EAGLE3 speculator、BF16 eager 和固定 `gamma=3`。output length 256 的三轮实验中，batch 1 吞吐提升 `1.20x`，batch 4 提升 `1.34x`。
 
+Stage 4 的三类 workload、18 次正式运行、汇总 CSV 和脱敏代表性 JSON 见 [`benchmarks/results/`](benchmarks/results/)。
+
 ## 测试
 
 CPU 单元测试不需要安装 FlashAttention，也不需要本地模型：
