@@ -88,6 +88,8 @@ class LLMEngine:
             "arrival_time": now,
             "first_token_time": None,
             "token_times": [],
+            "output_event_times": [],
+            "speculative_step_latencies": [],
             "finish_time": None,
             "prompt_tokens": len(prompt),
             "output_tokens": 0,
@@ -208,6 +210,7 @@ class LLMEngine:
                     first_token_seq_ids.append(seq.seq_id)
                 decode_seq_ids.append(seq.seq_id)
                 metric["token_times"].extend([step_end] * (after - before))
+                metric.setdefault("output_event_times", []).append(step_end)
                 metric["output_tokens"] = after
             if seq.is_finished and metric["finish_time"] is None:
                 metric["finish_time"] = step_end
@@ -268,12 +271,16 @@ class LLMEngine:
 
             metric = self.request_metrics.get(seq.seq_id)
             if metric is not None:
+                metric.setdefault("speculative_step_latencies", []).append(
+                    step_end - step_start
+                )
                 if emitted_tokens > 0:
                     if metric["first_token_time"] is None:
                         metric["first_token_time"] = step_end
                         first_token_seq_ids.append(seq.seq_id)
                     decode_seq_ids.append(seq.seq_id)
                     metric["token_times"].extend([step_end] * emitted_tokens)
+                    metric.setdefault("output_event_times", []).append(step_end)
                     metric["output_tokens"] = after
                 metric.setdefault("speculative_steps", 0)
                 metric.setdefault("speculative_draft_tokens", 0)
@@ -356,7 +363,9 @@ class LLMEngine:
         now = perf_counter()
         requests = []
         ttfts = []
-        itls = []
+        burst_itls = []
+        output_event_latencies = []
+        speculative_step_latencies = []
         request_latencies = []
         tpots = []
         wall_start = None
@@ -374,6 +383,10 @@ class LLMEngine:
             arrival_time = metric["arrival_time"]
             first_token_time = metric["first_token_time"]
             token_times = metric["token_times"]
+            output_event_times = metric.get("output_event_times", [])
+            request_speculative_step_latencies = metric.get(
+                "speculative_step_latencies", []
+            )
             finish_time = metric["finish_time"]
             output_tokens = metric["output_tokens"]
             success = metric["success"]
@@ -412,7 +425,13 @@ class LLMEngine:
                 token_times[i] - token_times[i - 1]
                 for i in range(1, len(token_times))
             ]
-            itls.extend(request_itls)
+            request_output_event_latencies = [
+                output_event_times[i] - output_event_times[i - 1]
+                for i in range(1, len(output_event_times))
+            ]
+            burst_itls.extend(request_itls)
+            output_event_latencies.extend(request_output_event_latencies)
+            speculative_step_latencies.extend(request_speculative_step_latencies)
 
             latency = None
             if finish_time is not None:
@@ -437,7 +456,11 @@ class LLMEngine:
                 "token_times": token_times,
                 "finish_time": finish_time,
                 "ttft": ttft,
+                "output_event_times": output_event_times,
+                "burst_itl": request_itls,
                 "itl": request_itls,
+                "output_event_latency": request_output_event_latencies,
+                "speculative_step_latency": request_speculative_step_latencies,
                 "latency": latency,
                 "speculative_steps": speculative_steps,
                 "speculative_draft_tokens": speculative_draft_tokens,
@@ -466,7 +489,10 @@ class LLMEngine:
                 "wall_time": wall_time,
                 "throughput": total_output_tokens / wall_time if wall_time > 0 else 0.0,
                 "ttft": self._summary(ttfts),
-                "itl": self._summary(itls),
+                "burst_itl": self._summary(burst_itls),
+                "itl": self._summary(burst_itls),
+                "output_event_latency": self._summary(output_event_latencies),
+                "speculative_step_latency": self._summary(speculative_step_latencies),
                 "tpot": self._summary(tpots),
                 "request_latency": self._summary(request_latencies),
                 "speculative": {

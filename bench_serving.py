@@ -8,8 +8,12 @@ runtime behavior by default and can enable experimental features via flags.
 import argparse
 import json
 import os
+import platform
+import subprocess
 import time
 from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 from random import Random
 
 import torch
@@ -34,16 +38,88 @@ class ArgmaxSampler:
         return logits.argmax(dim=-1)
 
 
+def git_output(*args: str):
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
+def build_environment_metadata():
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
+        properties = torch.cuda.get_device_properties(0)
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory_bytes = properties.total_memory
+    else:
+        gpu_name = None
+        gpu_memory_bytes = None
+    commit = git_output("rev-parse", "HEAD")
+    status = git_output("status", "--porcelain")
+    return {
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": commit,
+        "git_dirty": bool(status) if status is not None else None,
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "cuda_available": cuda_available,
+        "gpu_name": gpu_name,
+        "gpu_memory_bytes": gpu_memory_bytes,
+    }
+
+
+def discover_model_revision(model_path: str):
+    metadata_path = (
+        Path(model_path)
+        / ".cache"
+        / "huggingface"
+        / "download"
+        / "config.json.metadata"
+    )
+    try:
+        revision = metadata_path.read_text().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+    if len(revision) != 40:
+        return None
+    try:
+        int(revision, 16)
+    except ValueError:
+        return None
+    return revision
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Request-level serving benchmark for LLM-Serve")
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH", "~/models/Qwen3-8B/"))
+    parser.add_argument("--model-revision", default=os.environ.get("MODEL_REVISION"))
+    parser.add_argument(
+        "--speculative-model-revision",
+        default=os.environ.get("SPECULATIVE_MODEL_REVISION"),
+    )
+    parser.add_argument("--workload-name", default=None)
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--input-len", type=int, default=256)
+    parser.add_argument("--long-input-len", type=int, default=4096)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--prompt-mode", choices=["random-token", "natural"], default="random-token")
     parser.add_argument("--prompt-file", default=None, help="Plain text file with one prompt per non-empty line")
-    parser.add_argument("--arrival", choices=["all", "poisson", "closed-loop"], default="all")
+    parser.add_argument(
+        "--arrival",
+        choices=["all", "poisson", "closed-loop", "prefill-injection"],
+        default="all",
+    )
     parser.add_argument("--request-rate", type=float, default=4.0, help="Requests per second for poisson arrival")
+    parser.add_argument("--injection-delay", type=float, default=1.0)
     parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--warmup-seconds", type=float, default=5.0)
     parser.add_argument("--measurement-seconds", type=float, default=15.0)
@@ -104,8 +180,18 @@ def build_prompts(args, rng: Random):
 
 def build_workload(args):
     rng = Random(args.seed)
-    arrivals = build_arrivals(args.num_requests, args.arrival, args.request_rate, rng)
-    prompts = build_prompts(args, rng)
+    if args.arrival == "prefill-injection":
+        arrivals = [0.0] * (args.num_requests - 1) + [args.injection_delay]
+        prompts = [
+            [rng.randint(0, 10000) for _ in range(args.input_len)]
+            for _ in range(args.num_requests - 1)
+        ]
+        prompts.append(
+            [rng.randint(0, 10000) for _ in range(args.long_input_len)]
+        )
+    else:
+        arrivals = build_arrivals(args.num_requests, args.arrival, args.request_rate, rng)
+        prompts = build_prompts(args, rng)
     sampling_params = [
         SamplingParams(
             temperature=args.temperature,
@@ -231,7 +317,9 @@ def build_steady_state_summary(
     ]
 
     ttfts = []
-    itls = []
+    burst_itls = []
+    output_event_latencies = []
+    speculative_step_latencies = []
     tpots = []
     latencies = []
     for request in fully_measured_requests:
@@ -240,11 +328,25 @@ def build_steady_state_summary(
         output_count = request["output_tokens"]
         if first_token_time is not None:
             ttfts.append(first_token_time - request["arrival_time"])
-        request_itls = request.get("itl") or [
-            request["token_times"][i] - request["token_times"][i - 1]
-            for i in range(1, len(request["token_times"]))
-        ]
-        itls.extend(request_itls)
+        request_burst_itls = request.get("burst_itl")
+        if request_burst_itls is None:
+            request_burst_itls = request.get("itl")
+        if request_burst_itls is None:
+            request_burst_itls = [
+                request["token_times"][i] - request["token_times"][i - 1]
+                for i in range(1, len(request["token_times"]))
+            ]
+        request_event_latencies = request.get("output_event_latency")
+        if request_event_latencies is None:
+            output_event_times = request.get("output_event_times", [])
+            request_event_latencies = [
+                output_event_times[i] - output_event_times[i - 1]
+                for i in range(1, len(output_event_times))
+            ]
+        request_step_latencies = request.get("speculative_step_latency", [])
+        burst_itls.extend(request_burst_itls)
+        output_event_latencies.extend(request_event_latencies)
+        speculative_step_latencies.extend(request_step_latencies)
         latencies.append(finish_time - request["arrival_time"])
         if output_count > 1 and first_token_time is not None:
             tpots.append((finish_time - first_token_time) / (output_count - 1))
@@ -265,7 +367,10 @@ def build_steady_state_summary(
         ),
         "max_scheduled_batch_size": max(scheduled_batch_sizes, default=0),
         "ttft": summarize_values(ttfts),
-        "itl": summarize_values(itls),
+        "burst_itl": summarize_values(burst_itls),
+        "itl": summarize_values(burst_itls),
+        "output_event_latency": summarize_values(output_event_latencies),
+        "speculative_step_latency": summarize_values(speculative_step_latencies),
         "tpot": summarize_values(tpots),
         "request_latency": summarize_values(latencies),
         "speculative": summarize_speculative_requests(fully_measured_requests),
@@ -292,6 +397,15 @@ def validate_benchmark_args(args):
             raise ValueError("--warmup-seconds must be non-negative")
         if args.measurement_seconds <= 0:
             raise ValueError("--measurement-seconds must be positive")
+    if args.arrival == "prefill-injection":
+        if args.num_requests < 2:
+            raise ValueError("prefill injection requires at least two requests")
+        if args.prompt_mode != "random-token" or args.prompt_file:
+            raise ValueError("prefill injection requires random-token prompts")
+        if args.injection_delay <= 0:
+            raise ValueError("--injection-delay must be positive")
+        if args.long_input_len <= args.input_len:
+            raise ValueError("--long-input-len must exceed --input-len")
 
 
 def run_closed_loop(engine, args):
@@ -372,11 +486,17 @@ def print_summary(result):
     print("--------------------")
     for name, label in [
         ("ttft", "TTFT"),
-        ("itl", "ITL"),
+        ("burst_itl", "Burst ITL"),
+        ("output_event_latency", "Output-event latency"),
+        ("speculative_step_latency", "Speculative step latency"),
         ("tpot", "TPOT"),
         ("request_latency", "Request latency"),
     ]:
-        stats = summary[name]
+        stats = summary.get(name)
+        if stats is None and name == "burst_itl":
+            stats = summary.get("itl")
+        if stats is None:
+            continue
         print(
             f"{label:<18} "
             f"mean={format_ms(stats['mean']):>10} "
@@ -402,11 +522,17 @@ def print_summary(result):
         print("---------------------------------")
         for name, label in [
             ("ttft", "TTFT"),
-            ("itl", "ITL"),
+            ("burst_itl", "Burst ITL"),
+            ("output_event_latency", "Output-event latency"),
+            ("speculative_step_latency", "Speculative step latency"),
             ("tpot", "TPOT"),
             ("request_latency", "Request latency"),
         ]:
-            stats = steady_state[name]
+            stats = steady_state.get(name)
+            if stats is None and name == "burst_itl":
+                stats = steady_state.get("itl")
+            if stats is None:
+                continue
             print(
                 f"{label:<18} "
                 f"mean={format_ms(stats['mean']):>10} "
@@ -477,6 +603,18 @@ def run_benchmark(args):
     validate_benchmark_args(args)
     model_path = os.path.expanduser(args.model)
     speculative_model = os.path.expanduser(args.speculative_model) if args.speculative_model else None
+    model_revision = (
+        getattr(args, "model_revision", None)
+        or discover_model_revision(model_path)
+    )
+    speculative_model_revision = (
+        getattr(args, "speculative_model_revision", None)
+        or (
+            discover_model_revision(speculative_model)
+            if speculative_model is not None
+            else None
+        )
+    )
     workload = build_workload(args) if args.arrival != "closed-loop" else None
     engine = LLM(
         model_path,
@@ -526,15 +664,34 @@ def run_benchmark(args):
         )
     engine.exit()
     return {
+        "metadata": build_environment_metadata(),
         "config": {
             "model": model_path,
+            "model_revision": model_revision,
+            "speculative_model_revision": speculative_model_revision,
+            "workload_name": getattr(args, "workload_name", None),
             "num_requests": args.num_requests if args.arrival != "closed-loop" else None,
             "input_len": args.input_len,
+            "long_input_len": (
+                args.long_input_len
+                if args.arrival == "prefill-injection"
+                else None
+            ),
             "output_len": args.output_len,
             "prompt_mode": args.prompt_mode,
             "prompt_file": os.path.expanduser(args.prompt_file) if args.prompt_file else None,
             "arrival": args.arrival,
             "request_rate": args.request_rate if args.arrival == "poisson" else None,
+            "injection_delay": (
+                args.injection_delay
+                if args.arrival == "prefill-injection"
+                else None
+            ),
+            "injected_request_index": (
+                args.num_requests - 1
+                if args.arrival == "prefill-injection"
+                else None
+            ),
             "max_concurrency": args.max_concurrency if args.arrival == "closed-loop" else None,
             "warmup_seconds": args.warmup_seconds if args.arrival == "closed-loop" else None,
             "measurement_seconds": args.measurement_seconds if args.arrival == "closed-loop" else None,

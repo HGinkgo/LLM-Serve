@@ -1,35 +1,43 @@
 from collections.abc import Sequence
 
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
 
 
-@triton.jit
-def _fused_commit_tree_kv_kernel(
-    tree_k_ptr,
-    tree_v_ptr,
-    k_cache_ptr,
-    v_cache_ptr,
-    node_indices_ptr,
-    slot_mapping_ptr,
-    tree_layer_stride: tl.constexpr,
-    cache_layer_stride: tl.constexpr,
-    KV_DIM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    layer_index = tl.program_id(0)
-    commit_index = tl.program_id(1)
-    node_index = tl.load(node_indices_ptr + commit_index)
-    slot = tl.load(slot_mapping_ptr + commit_index)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < KV_DIM
-    source_offsets = layer_index * tree_layer_stride + node_index * KV_DIM + offsets
-    target_offsets = layer_index * cache_layer_stride + slot * KV_DIM + offsets
-    key = tl.load(tree_k_ptr + source_offsets, mask=mask)
-    value = tl.load(tree_v_ptr + source_offsets, mask=mask)
-    tl.store(k_cache_ptr + target_offsets, key, mask=mask)
-    tl.store(v_cache_ptr + target_offsets, value, mask=mask)
+if triton is not None:
+    @triton.jit
+    def _fused_commit_tree_kv_kernel(
+        tree_k_ptr,
+        tree_v_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        node_indices_ptr,
+        slot_mapping_ptr,
+        tree_layer_stride: tl.constexpr,
+        cache_layer_stride: tl.constexpr,
+        KV_DIM: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        layer_index = tl.program_id(0)
+        commit_index = tl.program_id(1)
+        node_index = tl.load(node_indices_ptr + commit_index)
+        slot = tl.load(slot_mapping_ptr + commit_index)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < KV_DIM
+        source_offsets = layer_index * tree_layer_stride + node_index * KV_DIM + offsets
+        target_offsets = layer_index * cache_layer_stride + slot * KV_DIM + offsets
+        key = tl.load(tree_k_ptr + source_offsets, mask=mask)
+        value = tl.load(tree_v_ptr + source_offsets, mask=mask)
+        tl.store(k_cache_ptr + target_offsets, key, mask=mask)
+        tl.store(v_cache_ptr + target_offsets, value, mask=mask)
+else:
+    _fused_commit_tree_kv_kernel = None
 
 
 def fused_commit_tree_kv(
@@ -50,6 +58,8 @@ def fused_commit_tree_kv(
         raise ValueError("fused Tree K/V buffers must be contiguous")
     if node_indices.ndim != 1 or node_indices.numel() != slot_mapping.numel():
         raise ValueError("selected nodes and slots must have matching one-dimensional shapes")
+    if _fused_commit_tree_kv_kernel is None:
+        raise RuntimeError("Triton is required for fused Tree KV commit")
     kv_dim = tree_k.size(2) * tree_k.size(3)
     block_size = triton.next_power_of_2(kv_dim)
     _fused_commit_tree_kv_kernel[(tree_k.size(0), node_indices.numel())](

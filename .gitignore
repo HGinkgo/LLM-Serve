@@ -202,5 +202,4 @@ cython_debug/
 experiment-data/
 docs/
 roadmap.md
-tests/
-check_speculative_correctness.py
+test-results/
