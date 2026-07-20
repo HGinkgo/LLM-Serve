@@ -241,6 +241,16 @@ class BenchServingSpeculativeTest(unittest.TestCase):
         self.assertTrue(args.speculative_trace)
         self.assertTrue(args.argmax_sampler)
 
+    def test_parse_args_allows_explicitly_disabling_env_speculative_model(self):
+        with patch.dict(os.environ, {"SPECULATIVE_MODEL": "/env/eagle"}), patch.object(
+            sys,
+            "argv",
+            ["bench_serving.py", "--speculative-model", ""],
+        ):
+            args = bench_serving.parse_args()
+
+        self.assertEqual(args.speculative_model, "")
+
     def test_parse_args_rejects_completed_tree_kv_ablation_flag(self):
         with patch.object(
             sys,

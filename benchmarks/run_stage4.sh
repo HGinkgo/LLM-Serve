@@ -18,6 +18,10 @@ common=(
   --argmax-sampler
 )
 
+baseline=(
+  --speculative-model ""
+)
+
 eagle=(
   --speculative-model "$SPECULATIVE_MODEL"
   --speculative-gamma 3
@@ -29,6 +33,7 @@ for ((run = 1; run <= RUNS; run++)); do
 
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "$PYTHON" bench_serving.py \
     "${common[@]}" \
+    "${baseline[@]}" \
     --workload-name prefill-injection-baseline \
     --arrival prefill-injection \
     --num-requests 5 \
@@ -43,6 +48,7 @@ for ((run = 1; run <= RUNS; run++)); do
 
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "$PYTHON" bench_serving.py \
     "${common[@]}" \
+    "${baseline[@]}" \
     --workload-name prefill-injection-chunked \
     --arrival prefill-injection \
     --num-requests 5 \
@@ -58,6 +64,7 @@ for ((run = 1; run <= RUNS; run++)); do
 
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "$PYTHON" bench_serving.py \
     "${common[@]}" \
+    "${baseline[@]}" \
     --workload-name decode-heavy-baseline \
     --arrival all \
     --num-requests 4 \
@@ -83,6 +90,7 @@ for ((run = 1; run <= RUNS; run++)); do
 
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" "$PYTHON" bench_serving.py \
     "${common[@]}" \
+    "${baseline[@]}" \
     --workload-name mixed-closed-loop-baseline \
     --arrival closed-loop \
     --max-concurrency 8 \
