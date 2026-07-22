@@ -21,17 +21,57 @@ from benchmarks.suite import (
 
 
 AGGREGATE_METRICS = (
-    "metrics.throughput.requests_per_second",
-    "metrics.throughput.output_tokens_per_second",
-    "metrics.throughput.total_tokens_per_second",
-    "metrics.latency.overall.ttft.p50",
-    "metrics.latency.overall.ttft.p99",
-    "metrics.latency.overall.tpot.p50",
-    "metrics.latency.overall.tpot.p99",
-    "metrics.latency.overall.e2e.p50",
-    "metrics.latency.overall.e2e.p99",
-    "metrics.speculative.acceptance_rate",
-    "metrics.speculative.acceptance_length",
+    ("metrics.throughput.requests_per_second", 1.0, "req/s"),
+    ("metrics.throughput.input_tokens_per_second", 1.0, "tok/s"),
+    ("metrics.throughput.output_tokens_per_second", 1.0, "tok/s"),
+    ("metrics.throughput.total_tokens_per_second", 1.0, "tok/s"),
+    ("metrics.goodput.requests_per_second", 1.0, "req/s"),
+    ("metrics.latency.overall.ttft.p50", 1000.0, "ms"),
+    ("metrics.latency.overall.ttft.p99", 1000.0, "ms"),
+    ("metrics.latency.overall.tpot.p50", 1000.0, "ms"),
+    ("metrics.latency.overall.tpot.p99", 1000.0, "ms"),
+    ("metrics.latency.overall.burst_itl.p50", 1000.0, "ms"),
+    ("metrics.latency.overall.burst_itl.p99", 1000.0, "ms"),
+    (
+        "metrics.latency.overall.output_event_latency.p50",
+        1000.0,
+        "ms",
+    ),
+    (
+        "metrics.latency.overall.output_event_latency.p99",
+        1000.0,
+        "ms",
+    ),
+    (
+        "metrics.latency.overall.speculative_step_latency.p50",
+        1000.0,
+        "ms",
+    ),
+    (
+        "metrics.latency.overall.speculative_step_latency.p99",
+        1000.0,
+        "ms",
+    ),
+    ("metrics.latency.overall.e2e.p50", 1000.0, "ms"),
+    ("metrics.latency.overall.e2e.p99", 1000.0, "ms"),
+    ("metrics.latency.short.ttft.p50", 1000.0, "ms"),
+    ("metrics.latency.short.ttft.p99", 1000.0, "ms"),
+    ("metrics.latency.short.tpot.p50", 1000.0, "ms"),
+    ("metrics.latency.short.tpot.p99", 1000.0, "ms"),
+    ("metrics.latency.short.e2e.p50", 1000.0, "ms"),
+    ("metrics.latency.short.e2e.p99", 1000.0, "ms"),
+    ("metrics.latency.long.ttft.p50", 1000.0, "ms"),
+    ("metrics.latency.long.ttft.p99", 1000.0, "ms"),
+    ("metrics.latency.long.tpot.p50", 1000.0, "ms"),
+    ("metrics.latency.long.tpot.p99", 1000.0, "ms"),
+    ("metrics.latency.long.e2e.p50", 1000.0, "ms"),
+    ("metrics.latency.long.e2e.p99", 1000.0, "ms"),
+    ("metrics.speculative.acceptance_rate", 1.0, "ratio"),
+    ("metrics.speculative.acceptance_length", 1.0, "tokens/step"),
+    ("metrics.scheduled_batch_size.mean", 1.0, "requests"),
+    ("metrics.speculative_batch_size.mean", 1.0, "requests"),
+    ("metrics.waiting_queue_size.p99", 1.0, "requests"),
+    ("metrics.running_queue_size.p99", 1.0, "requests"),
 )
 
 
@@ -91,11 +131,12 @@ def _failure_result(
 
 def _aggregate_all(results):
     rows = []
-    for metric_path in AGGREGATE_METRICS:
-        try:
-            rows.extend(aggregate_results(results, metric_path))
-        except (KeyError, TypeError, ValueError):
-            continue
+    for metric_path, scale, unit in AGGREGATE_METRICS:
+        rows.extend(
+            aggregate_results(
+                results, metric_path, scale=scale, unit=unit
+            )
+        )
     return rows
 
 

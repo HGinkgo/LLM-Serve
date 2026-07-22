@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "name": "serving-formal-poisson",
+  "runs": 3,
+  "profiles": {
+    "decode-heavy": {
+      "classes": [
+        {
+          "name": "decode",
+          "weight": 1,
+          "input_len": 256,
+          "output_len": 256
+        }
+      ]
+    },
+    "mixed-serving": {
+      "classes": [
+        {
+          "name": "short",
+          "weight": 0.8,
+          "input_len": 128,
+          "output_len": 128
+        },
+        {
+          "name": "long",
+          "weight": 0.2,
+          "input_len": 4096,
+          "output_len": 128
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "eagle-poisson",
+      "arrival": "poisson",
+      "profile": "decode-heavy",
+      "num_requests": 24,
+      "request_rates": [0.25, 0.75, 1.25],
+      "variants": [
+        {
+          "name": "baseline"
+        },
+        {
+          "name": "eagle",
+          "enable_speculative": true
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "argmax_sampler": true,
+        "warmup": true,
+        "max_model_len": 1024,
+        "max_num_batched_tokens": 2048,
+        "speculative_gamma": 3,
+        "speculative_accept_mode": "greedy"
+      },
+      "slo_ms": {
+        "ttft": 2000,
+        "tpot": 100,
+        "e2e": 30000
+      }
+    },
+    {
+      "name": "chunked-poisson",
+      "arrival": "poisson",
+      "profile": "mixed-serving",
+      "num_requests": 25,
+      "request_rates": [0.5, 1.5, 2.5],
+      "variants": [
+        {
+          "name": "baseline"
+        },
+        {
+          "name": "chunked",
+          "enable_chunked_prefill": true
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "argmax_sampler": true,
+        "warmup": true,
+        "max_model_len": 4608,
+        "max_num_batched_tokens": 512
+      },
+      "slo_ms": {
+        "ttft": 5000,
+        "tpot": 100,
+        "e2e": 30000
+      }
+    }
+  ]
+}

@@ -162,7 +162,21 @@ def build_summary_rows(results: list[dict]) -> list[dict]:
         "running_queue_size_p99": (
             "metrics.running_queue_size.p99", 1.0
         ),
+        "goodput_rps": ("metrics.goodput.requests_per_second", 1.0),
+        "speculative_batch_size_mean": (
+            "metrics.speculative_batch_size.mean", 1.0
+        ),
     }
+    for request_class in ("short", "long"):
+        for latency_name in ("ttft", "tpot", "e2e"):
+            for percentile_name in ("p50", "p99"):
+                fields[
+                    f"{request_class}_{latency_name}_{percentile_name}_ms"
+                ] = (
+                    "metrics.latency."
+                    f"{request_class}.{latency_name}.{percentile_name}",
+                    1000.0,
+                )
     rows = []
     for result in results:
         config = result.get("config", {})
@@ -190,7 +204,13 @@ def build_summary_rows(results: list[dict]) -> list[dict]:
     return rows
 
 
-def aggregate_results(results: list[dict], metric_path: str) -> list[dict]:
+def aggregate_results(
+    results: list[dict],
+    metric_path: str,
+    *,
+    scale: float = 1.0,
+    unit: str | None = None,
+) -> list[dict]:
     groups = {}
     for result in results:
         if not result.get("complete"):
@@ -203,7 +223,11 @@ def aggregate_results(results: list[dict], metric_path: str) -> list[dict]:
             config.get("max_concurrency"),
             config["variant"],
         )
-        groups.setdefault(key, []).append(_nested_value(result, metric_path))
+        try:
+            value = _nested_value(result, metric_path)
+        except (KeyError, TypeError, ValueError):
+            continue
+        groups.setdefault(key, []).append(value * scale)
 
     baseline_means = {}
     for key, values in groups.items():
@@ -226,6 +250,7 @@ def aggregate_results(results: list[dict], metric_path: str) -> list[dict]:
             "max_concurrency": max_concurrency,
             "variant": variant,
             "metric": metric_path,
+            "unit": unit,
             "runs": len(values),
             "mean": value_mean,
             "stddev": stdev(values) if len(values) > 1 else 0.0,

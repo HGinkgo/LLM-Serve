@@ -66,7 +66,12 @@ class BenchmarkSuiteTests(unittest.TestCase):
 
         self.assertEqual(
             {path.name for path in suite_paths},
-            {"pilot.json", "smoke.json"},
+            {
+                "formal-closed-loop.json",
+                "formal-poisson.json",
+                "pilot.json",
+                "smoke.json",
+            },
         )
         for path in suite_paths:
             suite = json.loads(path.read_text())
@@ -80,6 +85,9 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     experiment["measurement_seconds"] >= 30
                     for experiment in suite["experiments"]
                 ))
+            if path.name.startswith("formal-"):
+                self.assertEqual(suite["runs"], 3)
+                self.assertEqual(len(points), 36)
 
     def test_expand_suite_pairs_variants_with_identical_randomness(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.suite"))
@@ -206,7 +214,12 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     "overall": {
                         "ttft": {"p50": 0.1, "p99": 0.5},
                         "tpot": {"p50": 0.02, "p99": 0.04},
-                    }
+                    },
+                    "short": {
+                        "ttft": {"p50": 0.05, "p99": 0.2},
+                        "tpot": {"p50": 0.01, "p99": 0.03},
+                        "e2e": {"p50": 1.0, "p99": 2.0},
+                    },
                 },
                 "speculative": {"acceptance_rate": None},
             },
@@ -219,7 +232,41 @@ class BenchmarkSuiteTests(unittest.TestCase):
         self.assertEqual(row["output_throughput_tps"], 8.0)
         self.assertEqual(row["ttft_p50_ms"], 100.0)
         self.assertEqual(row["tpot_p99_ms"], 40.0)
+        self.assertEqual(row["short_ttft_p99_ms"], 200.0)
+        self.assertEqual(row["short_e2e_p50_ms"], 1000.0)
+        self.assertIsNone(row["long_ttft_p99_ms"])
         self.assertIsNone(row["acceptance_rate"])
+
+    def test_aggregate_results_skips_missing_values_and_scales_units(self):
+        from benchmarks.suite import aggregate_results
+
+        result = {
+            "complete": True,
+            "config": {
+                "experiment": "mixed",
+                "arrival": "poisson",
+                "variant": "baseline",
+                "request_rate": 1.0,
+                "run": 0,
+            },
+            "metrics": {
+                "latency": {"short": {"ttft": {"p50": 0.125}}}
+            },
+        }
+
+        rows = aggregate_results(
+            [result],
+            "metrics.latency.short.ttft.p50",
+            scale=1000.0,
+            unit="ms",
+        )
+        missing = aggregate_results(
+            [result], "metrics.latency.long.ttft.p50"
+        )
+
+        self.assertEqual(rows[0]["mean"], 125.0)
+        self.assertEqual(rows[0]["unit"], "ms")
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":
