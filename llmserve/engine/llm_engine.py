@@ -217,6 +217,8 @@ class LLMEngine:
             "first_token_seq_ids": first_token_seq_ids,
             "decode_seq_ids": decode_seq_ids,
             "finished_seq_ids": finished_seq_ids,
+            "waiting_queue_size": len(getattr(self.scheduler, "waiting", ())),
+            "running_queue_size": len(getattr(self.scheduler, "running", ())),
         }
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
@@ -317,6 +319,8 @@ class LLMEngine:
             "first_token_seq_ids": first_token_seq_ids,
             "decode_seq_ids": decode_seq_ids,
             "finished_seq_ids": finished_seq_ids,
+            "waiting_queue_size": len(getattr(self.scheduler, "waiting", ())),
+            "running_queue_size": len(getattr(self.scheduler, "running", ())),
             "speculative": True,
             "speculative_batch_size": len(seqs),
             "speculative_num_draft_tokens": total_draft_tokens,

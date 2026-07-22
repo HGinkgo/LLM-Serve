@@ -8,6 +8,21 @@ def _rate_label(request_rate: float):
     return str(request_rate).replace(".", "p")
 
 
+def _point_dimensions(experiment: dict):
+    arrival = experiment["arrival"]
+    if arrival == "poisson":
+        return (
+            ("request_rate", value, f"rate-{_rate_label(value)}")
+            for value in experiment["request_rates"]
+        )
+    if arrival == "closed-loop":
+        return (
+            ("max_concurrency", value, f"concurrency-{value}")
+            for value in experiment["max_concurrencies"]
+        )
+    raise ValueError(f"unsupported arrival: {arrival}")
+
+
 def expand_suite(suite: dict) -> list[dict]:
     if suite.get("schema_version") != 1:
         raise ValueError("unsupported suite schema_version")
@@ -22,12 +37,10 @@ def expand_suite(suite: dict) -> list[dict]:
         if profile_name not in profiles:
             raise ValueError(f"unknown profile: {profile_name}")
         arrival = experiment["arrival"]
-        if arrival != "poisson":
-            raise ValueError(f"unsupported arrival: {arrival}")
         runtime_defaults = deepcopy(experiment.get("runtime", {}))
         runtime_defaults.setdefault("enable_chunked_prefill", False)
 
-        for request_rate in experiment["request_rates"]:
+        for dimension_name, dimension_value, dimension_label in _point_dimensions(experiment):
             for run in range(runs):
                 for variant in experiment["variants"]:
                     runtime = deepcopy(runtime_defaults)
@@ -41,9 +54,9 @@ def expand_suite(suite: dict) -> list[dict]:
                     variant_name = variant["name"]
                     point_id = (
                         f"{experiment['name']}-{variant_name}-"
-                        f"rate-{_rate_label(request_rate)}-r{run + 1}"
+                        f"{dimension_label}-r{run + 1}"
                     )
-                    points.append({
+                    point = {
                         "point_id": point_id,
                         "suite": suite["name"],
                         "experiment": experiment["name"],
@@ -52,12 +65,19 @@ def expand_suite(suite: dict) -> list[dict]:
                         "run": run,
                         "workload_seed": run,
                         "arrival_seed": run,
-                        "request_rate": request_rate,
-                        "num_requests": experiment["num_requests"],
                         "workload": deepcopy(profiles[profile_name]),
                         "runtime": runtime,
                         "slo_ms": deepcopy(experiment.get("slo_ms")),
-                    })
+                    }
+                    point[dimension_name] = dimension_value
+                    if arrival == "poisson":
+                        point["num_requests"] = experiment["num_requests"]
+                    else:
+                        point["warmup_seconds"] = experiment["warmup_seconds"]
+                        point["measurement_seconds"] = experiment[
+                            "measurement_seconds"
+                        ]
+                    points.append(point)
     if len({point["point_id"] for point in points}) != len(points):
         raise ValueError("suite expands to duplicate point_id values")
     return points
@@ -80,6 +100,91 @@ def _nested_value(value: dict, path: str):
     for part in path.split("."):
         value = value[part]
     return float(value)
+
+
+def _optional_nested_value(value: dict, path: str, scale: float = 1.0):
+    try:
+        for part in path.split("."):
+            value = value[part]
+    except (KeyError, TypeError):
+        return None
+    return value * scale if value is not None else None
+
+
+def build_summary_rows(results: list[dict]) -> list[dict]:
+    fields = {
+        "request_throughput_rps": (
+            "metrics.throughput.requests_per_second", 1.0
+        ),
+        "input_throughput_tps": (
+            "metrics.throughput.input_tokens_per_second", 1.0
+        ),
+        "output_throughput_tps": (
+            "metrics.throughput.output_tokens_per_second", 1.0
+        ),
+        "total_throughput_tps": (
+            "metrics.throughput.total_tokens_per_second", 1.0
+        ),
+        "ttft_p50_ms": ("metrics.latency.overall.ttft.p50", 1000.0),
+        "ttft_p99_ms": ("metrics.latency.overall.ttft.p99", 1000.0),
+        "tpot_p50_ms": ("metrics.latency.overall.tpot.p50", 1000.0),
+        "tpot_p99_ms": ("metrics.latency.overall.tpot.p99", 1000.0),
+        "burst_itl_p50_ms": (
+            "metrics.latency.overall.burst_itl.p50", 1000.0
+        ),
+        "burst_itl_p99_ms": (
+            "metrics.latency.overall.burst_itl.p99", 1000.0
+        ),
+        "output_event_latency_p50_ms": (
+            "metrics.latency.overall.output_event_latency.p50", 1000.0
+        ),
+        "output_event_latency_p99_ms": (
+            "metrics.latency.overall.output_event_latency.p99", 1000.0
+        ),
+        "speculative_step_latency_p50_ms": (
+            "metrics.latency.overall.speculative_step_latency.p50", 1000.0
+        ),
+        "speculative_step_latency_p99_ms": (
+            "metrics.latency.overall.speculative_step_latency.p99", 1000.0
+        ),
+        "e2e_p50_ms": ("metrics.latency.overall.e2e.p50", 1000.0),
+        "e2e_p99_ms": ("metrics.latency.overall.e2e.p99", 1000.0),
+        "acceptance_rate": ("metrics.speculative.acceptance_rate", 1.0),
+        "acceptance_length": (
+            "metrics.speculative.acceptance_length", 1.0
+        ),
+        "scheduled_batch_size_mean": (
+            "metrics.scheduled_batch_size.mean", 1.0
+        ),
+        "waiting_queue_size_p99": (
+            "metrics.waiting_queue_size.p99", 1.0
+        ),
+        "running_queue_size_p99": (
+            "metrics.running_queue_size.p99", 1.0
+        ),
+    }
+    rows = []
+    for result in results:
+        config = result.get("config", {})
+        row = {
+            "point_id": result.get("point_id"),
+            "complete": result.get("complete", False),
+            "git_commit": result.get("git_commit"),
+            "experiment": config.get("experiment"),
+            "arrival": config.get("arrival"),
+            "variant": config.get("variant"),
+            "run": config.get("run"),
+            "request_rate": config.get("request_rate"),
+            "max_concurrency": config.get("max_concurrency"),
+            "completed": _optional_nested_value(result, "metrics.completed"),
+            "failed": _optional_nested_value(result, "metrics.failed"),
+        }
+        row.update({
+            name: _optional_nested_value(result, path, scale)
+            for name, (path, scale) in fields.items()
+        })
+        rows.append(row)
+    return rows
 
 
 def aggregate_results(results: list[dict], metric_path: str) -> list[dict]:

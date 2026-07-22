@@ -111,6 +111,65 @@ class BenchmarkRuntimeTests(unittest.TestCase):
                 make_sampling_params=lambda spec: spec.output_len,
             )
 
+    def test_poisson_runner_counts_delay_between_scheduled_and_admitted_time(self):
+        from benchmarks.runtime import run_poisson
+
+        clock = FakeClock()
+        engine = FakeEngine(clock)
+        specs = [
+            RequestSpec(0, "short", 1, 1, (1,)),
+            RequestSpec(1, "short", 1, 1, (2,)),
+        ]
+
+        observation = run_poisson(
+            engine,
+            specs,
+            arrival_times=[0.0, 0.1],
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(observation["requests"][1]["arrival_time"], 0.1)
+        self.assertAlmostEqual(
+            observation["requests"][1]["first_token_time"]
+            - observation["requests"][1]["arrival_time"],
+            0.4,
+        )
+        self.assertEqual(observation["speculative_batch_sizes"], [])
+
+    def test_closed_loop_refills_during_window_then_drains(self):
+        import benchmarks.runtime as runtime
+
+        self.assertTrue(hasattr(runtime, "run_closed_loop"))
+        run_closed_loop = runtime.run_closed_loop
+
+        clock = FakeClock()
+        engine = FakeEngine(clock)
+        specs = (
+            RequestSpec(index, "short", 2, 1, (index, index + 1))
+            for index in range(10)
+        )
+
+        observation = run_closed_loop(
+            engine,
+            specs,
+            max_concurrency=2,
+            warmup_seconds=0.5,
+            measurement_seconds=1.5,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+        )
+
+        self.assertEqual(observation["duration"], 1.5)
+        self.assertEqual(observation["admitted"], 9)
+        self.assertEqual(observation["window_completed"], 6)
+        self.assertEqual(observation["window_output_tokens"], 6)
+        self.assertEqual(len(observation["latency_requests"]), 4)
+        self.assertEqual(observation["scheduled_batch_sizes"], [2] * 6)
+        self.assertEqual(observation["speculative_batch_sizes"], [])
+        self.assertTrue(engine.is_finished())
+
 
 class BenchmarkSchemaTests(unittest.TestCase):
     def test_compact_request_removes_absolute_timestamps(self):
@@ -131,6 +190,13 @@ class BenchmarkSchemaTests(unittest.TestCase):
             "speculative_step_latency": [0.1, 0.2],
             "finish_time": 8.0,
             "speculative_trace": [{"draft_token_ids": [1, 2, 3]}],
+            "speculative_steps": 2,
+            "speculative_draft_tokens": 6,
+            "speculative_accepted_tokens": 4,
+            "speculative_emitted_tokens": 6,
+            "speculative_accept_all_count": 1,
+            "speculative_gamma_counts": {3: 2},
+            "speculative_timing": {"draft": 0.3},
         }
 
         compact = compact_request_record(request)
@@ -147,6 +213,11 @@ class BenchmarkSchemaTests(unittest.TestCase):
         self.assertNotIn("token_times", compact)
         self.assertNotIn("output_event_times", compact)
         self.assertNotIn("speculative_trace", compact)
+        self.assertEqual(compact["speculative"]["steps"], 2)
+        self.assertEqual(compact["speculative"]["gamma_counts"], {3: 2})
+        self.assertAlmostEqual(
+            compact["speculative"]["timing_ms"]["draft"], 300.0
+        )
 
 
 if __name__ == "__main__":

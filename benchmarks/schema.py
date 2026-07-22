@@ -61,4 +61,22 @@ def compact_request_record(request: dict):
         "speculative_step_latency_ms": _milliseconds_summary(
             speculative_step_latency
         ),
+        "speculative": {
+            "steps": request.get("speculative_steps", 0),
+            "draft_tokens": request.get("speculative_draft_tokens", 0),
+            "accepted_tokens": request.get(
+                "speculative_accepted_tokens", 0
+            ),
+            "emitted_tokens": request.get("speculative_emitted_tokens", 0),
+            "accept_all_count": request.get(
+                "speculative_accept_all_count", 0
+            ),
+            "gamma_counts": request.get("speculative_gamma_counts", {}),
+            "timing_ms": {
+                name: value * 1000
+                for name, value in sorted(
+                    request.get("speculative_timing", {}).items()
+                )
+            },
+        },
     }

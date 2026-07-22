@@ -35,6 +35,32 @@ class BenchmarkWorkloadTests(unittest.TestCase):
 
         self.assertNotEqual(first[0].prompt_token_ids, second[0].prompt_token_ids)
 
+    def test_request_stream_keeps_exact_mix_without_reusing_prompts(self):
+        import benchmarks.workloads as workloads
+
+        self.assertTrue(hasattr(workloads, "iter_request_specs"))
+        WorkloadClass = workloads.WorkloadClass
+        iter_request_specs = workloads.iter_request_specs
+
+        classes = [
+            WorkloadClass("short", weight=0.8, input_len=8, output_len=4),
+            WorkloadClass("long", weight=0.2, input_len=16, output_len=4),
+        ]
+        stream = iter_request_specs(classes, seed=3, cycle_size=10)
+
+        specs = [next(stream) for _ in range(20)]
+
+        for offset in (0, 10):
+            self.assertEqual(
+                Counter(spec.request_class for spec in specs[offset:offset + 10]),
+                {"short": 8, "long": 2},
+            )
+        self.assertEqual([spec.request_id for spec in specs], list(range(20)))
+        self.assertNotEqual(
+            [spec.prompt_token_ids for spec in specs[:10]],
+            [spec.prompt_token_ids for spec in specs[10:]],
+        )
+
 
 class BenchmarkArrivalTests(unittest.TestCase):
     def test_poisson_arrivals_start_immediately_and_are_reproducible(self):
@@ -102,6 +128,9 @@ class BenchmarkMetricTests(unittest.TestCase):
         self.assertAlmostEqual(result["latency"]["overall"]["ttft"]["p50"], 1.5)
         self.assertAlmostEqual(result["latency"]["overall"]["ttft"]["p90"], 1.9)
         self.assertAlmostEqual(result["latency"]["overall"]["tpot"]["p50"], 1.5)
+        self.assertAlmostEqual(
+            result["latency"]["overall"]["burst_itl"]["p50"], 1.0
+        )
         self.assertAlmostEqual(result["latency"]["overall"]["e2e"]["p99"], 3.99)
         self.assertEqual(result["latency"]["short"]["ttft"]["p50"], 1.0)
         self.assertEqual(result["latency"]["long"]["ttft"]["p50"], 2.0)
@@ -132,6 +161,39 @@ class BenchmarkMetricTests(unittest.TestCase):
         self.assertEqual(result["throughput"]["total_tokens_per_second"], 0.0)
         self.assertIsNone(result["latency"]["overall"]["ttft"]["p50"])
         self.assertIsNone(result["goodput"])
+
+    def test_speculative_summary_aggregates_request_counters_and_timing(self):
+        from benchmarks.metrics import summarize_speculative_requests
+
+        requests = [
+            {
+                "speculative_steps": 2,
+                "speculative_draft_tokens": 6,
+                "speculative_accepted_tokens": 4,
+                "speculative_emitted_tokens": 6,
+                "speculative_accept_all_count": 1,
+                "speculative_gamma_counts": {3: 2},
+                "speculative_timing": {"draft": 0.03, "verify": 0.05},
+            },
+            {
+                "speculative_steps": 1,
+                "speculative_draft_tokens": 3,
+                "speculative_accepted_tokens": 1,
+                "speculative_emitted_tokens": 2,
+                "speculative_accept_all_count": 0,
+                "speculative_gamma_counts": {3: 1},
+                "speculative_timing": {"draft": 0.02, "verify": 0.04},
+            },
+        ]
+
+        result = summarize_speculative_requests(requests)
+
+        self.assertEqual(result["steps"], 3)
+        self.assertEqual(result["gamma_counts"], {3: 3})
+        self.assertAlmostEqual(result["acceptance_rate"], 5 / 9)
+        self.assertAlmostEqual(result["acceptance_length"], 8 / 3)
+        self.assertAlmostEqual(result["timing"]["draft"]["total_ms"], 50.0)
+        self.assertAlmostEqual(result["timing"]["verify"]["mean_ms"], 30.0)
 
 
 if __name__ == "__main__":

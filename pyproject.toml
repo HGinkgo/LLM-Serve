@@ -24,4 +24,4 @@ Homepage="https://github.com/HGinkgo/LLM-Serve"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["llmserve*"]
+include = ["llmserve*", "benchmarks*"]

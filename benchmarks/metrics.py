@@ -47,24 +47,93 @@ def _request_latency(request: Mapping):
         tpot = (finish_time - first_token_time) / (output_tokens - 1)
     else:
         tpot = 0.0
-    itl = request.get("burst_itl")
-    if itl is None:
-        itl = [
+    burst_itl = request.get("burst_itl")
+    if burst_itl is None:
+        burst_itl = [
             token_times[index] - token_times[index - 1]
             for index in range(1, len(token_times))
         ]
-    return {"ttft": ttft, "tpot": tpot, "itl": itl, "e2e": e2e}
+    output_event_latency = request.get("output_event_latency")
+    if output_event_latency is None:
+        output_event_times = request.get("output_event_times", [])
+        output_event_latency = [
+            output_event_times[index] - output_event_times[index - 1]
+            for index in range(1, len(output_event_times))
+        ]
+    return {
+        "ttft": ttft,
+        "tpot": tpot,
+        "burst_itl": burst_itl,
+        "output_event_latency": output_event_latency,
+        "speculative_step_latency": request.get(
+            "speculative_step_latency", []
+        ),
+        "e2e": e2e,
+    }
 
 
 def _latency_summary(requests: Sequence[Mapping]):
-    values = {"ttft": [], "tpot": [], "itl": [], "e2e": []}
+    scalar_names = ("ttft", "tpot", "e2e")
+    sample_names = (
+        "burst_itl",
+        "output_event_latency",
+        "speculative_step_latency",
+    )
+    values = {name: [] for name in scalar_names + sample_names}
     for request in requests:
         latency = _request_latency(request)
-        values["ttft"].append(latency["ttft"])
-        values["tpot"].append(latency["tpot"])
-        values["itl"].extend(latency["itl"])
-        values["e2e"].append(latency["e2e"])
+        for name in scalar_names:
+            values[name].append(latency[name])
+        for name in sample_names:
+            values[name].extend(latency[name])
     return {name: summarize_values(samples) for name, samples in values.items()}
+
+
+def summarize_speculative_requests(requests: Sequence[Mapping]):
+    steps = sum(request.get("speculative_steps", 0) for request in requests)
+    draft_tokens = sum(
+        request.get("speculative_draft_tokens", 0) for request in requests
+    )
+    accepted_tokens = sum(
+        request.get("speculative_accepted_tokens", 0) for request in requests
+    )
+    emitted_tokens = sum(
+        request.get("speculative_emitted_tokens", 0) for request in requests
+    )
+    accept_all_count = sum(
+        request.get("speculative_accept_all_count", 0) for request in requests
+    )
+    gamma_counts = {}
+    timing_totals = {}
+    for request in requests:
+        for gamma, count in request.get("speculative_gamma_counts", {}).items():
+            gamma_counts[gamma] = gamma_counts.get(gamma, 0) + count
+        for name, value in request.get("speculative_timing", {}).items():
+            timing_totals[name] = timing_totals.get(name, 0.0) + value
+
+    return {
+        "steps": steps,
+        "draft_tokens": draft_tokens,
+        "accepted_tokens": accepted_tokens,
+        "emitted_tokens": emitted_tokens,
+        "acceptance_rate": (
+            accepted_tokens / draft_tokens if draft_tokens > 0 else None
+        ),
+        "acceptance_length": emitted_tokens / steps if steps > 0 else None,
+        "accepted_length": accepted_tokens / steps if steps > 0 else None,
+        "draft_tokens_per_step": draft_tokens / steps if steps > 0 else None,
+        "accept_all_count": accept_all_count,
+        "gamma_counts": dict(
+            sorted(gamma_counts.items(), key=lambda item: int(item[0]))
+        ),
+        "timing": {
+            name: {
+                "total_ms": total * 1000,
+                "mean_ms": total * 1000 / steps if steps > 0 else None,
+            }
+            for name, total in sorted(timing_totals.items())
+        },
+    }
 
 
 def _goodput_summary(

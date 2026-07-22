@@ -34,8 +34,47 @@ SUITE = {
     ],
 }
 
+CLOSED_LOOP_SUITE = {
+    "schema_version": 1,
+    "name": "serving-v1",
+    "runs": 2,
+    "profiles": SUITE["profiles"],
+    "experiments": [
+        {
+            "name": "decode-closed-loop",
+            "arrival": "closed-loop",
+            "profile": "mixed",
+            "max_concurrencies": [1, 4],
+            "warmup_seconds": 2,
+            "measurement_seconds": 5,
+            "variants": [
+                {"name": "baseline"},
+                {"name": "eagle", "enable_speculative": True},
+            ],
+            "runtime": {"max_model_len": 4608, "max_num_batched_tokens": 512},
+        }
+    ],
+}
+
 
 class BenchmarkSuiteTests(unittest.TestCase):
+    def test_repository_suite_configs_expand_to_unique_points(self):
+        from benchmarks.suite import expand_suite
+
+        suite_dir = Path(__file__).resolve().parents[1] / "benchmarks" / "suites"
+        suite_paths = sorted(suite_dir.glob("*.json"))
+
+        self.assertEqual(
+            {path.name for path in suite_paths},
+            {"pilot.json", "smoke.json"},
+        )
+        for path in suite_paths:
+            points = expand_suite(json.loads(path.read_text()))
+            self.assertTrue(points)
+            self.assertEqual(
+                len({point["point_id"] for point in points}), len(points)
+            )
+
     def test_expand_suite_pairs_variants_with_identical_randomness(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.suite"))
         from benchmarks.suite import expand_suite
@@ -68,6 +107,23 @@ class BenchmarkSuiteTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "unknown profile"):
             expand_suite(invalid)
+
+    def test_expand_suite_supports_closed_loop_concurrency_sweep(self):
+        from benchmarks.suite import expand_suite
+
+        points = expand_suite(CLOSED_LOOP_SUITE)
+
+        self.assertEqual(len(points), 8)
+        self.assertEqual({point["max_concurrency"] for point in points}, {1, 4})
+        self.assertTrue(all(point["warmup_seconds"] == 2 for point in points))
+        self.assertTrue(all(point["measurement_seconds"] == 5 for point in points))
+        paired = {}
+        for point in points:
+            key = (point["max_concurrency"], point["run"])
+            paired.setdefault(key, []).append(point)
+        for variants in paired.values():
+            self.assertEqual({point["variant"] for point in variants}, {"baseline", "eagle"})
+            self.assertEqual(len({point["workload_seed"] for point in variants}), 1)
 
     def test_resume_requires_complete_matching_result(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.suite"))
@@ -118,6 +174,46 @@ class BenchmarkSuiteTests(unittest.TestCase):
         self.assertEqual(baseline["ratio_to_baseline"], 1.0)
         self.assertEqual(chunked["mean"], 15.0)
         self.assertEqual(chunked["ratio_to_baseline"], 1.25)
+
+    def test_summary_rows_flatten_standard_metrics_in_public_units(self):
+        from benchmarks.suite import build_summary_rows
+
+        result = {
+            "point_id": "point-1",
+            "complete": True,
+            "git_commit": "abc123",
+            "config": {
+                "experiment": "chunked-poisson",
+                "arrival": "poisson",
+                "variant": "baseline",
+                "request_rate": 1.0,
+                "run": 0,
+            },
+            "metrics": {
+                "completed": 4,
+                "failed": 0,
+                "throughput": {
+                    "requests_per_second": 2.0,
+                    "output_tokens_per_second": 8.0,
+                },
+                "latency": {
+                    "overall": {
+                        "ttft": {"p50": 0.1, "p99": 0.5},
+                        "tpot": {"p50": 0.02, "p99": 0.04},
+                    }
+                },
+                "speculative": {"acceptance_rate": None},
+            },
+        }
+
+        row = build_summary_rows([result])[0]
+
+        self.assertEqual(row["point_id"], "point-1")
+        self.assertEqual(row["request_throughput_rps"], 2.0)
+        self.assertEqual(row["output_throughput_tps"], 8.0)
+        self.assertEqual(row["ttft_p50_ms"], 100.0)
+        self.assertEqual(row["tpot_p99_ms"], 40.0)
+        self.assertIsNone(row["acceptance_rate"])
 
 
 if __name__ == "__main__":

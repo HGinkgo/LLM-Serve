@@ -82,3 +82,36 @@ def build_request_specs(
             )
         )
     return specs
+
+
+def iter_request_specs(
+    classes: Sequence[WorkloadClass],
+    seed: int,
+    cycle_size: int = 100,
+):
+    if not classes:
+        raise ValueError("classes cannot be empty")
+    if cycle_size <= 0:
+        raise ValueError("cycle_size must be positive")
+
+    rng = Random(seed)
+    request_id = 0
+    counts = _class_counts(classes, cycle_size)
+    while True:
+        assignments = []
+        for workload_class, count in zip(classes, counts):
+            assignments.extend([workload_class] * count)
+        rng.shuffle(assignments)
+        for workload_class in assignments:
+            prompt_token_ids = tuple(
+                rng.randint(0, 10000)
+                for _ in range(workload_class.input_len)
+            )
+            yield RequestSpec(
+                request_id=request_id,
+                request_class=workload_class.name,
+                input_len=workload_class.input_len,
+                output_len=workload_class.output_len,
+                prompt_token_ids=prompt_token_ids,
+            )
+            request_id += 1

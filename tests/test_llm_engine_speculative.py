@@ -27,6 +27,8 @@ class FakeScheduler:
     def __init__(self, seq):
         self.seq = seq
         self.block_manager = FakeBlockManager()
+        self.waiting = [object(), object()]
+        self.running = [seq]
 
     def schedule(self):
         self.seq.num_scheduled_tokens = 1
@@ -327,6 +329,8 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         self.assertEqual(engine.scheduler.block_manager.calls, [])
         self.assertNotIn("speculative", engine.last_step_events)
         self.assertEqual(len(engine.request_metrics[seq.seq_id]["output_event_times"]), 1)
+        self.assertEqual(engine.last_step_events["waiting_queue_size"], 2)
+        self.assertEqual(engine.last_step_events["running_queue_size"], 1)
 
     def test_step_passes_explicit_groups_for_mixed_batch(self):
         prefill = Sequence([1, 2, 3])
