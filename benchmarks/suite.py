@@ -1,0 +1,130 @@
+import json
+from copy import deepcopy
+from pathlib import Path
+from statistics import mean, stdev
+
+
+def _rate_label(request_rate: float):
+    return str(request_rate).replace(".", "p")
+
+
+def expand_suite(suite: dict) -> list[dict]:
+    if suite.get("schema_version") != 1:
+        raise ValueError("unsupported suite schema_version")
+    runs = suite.get("runs", 0)
+    if runs <= 0:
+        raise ValueError("suite runs must be positive")
+    profiles = suite.get("profiles", {})
+    points = []
+
+    for experiment in suite.get("experiments", []):
+        profile_name = experiment["profile"]
+        if profile_name not in profiles:
+            raise ValueError(f"unknown profile: {profile_name}")
+        arrival = experiment["arrival"]
+        if arrival != "poisson":
+            raise ValueError(f"unsupported arrival: {arrival}")
+        runtime_defaults = deepcopy(experiment.get("runtime", {}))
+        runtime_defaults.setdefault("enable_chunked_prefill", False)
+
+        for request_rate in experiment["request_rates"]:
+            for run in range(runs):
+                for variant in experiment["variants"]:
+                    runtime = deepcopy(runtime_defaults)
+                    runtime.update(
+                        {
+                            key: value
+                            for key, value in variant.items()
+                            if key != "name"
+                        }
+                    )
+                    variant_name = variant["name"]
+                    point_id = (
+                        f"{experiment['name']}-{variant_name}-"
+                        f"rate-{_rate_label(request_rate)}-r{run + 1}"
+                    )
+                    points.append({
+                        "point_id": point_id,
+                        "suite": suite["name"],
+                        "experiment": experiment["name"],
+                        "arrival": arrival,
+                        "variant": variant_name,
+                        "run": run,
+                        "workload_seed": run,
+                        "arrival_seed": run,
+                        "request_rate": request_rate,
+                        "num_requests": experiment["num_requests"],
+                        "workload": deepcopy(profiles[profile_name]),
+                        "runtime": runtime,
+                        "slo_ms": deepcopy(experiment.get("slo_ms")),
+                    })
+    if len({point["point_id"] for point in points}) != len(points):
+        raise ValueError("suite expands to duplicate point_id values")
+    return points
+
+
+def can_resume_result(path: Path, point: dict, git_commit: str) -> bool:
+    try:
+        result = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        result.get("schema_version") == 2
+        and result.get("complete") is True
+        and result.get("point_id") == point["point_id"]
+        and result.get("git_commit") == git_commit
+    )
+
+
+def _nested_value(value: dict, path: str):
+    for part in path.split("."):
+        value = value[part]
+    return float(value)
+
+
+def aggregate_results(results: list[dict], metric_path: str) -> list[dict]:
+    groups = {}
+    for result in results:
+        if not result.get("complete"):
+            continue
+        config = result["config"]
+        key = (
+            config["experiment"],
+            config["arrival"],
+            config.get("request_rate"),
+            config.get("max_concurrency"),
+            config["variant"],
+        )
+        groups.setdefault(key, []).append(_nested_value(result, metric_path))
+
+    baseline_means = {}
+    for key, values in groups.items():
+        experiment, arrival, request_rate, max_concurrency, variant = key
+        if variant == "baseline":
+            baseline_means[(experiment, arrival, request_rate, max_concurrency)] = mean(values)
+
+    rows = []
+    for key in sorted(groups, key=lambda item: tuple(str(value) for value in item)):
+        experiment, arrival, request_rate, max_concurrency, variant = key
+        values = groups[key]
+        value_mean = mean(values)
+        baseline_mean = baseline_means.get(
+            (experiment, arrival, request_rate, max_concurrency)
+        )
+        rows.append({
+            "experiment": experiment,
+            "arrival": arrival,
+            "request_rate": request_rate,
+            "max_concurrency": max_concurrency,
+            "variant": variant,
+            "metric": metric_path,
+            "runs": len(values),
+            "mean": value_mean,
+            "stddev": stdev(values) if len(values) > 1 else 0.0,
+            "ratio_to_baseline": (
+                value_mean / baseline_mean
+                if baseline_mean not in (None, 0)
+                else None
+            ),
+        })
+    return rows
