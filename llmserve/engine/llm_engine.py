@@ -77,6 +77,15 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
+    def reset_metrics(self):
+        if not self.scheduler.is_finished():
+            raise RuntimeError("cannot reset metrics while requests are active")
+        self.request_metrics.clear()
+        self.last_step_events = {}
+        self.speculative_batch_calls = 0
+        self.speculative_batch_sequences = 0
+        self.speculative_max_batch_size = 0
+
     # 把用户请求放进系统
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

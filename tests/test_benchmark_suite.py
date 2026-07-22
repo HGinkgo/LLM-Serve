@@ -69,11 +69,17 @@ class BenchmarkSuiteTests(unittest.TestCase):
             {"pilot.json", "smoke.json"},
         )
         for path in suite_paths:
-            points = expand_suite(json.loads(path.read_text()))
+            suite = json.loads(path.read_text())
+            points = expand_suite(suite)
             self.assertTrue(points)
             self.assertEqual(
                 len({point["point_id"] for point in points}), len(points)
             )
+            if path.name == "pilot.json":
+                self.assertTrue(all(
+                    experiment["measurement_seconds"] >= 30
+                    for experiment in suite["experiments"]
+                ))
 
     def test_expand_suite_pairs_variants_with_identical_randomness(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.suite"))

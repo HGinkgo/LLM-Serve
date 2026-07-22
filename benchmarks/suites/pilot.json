@@ -35,9 +35,9 @@
       "name": "eagle-capacity",
       "arrival": "closed-loop",
       "profile": "decode-heavy",
-      "max_concurrencies": [1, 4],
-      "warmup_seconds": 3,
-      "measurement_seconds": 8,
+      "max_concurrencies": [1, 4, 8],
+      "warmup_seconds": 5,
+      "measurement_seconds": 30,
       "variants": [
         {
           "name": "baseline"
@@ -60,9 +60,9 @@
       "name": "chunked-capacity",
       "arrival": "closed-loop",
       "profile": "mixed-serving",
-      "max_concurrencies": [4, 8],
-      "warmup_seconds": 3,
-      "measurement_seconds": 8,
+      "max_concurrencies": [4, 8, 16],
+      "warmup_seconds": 5,
+      "measurement_seconds": 30,
       "variants": [
         {
           "name": "baseline"

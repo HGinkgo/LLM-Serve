@@ -49,6 +49,7 @@
       "runtime": {
         "enforce_eager": true,
         "argmax_sampler": true,
+        "warmup": true,
         "max_model_len": 1024,
         "max_num_batched_tokens": 512,
         "speculative_gamma": 3,
@@ -73,6 +74,7 @@
       "runtime": {
         "enforce_eager": true,
         "argmax_sampler": true,
+        "warmup": true,
         "max_model_len": 1024,
         "max_num_batched_tokens": 256
       }

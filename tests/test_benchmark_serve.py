@@ -116,6 +116,60 @@ class BenchmarkServeTests(unittest.TestCase):
         logits = torch.tensor([[0.0, 2.0, 1.0]])
         self.assertEqual(engine.model_runner.sampler(logits, None).item(), 1)
 
+    def test_closed_loop_result_reports_latency_sample_request_count(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        point = make_point(
+            point_id="closed-loop-baseline-concurrency-2-r1",
+            arrival="closed-loop",
+            max_concurrency=2,
+            warmup_seconds=0.5,
+            measurement_seconds=1.5,
+        )
+
+        result = run_point(
+            point,
+            model="/models/Qwen3-8B",
+            engine_factory=lambda *args, **kwargs: FakeEngine(clock),
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(result["metrics"]["completed"], 6)
+        self.assertEqual(result["metrics"]["latency_sample_requests"], 4)
+
+    def test_poisson_warmup_is_reset_before_measurement(self):
+        from benchmarks.serve import run_point
+
+        class ResettableFakeEngine(FakeEngine):
+            def __init__(self, clock):
+                super().__init__(clock)
+                self.reset_calls = 0
+
+            def reset_metrics(self):
+                self.reset_calls += 1
+                self.requests.clear()
+                self.last_step_events = {}
+
+        clock = FakeClock()
+        engine = ResettableFakeEngine(clock)
+        point = make_point()
+        point["runtime"]["warmup"] = True
+
+        result = run_point(
+            point,
+            model="/models/Qwen3-8B",
+            engine_factory=lambda *args, **kwargs: engine,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(engine.reset_calls, 1)
+        self.assertEqual(result["metrics"]["completed"], 3)
+        self.assertEqual(len(result["requests"]), 3)
 
 if __name__ == "__main__":
     unittest.main()

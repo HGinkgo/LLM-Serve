@@ -5,6 +5,7 @@ import sys
 import time
 from copy import deepcopy
 from pathlib import Path
+from random import Random
 
 from benchmarks.arrivals import poisson_arrival_times
 from benchmarks.environment import (
@@ -21,9 +22,33 @@ from benchmarks.runtime import run_closed_loop, run_poisson
 from benchmarks.schema import compact_request_record
 from benchmarks.workloads import (
     WorkloadClass,
+    RequestSpec,
     build_request_specs,
     iter_request_specs,
 )
+
+
+def _warmup_engine(engine, classes, make_sampling_params):
+    rng = Random(0)
+    for index, workload_class in enumerate(classes):
+        output_len = min(workload_class.output_len, 8)
+        spec = RequestSpec(
+            request_id=-(index + 1),
+            request_class=workload_class.name,
+            input_len=workload_class.input_len,
+            output_len=output_len,
+            prompt_token_ids=tuple(
+                rng.randint(0, 10000)
+                for _ in range(workload_class.input_len)
+            ),
+        )
+        engine.add_request(
+            list(spec.prompt_token_ids),
+            make_sampling_params(spec),
+        )
+    while not engine.is_finished():
+        engine.step()
+    engine.reset_metrics()
 
 
 def _default_engine_factory(model, **kwargs):
@@ -71,6 +96,9 @@ def _closed_loop_metrics(observation: dict, slo_ms):
         request["prompt_tokens"] for request in completed_requests
     )
     metrics["completed"] = observation["window_completed"]
+    metrics["latency_sample_requests"] = len(
+        observation["latency_requests"]
+    )
     metrics["failed"] = sum(
         not request["success"] for request in completed_requests
     )
@@ -127,6 +155,8 @@ def run_point(
     classes = _workload_classes(point)
     try:
         if point["arrival"] == "poisson":
+            if runtime.get("warmup", False):
+                _warmup_engine(engine, classes, make_sampling_params)
             specs = build_request_specs(
                 classes,
                 num_requests=point["num_requests"],

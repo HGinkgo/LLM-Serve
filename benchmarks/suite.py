@@ -178,6 +178,9 @@ def build_summary_rows(results: list[dict]) -> list[dict]:
             "max_concurrency": config.get("max_concurrency"),
             "completed": _optional_nested_value(result, "metrics.completed"),
             "failed": _optional_nested_value(result, "metrics.failed"),
+            "latency_sample_requests": _optional_nested_value(
+                result, "metrics.latency_sample_requests"
+            ),
         }
         row.update({
             name: _optional_nested_value(result, path, scale)

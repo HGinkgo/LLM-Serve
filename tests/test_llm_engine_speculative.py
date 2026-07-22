@@ -169,6 +169,22 @@ class FakeBatchModelRunner(FakeModelRunner):
 
 
 class LLMEngineSpeculativeTest(unittest.TestCase):
+    def test_reset_metrics_requires_idle_engine_and_clears_counters(self):
+        engine = object.__new__(LLMEngine)
+        engine.scheduler = SimpleNamespace(is_finished=lambda: True)
+        engine.request_metrics = {1: {"success": True}}
+        engine.last_step_events = {"step_end": 1.0}
+        engine.speculative_batch_calls = 3
+        engine.speculative_batch_sequences = 7
+        engine.speculative_max_batch_size = 4
+
+        engine.reset_metrics()
+
+        self.assertEqual(engine.request_metrics, {})
+        self.assertEqual(engine.last_step_events, {})
+        self.assertEqual(engine.speculative_batch_calls, 0)
+        self.assertEqual(engine.speculative_batch_sequences, 0)
+        self.assertEqual(engine.speculative_max_batch_size, 0)
 
     @staticmethod
     def make_metric(seq):
