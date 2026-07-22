@@ -4,9 +4,9 @@ This directory contains the public, sanitized evidence for LLM-Serve benchmark c
 
 ## Data Boundary
 
-- `results/summary.csv`: one row per benchmark run.
-- `results/representative/`: at least one sanitized raw JSON for each published configuration.
-- Full raw runs remain local until they are sanitized and attached to a GitHub Release.
+- `results/summary.csv` and `results/representative/`: Stage 4 pre-refactor dataset.
+- `results/stage5-scheduler-output/`: Stage 5 post-refactor summary and sanitized representative JSON.
+- Full raw runs remain local unless they are explicitly curated for publication.
 - Public files must not contain absolute model paths, prompt paths, credentials, or host-specific workspace paths.
 
 Historical JSON generated before Stage 4 does not include output-event or speculative-step latency. The summary script preserves its old `itl` field as `burst_itl` and leaves the newer metrics empty. Historical data is not used as a substitute for the clean Stage 4 rerun.
@@ -27,8 +27,8 @@ Run benchmarks with `--output-json`, `--workload-name`, and explicit model revis
 ```bash
 python scripts/summarize_benchmarks.py \
   /path/to/run1.json /path/to/run2.json \
-  --csv benchmarks/results/summary.csv \
-  --representative-dir benchmarks/results/representative
+  --csv benchmarks/results/<dataset>/summary.csv \
+  --representative-dir benchmarks/results/<dataset>/representative
 ```
 
 The script copies measured values without modification. It only normalizes local path fields in the representative JSON.
