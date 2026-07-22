@@ -4,141 +4,120 @@
 
 [![CPU tests](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml)
 
-LLM-Serve is an educational single-GPU inference runtime extended from the `nano-vllm` skeleton. It focuses on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and EAGLE-style speculative decoding.
+LLM-Serve is an educational single-GPU inference runtime focused on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and EAGLE-style speculative decoding.
 
-The initial skeleton was informed by the vLLM PagedAttention paper and the `nano-vllm` educational codebase. The scheduler changes, chunked prefill path, benchmark tooling, and speculative decoding runtime are independently designed and implemented in this repository.
-
-The repository name and Python package are aligned as `LLM-Serve` / `llmserve`.
+The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vllm`. The scheduler changes, chunked prefill path, benchmark system, and speculative decoding runtime are independently designed and implemented in this repository.
 
 ## Features
 
-- PagedAttention-style KV cache management with block tables, reusable KV blocks, and prefix-cache-aware block allocation.
-- Continuous batching with an iteration-level scheduler.
-- Chunked prefill with decode-first scheduling, allowing long prompt prefill work to share iterations with active decode requests.
-- Serving benchmark tooling with throughput, TTFT, burst ITL, output-event latency, speculative step latency, TPOT, request latency, and a closed-loop steady-state mode that separates warmup, measurement, and drain phases.
-- EAGLE-style speculative decoding with batched draft proposal, packed target verification, per-request draft KV, greedy verification, and acceptance and timing metrics.
-- Qwen3 model support for local single-GPU experiments.
+- PagedAttention-style KV cache allocation, recycling, block tables, and prefix cache.
+- Iteration-level continuous batching with explicit prefill/decode groups.
+- Decode-first chunked prefill for mixed prefill/decode batches.
+- EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy verification, and timing metrics.
+- Reproducible Poisson request-rate and closed-loop concurrency suites with throughput, goodput, TTFT, TPOT, burst ITL, output-event latency, E2E, queue depth, and speculative metrics.
+- A validated single-GPU Qwen3-8B BF16 path and optional fixed-tree experiments.
 
-## Code Layout
+## Layout
 
-- `llmserve/engine/`: request scheduling, KV block management, target-model execution, and speculative runtime orchestration.
-- `llmserve/models/`: Qwen3 and EAGLE3 neural-network definitions plus checkpoint loading.
-- `llmserve/speculative/`: draft generation, verification sampling, fixed-tree algorithms, Tree KV management, and shared result types.
-- `llmserve/layers/`: attention, sampling, and model building blocks.
-- `bench_serving.py`: finite-workload and closed-loop serving benchmarks.
-- `tests/`: CPU unit tests, optional real-checkpoint integration tests, and CUDA kernel tests.
-- `scripts/summarize_benchmarks.py`: produces sanitized representative JSON and per-run CSV files.
-- `benchmarks/`: public benchmark semantics and results.
-
-`ModelRunner` owns the target-model execution resources. `SpeculativeExecutor` composes those resources into the EAGLE decode flow, while algorithmic code remains independent under `llmserve/speculative/`.
+- `llmserve/engine/`: scheduling, KV block management, target execution, and speculative orchestration.
+- `llmserve/models/`: Qwen3 and EAGLE3 definitions and checkpoint loading.
+- `llmserve/speculative/`: draft, verification sampling, fixed trees, and Tree KV management.
+- `llmserve/layers/`: attention, linear, sampling, and other model building blocks.
+- `benchmarks/`: workloads, arrivals, metrics, point/suite runners, and public results.
+- `tests/`: CPU tests plus optional checkpoint and CUDA kernel coverage.
 
 ## Quick Start
 
-Install the package in editable mode:
-
 ```bash
 pip install -e .
-```
 
-Set a local model path:
-
-```bash
 export MODEL_PATH=/path/to/Qwen3-8B
-```
+export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
 
-Run a small generation example:
-
-```bash
 python example.py
 ```
 
-Run a small serving benchmark:
+Run the four-point GPU smoke suite:
 
 ```bash
-python bench_serving.py \
-  --model "$MODEL_PATH" \
-  --num-requests 8 \
-  --input-len 128 \
-  --output-len 128 \
-  --arrival all
-```
-
-Measure steady-state continuous batching at a fixed concurrency:
-
-```bash
-python bench_serving.py \
-  --model "$MODEL_PATH" \
-  --arrival closed-loop \
-  --max-concurrency 8 \
-  --warmup-seconds 5 \
-  --measurement-seconds 15 \
-  --prompt-mode natural \
-  --output-len 64
-```
-
-Closed-loop mode replaces each completed request until the measurement window ends, then stops admission and drains remaining requests. Its steady-state throughput counts only tokens emitted inside the measurement window; the existing overall summary is still included for comparison.
-
-Run the chunked prefill path:
-
-```bash
-python bench_serving.py \
-  --model "$MODEL_PATH" \
-  --workload-name prefill-injection \
-  --arrival prefill-injection \
-  --num-requests 5 \
-  --input-len 128 \
-  --long-input-len 4096 \
-  --injection-delay 1 \
-  --output-len 256 \
-  --max-model-len 4608 \
-  --max-num-batched-tokens 512 \
-  --enable-chunked-prefill
-```
-
-This workload starts four short-prompt requests, then injects one long prompt into their active decode batch. Remove `--enable-chunked-prefill` to run the matching baseline.
-
-Run the EAGLE speculative path with a compatible draft checkpoint:
-
-```bash
-export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
-
-python bench_serving.py \
+python -m benchmarks.run_suite \
+  --suite benchmarks/suites/smoke.json \
+  --output-dir /tmp/llmserve-smoke \
   --model "$MODEL_PATH" \
   --speculative-model "$SPECULATIVE_MODEL" \
-  --speculative-gamma 3 \
-  --speculative-accept-mode greedy \
-  --speculative-trace \
-  --num-requests 1 \
-  --input-len 128 \
-  --output-len 64 \
-  --arrival all \
-  --enforce-eager
+  --allow-dirty
 ```
 
-The EAGLE benchmark summary reports speculative batch size, acceptance rate, acceptance length, accepted tokens per step, draft tokens per step, and a timing breakdown for draft proposal, target verification, accept/reject, KV update, and trace overhead.
+Run the formal Poisson suite on a clean commit:
 
-The validated 24GB configuration is Qwen3-8B with the RedHatAI Qwen3-8B EAGLE3 speculator, BF16 eager mode, and fixed `gamma=3`. In three output-256 runs, throughput improved by `1.20x` at batch 1 and `1.34x` at batch 4.
+```bash
+python -m benchmarks.run_suite \
+  --suite benchmarks/suites/formal-poisson.json \
+  --output-dir /tmp/llmserve-formal-poisson \
+  --model "$MODEL_PATH" \
+  --speculative-model "$SPECULATIVE_MODEL" \
+  --resume
+```
 
-The Stage 4 three-workload evidence, 18 formal runs, summary CSV, and sanitized representative JSON files are in [`benchmarks/results/`](benchmarks/results/).
+`formal-closed-loop.json` provides the fixed-concurrency complement. When running both suites concurrently on two GPUs, pass distinct distributed endpoints such as `tcp://localhost:2333` and `tcp://localhost:2334`. Each point runs in an independent subprocess. See [`benchmarks/README.md`](benchmarks/README.md) for schemas and execution details.
+
+## Results
+
+The public results use commit `ad35e65`, Qwen3-8B with the RedHatAI Qwen3-8B EAGLE3 speculator, BF16 eager mode, fixed `gamma=3`, argmax sampling, and one RTX 3090 24GB per suite. Every configuration has three independent runs.
+
+### EAGLE
+
+The decode-heavy profile is `256 input / 256 output`:
+
+| Closed-loop concurrency | Baseline output tok/s | EAGLE output tok/s | Throughput ratio | E2E P99 ratio |
+| :--- | ---: | ---: | ---: | ---: |
+| 1 | 25.08 | 41.01 | **1.635x** | 0.929x |
+| 4 | 89.20 | 153.40 | **1.720x** | 1.257x |
+| 8 | 172.36 | 267.39 | **1.551x** | 1.421x |
+
+At Poisson request rates `{0.25, 0.75, 1.25}`, finite-workload output throughput improves by only `1.025x-1.042x`, while E2E P99 is `1.068x-1.220x` of baseline. The result is deliberately workload-specific: saturated capacity gains do not imply lower online request latency.
+
+### Chunked Prefill
+
+The mixed profile combines 80% `128 input / 128 output` requests with 20% `4096 input / 128 output` requests:
+
+| Closed-loop concurrency | Output throughput ratio | TTFT P99 change | Short TTFT P99 change |
+| :--- | ---: | ---: | ---: |
+| 4 | 1.004x | **-20.1%** | **-19.7%** |
+| 8 | 1.044x | **-6.3%** | **-21.0%** |
+| 16 | 1.092x | **-20.4%** | **-17.2%** |
+
+At Poisson rates `{0.5, 1.5, 2.5}`, throughput remains effectively flat (`0.992x-1.000x`), while TPOT P99 drops by about `19%-20%` and E2E P99 by about `14%-17%`. Chunked prefill is therefore presented as a scheduling and tail-latency mechanism, not an unconditional throughput optimization.
+
+All 72 sanitized run JSON files, per-run CSVs, three-run aggregates, and manifests are published under [`benchmarks/results/`](benchmarks/results/).
+
+## Metric Semantics
+
+- `burst_itl`: adjacent per-token availability times; speculative bursts may include `0 ms` samples.
+- `output_event_latency`: adjacent output events, recorded once per request per emitting engine step.
+- `speculative_step_latency`: complete draft/verify/accept/KV step cost.
+- `TPOT`: request-level average time per output token.
+- Closed-loop throughput covers the measurement window. Latency and acceptance cover only requests whose arrival and finish both fall inside that window, with `latency_sample_requests` reported explicitly.
 
 ## Tests
 
-CPU unit tests do not require FlashAttention or local model checkpoints:
+```bash
+CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
+```
+
+Enable real-checkpoint tests explicitly:
 
 ```bash
+export LLMSERVE_TEST_TARGET_MODEL=/path/to/Qwen3-8B
+export LLMSERVE_TEST_SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
 python -m unittest discover -s tests
 ```
 
-Enable the real EAGLE checkpoint integration tests explicitly:
+CUDA-specific Tree KV tests run only when CUDA is available. GitHub Actions runs the remaining tests with CPU PyTorch.
 
-```bash
-export LLMSERVE_TEST_TARGET_MODEL=/path/to/Qwen3-target
-export LLMSERVE_TEST_SPECULATIVE_MODEL=/path/to/Qwen3-EAGLE3-speculator
-python -m unittest discover -s tests
-```
+## Scope
 
-Tree KV CUDA kernel tests run only when CUDA is available. GitHub Actions runs the remaining tests with CPU PyTorch and uploads the complete `unittest` output for the tested commit.
-
-## Notes
-
+- The primary target is single-GPU Qwen3-8B; two non-NVLink GPUs are not presented as a tensor-parallel performance platform.
+- Speculative CUDA Graph is not implemented. Fixed-tree speculation remains disabled by default.
+- The project intentionally omits an OpenAI-compatible HTTP layer; benchmarks drive the in-process runtime directly.
 - The codebase retains the original MIT license.

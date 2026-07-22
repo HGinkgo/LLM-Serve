@@ -1,48 +1,14 @@
-# Benchmark Results
+# Public Benchmark Evidence
 
-This directory preserves two comparable Qwen3-8B benchmark datasets generated on one RTX 3090 24GB with BF16 eager execution:
+本目录只包含新 serving benchmark 系统生成的正式数据，旧 Stage 4/5 脚本与结果已删除。
 
-- `summary.csv` and `representative/`: Stage 4 results from commit `89a1403`, before the SchedulerOutput refactor.
-- `stage5-scheduler-output/`: Stage 5 results from commit `f2d3843`, after the SchedulerOutput refactor.
+## 数据集
 
-Both datasets use the same model revisions, workloads, seeds, and metric definitions. Each summary contains all 18 runs; each representative directory contains one sanitized JSON per configuration.
+- `formal-poisson/`：36 个 run，Poisson request-rate 主实验。
+- `formal-closed-loop/`：36 个 run，固定并发稳态补充实验。
 
-## Stage 5 SchedulerOutput Rerun
+每个目录包含 `manifest.json`、`summary.csv`、`aggregate.csv` 和 `runs/*.json`。72 个 run 均为 `complete=true`，对应 commit `ad35e65cacdcb306362268c3a60923abd199b431`，模型 revision 和软硬件环境见各自 manifest。
 
-| Workload | Baseline mean throughput | Comparison mean throughput | Ratio | Baseline output-event P99 | Comparison output-event P99 |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| Prefill injection | 91.33 +/- 1.68 tok/s | 84.49 +/- 2.13 tok/s (chunked) | 0.925x | 46.74 ms | 135.55 ms |
-| Decode-heavy | 80.45 +/- 0.43 tok/s | 106.73 +/- 1.77 tok/s (EAGLE) | **1.327x** | 47.87 ms | 61.51 ms |
-| Mixed closed-loop steady state | 179.73 +/- 4.65 tok/s | 198.64 +/- 8.68 tok/s (EAGLE) | **1.105x** | 46.52 ms | 166.47 ms |
+公开文件已经扫描，不包含本地绝对路径、prompt token、凭据、traceback 或 host-specific workspace 信息。`summary.csv` 与 `aggregate.csv` 由 suite runner 直接从 run JSON 生成，不经过手工改写。
 
-The values are mean +/- sample standard deviation across three runs. Relative to Stage 4, the six configuration means changed by `-2.04%` to `+4.28%`; there is no systematic performance-regression signal from replacing hidden scheduler state with `SchedulerOutput`. Chunked prefill still does not establish a throughput win in this workload.
-
-All 18 Stage 5 JSON files record `git_dirty=false`, the same target/draft revisions, zero failures, and 401 successful request records. EAGLE burst ITL retains its `0 ms` samples; output-event latency and speculative-step latency remain separate metrics.
-
-## Stage 4 Baseline
-
-These results were generated from commit `89a1403`.
-
-- Target model revision: `b968826d9c46dd6066d109eabc6255188de91218`
-- EAGLE3 draft revision: `08610ffa01dd9f16731fe8f627b85905b6aa51c4`
-- Three runs per configuration, fixed seeds `0`, `1`, and `2`
-- Decode-heavy and mixed workloads use natural prompts; prefill-injection uses random-token prompts
-- Baselines explicitly disable the speculative model
-
-The public `summary.csv` contains all 18 runs. `representative/` contains one sanitized JSON for each published configuration. Complete raw JSON remains local.
-
-## Summary
-
-| Workload | Baseline mean throughput | Comparison mean throughput | Ratio | Baseline output-event P99 | Comparison output-event P99 |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| Prefill injection | 89.25 tok/s | 85.52 tok/s (chunked) | 0.958x | 48.03 ms | 136.23 ms |
-| Decode-heavy | 82.12 tok/s | 102.80 tok/s (EAGLE) | **1.252x** | 47.28 ms | 66.99 ms |
-| Mixed closed-loop steady state | 177.60 tok/s | 190.49 tok/s (EAGLE) | **1.073x** | 47.27 ms | 176.00 ms |
-
-The prefill-injection result does not establish a throughput win for chunked prefill. Its value must be evaluated through the specific long-prompt interruption and tail-latency behavior, not throughput alone. EAGLE burst ITL retains its `0 ms` samples; output-event latency and speculative-step latency are reported separately in the CSV.
-
-## Verification
-
-- GitHub CPU test run: [29747762901](https://github.com/HGinkgo/LLM-Serve/actions/runs/29747762901)
-- Local Qwen3-8B + EAGLE3 + CUDA test suite: `104/104` passed
-- Every published JSON records `git_dirty=false` and the same benchmark commit.
+CPU 回归、编译检查和结果完整性校验见 [`verification.md`](verification.md)。

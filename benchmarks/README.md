@@ -1,34 +1,92 @@
-# Benchmark Results
+# Serving Benchmark
 
-This directory contains the public, sanitized evidence for LLM-Serve benchmark claims.
+`benchmarks` 直接驱动 in-process `LLMEngine`，用于研究 runtime 与 scheduler，不包含 HTTP/OpenAI API 胶水层。
 
-## Data Boundary
+## 目录
 
-- `results/summary.csv` and `results/representative/`: Stage 4 pre-refactor dataset.
-- `results/stage5-scheduler-output/`: Stage 5 post-refactor summary and sanitized representative JSON.
-- Full raw runs remain local unless they are explicitly curated for publication.
-- Public files must not contain absolute model paths, prompt paths, credentials, or host-specific workspace paths.
+- `workloads.py`：按权重生成确定性 token workload。
+- `arrivals.py`：可复现的 Poisson 到达时间。
+- `runtime.py`：有限 Poisson 与 closed-loop warmup/measurement/drain 循环。
+- `metrics.py`：吞吐、延迟、goodput 和 EAGLE 聚合。
+- `serve.py`：执行单个 benchmark point。
+- `run_suite.py`：展开 suite，每点启动独立子进程，处理恢复、失败和 CSV 汇总。
+- `suites/`：smoke、capacity pilot 和正式三轮矩阵。
+- `results/`：公开 manifest、逐运行 CSV、aggregate CSV 与完整脱敏 run JSON。
 
-Historical JSON generated before Stage 4 does not include output-event or speculative-step latency. The summary script preserves its old `itl` field as `burst_itl` and leaves the newer metrics empty. Historical data is not used as a substitute for the clean Stage 4 rerun.
+## Workload
 
-## Metric Semantics
+正式矩阵包含两个 profile：
 
-- `burst_itl`: adjacent per-token availability timestamps; speculative bursts may contain `0 ms` samples.
-- `output_event_latency`: adjacent engine output events, recorded once per request per emitting step.
-- `speculative_step_latency`: full draft/verify/accept/KV step time.
-- `tpot`: request-level average time per output token.
+| Profile | 请求组成 | 用途 |
+| :--- | :--- | :--- |
+| decode-heavy | 100% `256 input / 256 output` | EAGLE 与持续 decode 容量 |
+| mixed-serving | 80% `128 input / 128 output` + 20% `4096 input / 128 output` | chunked prefill 与尾延迟 |
 
-Throughput, TPOT, and request latency can be compared directly between baseline and speculative runs. Burst ITL must retain its burst-emission label.
+Poisson 主实验扫描 decode `{0.25, 0.75, 1.25} req/s`、mixed `{0.5, 1.5, 2.5} req/s`。closed-loop 补充实验扫描 decode concurrency `{1, 4, 8}`、mixed concurrency `{4, 8, 16}`，使用 5 秒 warmup 与 60 秒 measurement。
 
-## Generate Public Artifacts
+所有 A/B variant 在相同 run 内共享 workload seed 和 arrival seed。Poisson 正式点在 measurement 前对每个请求类别做短 warmup，然后清空 engine metrics；模型加载与首次 CUDA 执行不计入正式请求。
 
-Run benchmarks with `--output-json`, `--workload-name`, and explicit model revision metadata. Then generate the public CSV and sanitized representative JSON:
+## 运行
 
 ```bash
-python scripts/summarize_benchmarks.py \
-  /path/to/run1.json /path/to/run2.json \
-  --csv benchmarks/results/<dataset>/summary.csv \
-  --representative-dir benchmarks/results/<dataset>/representative
+export MODEL_PATH=/path/to/Qwen3-8B
+export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
+
+python -m benchmarks.run_suite \
+  --suite benchmarks/suites/formal-poisson.json \
+  --output-dir /tmp/llmserve-formal-poisson \
+  --model "$MODEL_PATH" \
+  --speculative-model "$SPECULATIVE_MODEL" \
+  --resume
 ```
 
-The script copies measured values without modification. It only normalizes local path fields in the representative JSON.
+正式运行默认拒绝 dirty worktree；`--allow-dirty` 只用于 smoke/pilot。`--resume` 仅接受 schema、point ID 和 commit SHA 均匹配且 `complete=true` 的结果。
+
+每个 point 在独立子进程中加载/释放模型，避免 CUDA 和 KV 状态跨点污染。worker 失败时仍写入 `complete=false` JSON，suite 继续执行其他点并最终返回非零。并行运行两个 suite 时必须使用不同 endpoint：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.run_suite \
+  --suite benchmarks/suites/formal-poisson.json \
+  --output-dir /tmp/poisson \
+  --model "$MODEL_PATH" \
+  --speculative-model "$SPECULATIVE_MODEL" \
+  --distributed-init-method tcp://localhost:2333
+
+CUDA_VISIBLE_DEVICES=1 python -m benchmarks.run_suite \
+  --suite benchmarks/suites/formal-closed-loop.json \
+  --output-dir /tmp/closed-loop \
+  --model "$MODEL_PATH" \
+  --speculative-model "$SPECULATIVE_MODEL" \
+  --distributed-init-method tcp://localhost:2334
+```
+
+## 输出
+
+每个 suite 输出：
+
+- `manifest.json`：commit、dirty 状态、环境、GPU、模型名/revision、完成/失败点数。
+- `runs/*.json`：脱敏配置、指标和请求级 compact records；不保存绝对模型路径、prompt token、绝对时间戳或 speculative trace。
+- `summary.csv`：每个 run 一行，延迟统一为毫秒。
+- `aggregate.csv`：三次重复的均值、样本标准差和 ratio-to-baseline，显式记录单位。
+- `points/*.json`：展开后的 point 配置；公开结果不重复提交这些文件，因为 `suites/*.json` 已可重建。
+
+## 指标语义
+
+- request/input/output/total throughput：完整请求或 measurement window 的容量指标。
+- `TTFT`：计划到达时刻到首 token；Poisson step 中途到达但稍后才入队的延迟也会计入。
+- `TPOT`：请求首 token 到完成之间的平均每输出 token 时间。
+- `burst_itl`：逐 token 可用时间间隔；EAGLE 同一 burst 的 token 会包含 `0 ms`。
+- `output_event_latency`：相邻输出事件间隔，每个 request/emitting step 只记录一次。
+- `speculative_step_latency`：完整 speculative step 成本。
+- `E2E`：计划到达到请求完成。
+- `goodput`：满足 suite 中 TTFT/TPOT/E2E SLO 的请求吞吐。
+- queue/batch metrics：scheduled batch、speculative batch、waiting/running queue 的分布。
+- EAGLE metrics：steps、draft/accepted/emitted token、acceptance rate/length、gamma histogram 与 timing。
+
+closed-loop output throughput 统计 measurement window 内产生的 token；request throughput 统计窗口内完成的请求。延迟和 speculative 指标只聚合 arrival 与 finish 都落在窗口内的请求，`latency_sample_requests` 用于判断 P50/P99 是否有有效样本。
+
+## 公开结果边界
+
+公开数据基于 commit `ad35e65`，Qwen3-8B、RedHatAI Qwen3-8B EAGLE3 speculator、BF16 eager、argmax、固定 `gamma=3` 和 RTX 3090 24GB。Poisson 与 closed-loop suite 同时在两张独立 3090 上运行，但每个 suite/engine 始终只使用单卡，不是 tensor parallel。
+
+核心结论见仓库根目录 README；原始数值以 [`results/formal-poisson/aggregate.csv`](results/formal-poisson/aggregate.csv) 和 [`results/formal-closed-loop/aggregate.csv`](results/formal-closed-loop/aggregate.csv) 为准。

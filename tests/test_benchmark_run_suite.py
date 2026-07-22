@@ -100,6 +100,8 @@ class BenchmarkRunSuiteTests(unittest.TestCase):
             )
             self.assertTrue((output_dir / "summary.csv").exists())
             self.assertTrue((output_dir / "aggregate.csv").exists())
+            self.assertNotIn(b"\r", (output_dir / "summary.csv").read_bytes())
+            self.assertNotIn(b"\r", (output_dir / "aggregate.csv").read_bytes())
             self.assertEqual(len(list((output_dir / "runs").glob("*.json"))), 2)
 
     def test_execute_suite_records_failure_and_continues(self):
