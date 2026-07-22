@@ -79,15 +79,25 @@ class BenchmarkRunSuiteTests(unittest.TestCase):
                 model="/private/Qwen3-8B",
                 speculative_model=None,
                 metadata={"git_commit": "abc123", "git_dirty": False},
+                distributed_init_method="tcp://localhost:2444",
                 command_runner=command_runner,
             )
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(len(commands), 2)
+            self.assertTrue(all(
+                command[command.index("--distributed-init-method") + 1]
+                == "tcp://localhost:2444"
+                for command in commands
+            ))
             manifest = json.loads((output_dir / "manifest.json").read_text())
             self.assertTrue(manifest["complete"])
             self.assertEqual(manifest["completed_points"], 2)
             self.assertEqual(manifest["model"], "Qwen3-8B")
+            self.assertEqual(
+                manifest["distributed_init_method"],
+                "tcp://localhost:2444",
+            )
             self.assertTrue((output_dir / "summary.csv").exists())
             self.assertTrue((output_dir / "aggregate.csv").exists())
             self.assertEqual(len(list((output_dir / "runs").glob("*.json"))), 2)

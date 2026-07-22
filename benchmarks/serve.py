@@ -121,6 +121,7 @@ def run_point(
     point: dict,
     model: str,
     speculative_model: str | None = None,
+    distributed_init_method: str | None = None,
     *,
     engine_factory=None,
     make_sampling_params=None,
@@ -138,18 +139,22 @@ def run_point(
     engine_factory = engine_factory or _default_engine_factory
     make_sampling_params = make_sampling_params or _default_sampling_params
     active_speculative_model = speculative_model if enable_speculative else None
-    engine = engine_factory(
-        model,
-        enforce_eager=runtime.get("enforce_eager", True),
-        enable_chunked_prefill=runtime.get("enable_chunked_prefill", False),
-        max_model_len=runtime["max_model_len"],
-        max_num_batched_tokens=runtime["max_num_batched_tokens"],
-        speculative_model=active_speculative_model,
-        speculative_gamma=runtime.get("speculative_gamma", 3),
-        speculative_tree_nodes=runtime.get("speculative_tree_nodes", 0),
-        speculative_accept_mode=runtime.get("speculative_accept_mode", "greedy"),
-        speculative_trace=runtime.get("speculative_trace", False),
-    )
+    engine_kwargs = {
+        "enforce_eager": runtime.get("enforce_eager", True),
+        "enable_chunked_prefill": runtime.get("enable_chunked_prefill", False),
+        "max_model_len": runtime["max_model_len"],
+        "max_num_batched_tokens": runtime["max_num_batched_tokens"],
+        "speculative_model": active_speculative_model,
+        "speculative_gamma": runtime.get("speculative_gamma", 3),
+        "speculative_tree_nodes": runtime.get("speculative_tree_nodes", 0),
+        "speculative_accept_mode": runtime.get(
+            "speculative_accept_mode", "greedy"
+        ),
+        "speculative_trace": runtime.get("speculative_trace", False),
+    }
+    if distributed_init_method is not None:
+        engine_kwargs["distributed_init_method"] = distributed_init_method
+    engine = engine_factory(model, **engine_kwargs)
     if runtime.get("argmax_sampler", False):
         engine.model_runner.sampler = ArgmaxSampler()
     classes = _workload_classes(point)
@@ -257,6 +262,10 @@ def _parse_args(argv=None):
     parser.add_argument("--model-revision")
     parser.add_argument("--speculative-model-revision")
     parser.add_argument("--expected-git-commit")
+    parser.add_argument(
+        "--distributed-init-method",
+        default="tcp://localhost:2333",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 
@@ -312,6 +321,7 @@ def main(argv=None):
             point,
             model=model,
             speculative_model=speculative_model,
+            distributed_init_method=args.distributed_init_method,
             metadata=metadata,
             model_revision=(
                 args.model_revision or discover_model_revision(model)

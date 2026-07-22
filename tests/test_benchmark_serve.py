@@ -54,6 +54,7 @@ class BenchmarkServeTests(unittest.TestCase):
             make_point(),
             model="/private/models/Qwen3-8B",
             speculative_model="/private/models/eagle3",
+            distributed_init_method="tcp://localhost:2444",
             engine_factory=engine_factory,
             make_sampling_params=lambda spec: spec.output_len,
             clock=clock.perf_counter,
@@ -64,6 +65,10 @@ class BenchmarkServeTests(unittest.TestCase):
         )
 
         self.assertEqual(factory_calls[0][0], "/private/models/Qwen3-8B")
+        self.assertEqual(
+            factory_calls[0][1]["distributed_init_method"],
+            "tcp://localhost:2444",
+        )
         self.assertIsNone(factory_calls[0][1]["speculative_model"])
         self.assertFalse(factory_calls[0][1]["enable_chunked_prefill"])
         self.assertEqual(result["schema_version"], 2)

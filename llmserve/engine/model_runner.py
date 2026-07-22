@@ -16,6 +16,15 @@ from llmserve.utils.context import set_context, get_context, reset_context
 from llmserve.utils.loader import load_model
 
 
+def initialize_distributed(config: Config, rank: int, world_size: int):
+    dist.init_process_group(
+        "nccl",
+        config.distributed_init_method,
+        world_size=world_size,
+        rank=rank,
+    )
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -27,7 +36,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        initialize_distributed(config, rank, self.world_size)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)

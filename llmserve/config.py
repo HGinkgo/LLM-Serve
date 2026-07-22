@@ -11,6 +11,7 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    distributed_init_method: str = "tcp://localhost:2333"
     enforce_eager: bool = False
     # ===== 2026-06-07 chunked prefill =====
     # Stage 2 的实验调度开关；默认关闭，保留原始 baseline 行为。

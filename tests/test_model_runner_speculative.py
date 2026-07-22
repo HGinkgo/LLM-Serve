@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from llmserve.engine.model_runner import ModelRunner
+from llmserve.engine.model_runner import ModelRunner, initialize_distributed
 from llmserve.engine.sequence import Sequence
 from llmserve.models.eagle3 import (
     Eagle3DraftOutput,
@@ -35,6 +35,25 @@ class FakeTargetModel:
         logits = torch.zeros(hidden_states.size(0), 8)
         logits[:, 6] = 10
         return logits
+
+
+class ModelRunnerDistributedInitTest(unittest.TestCase):
+    def test_initialize_distributed_uses_configured_method(self):
+        config = SimpleNamespace(
+            distributed_init_method="tcp://localhost:2444"
+        )
+
+        with patch(
+            "llmserve.engine.model_runner.dist.init_process_group"
+        ) as init_process_group:
+            initialize_distributed(config, rank=1, world_size=2)
+
+        init_process_group.assert_called_once_with(
+            "nccl",
+            "tcp://localhost:2444",
+            world_size=2,
+            rank=1,
+        )
 
 
 class FakeSampler:

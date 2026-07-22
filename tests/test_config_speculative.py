@@ -25,6 +25,15 @@ class ConfigSpeculativeTest(unittest.TestCase):
         self.assertFalse(hasattr(config, "speculative_tree_kv_mode"))
         self.assertFalse(hasattr(config, "speculative_batched_draft"))
 
+    def test_distributed_init_method_is_configurable(self):
+        config = self.make_config(
+            distributed_init_method="tcp://localhost:2444"
+        )
+
+        self.assertEqual(
+            config.distributed_init_method, "tcp://localhost:2444"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

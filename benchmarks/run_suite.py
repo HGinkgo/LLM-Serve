@@ -149,6 +149,7 @@ def execute_suite(
     *,
     model_revision: str | None = None,
     speculative_model_revision: str | None = None,
+    distributed_init_method: str = "tcp://localhost:2333",
     resume: bool = False,
     timeout_seconds: float | None = None,
     command_runner=subprocess.run,
@@ -177,6 +178,7 @@ def execute_suite(
             Path(speculative_model).name if speculative_model else None
         ),
         "speculative_model_revision": speculative_model_revision,
+        "distributed_init_method": distributed_init_method,
         "total_points": len(points),
         "completed_points": 0,
         "failed_points": 0,
@@ -206,6 +208,8 @@ def execute_suite(
                 model,
                 "--output",
                 str(result_path),
+                "--distributed-init-method",
+                distributed_init_method,
             ]
             if speculative_model:
                 command.extend(["--speculative-model", speculative_model])
@@ -297,6 +301,10 @@ def _parse_args(argv=None):
     )
     parser.add_argument("--model-revision")
     parser.add_argument("--speculative-model-revision")
+    parser.add_argument(
+        "--distributed-init-method",
+        default="tcp://localhost:2333",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--timeout-seconds", type=float)
@@ -329,6 +337,7 @@ def main(argv=None):
         metadata=metadata,
         model_revision=args.model_revision,
         speculative_model_revision=args.speculative_model_revision,
+        distributed_init_method=args.distributed_init_method,
         resume=args.resume,
         timeout_seconds=args.timeout_seconds,
     )
