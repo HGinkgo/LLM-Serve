@@ -246,10 +246,10 @@ def awq_triton_linear(
     *,
     group_size: int,
 ) -> torch.Tensor:
-    if triton is None:
-        raise RuntimeError("Triton is required for the AWQ W4A16 kernel")
     if inputs.device.type != "cuda":
         raise ValueError("AWQ Triton inputs must be CUDA tensors")
+    if triton is None:
+        raise RuntimeError("Triton is required for the AWQ W4A16 kernel")
     if inputs.ndim != 2:
         raise ValueError("AWQ Triton inputs must be two-dimensional")
     if inputs.dtype != torch.bfloat16 or scales.dtype != torch.bfloat16:

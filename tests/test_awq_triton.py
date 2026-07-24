@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -26,16 +27,19 @@ class AWQTritonTests(unittest.TestCase):
         self.assertEqual(select_awq_kernel_config(128, 64), (32, 1))
 
     def test_kernel_rejects_cpu_tensors(self):
-        from llmserve.layers.quantization.awq_triton import awq_triton_linear
+        from llmserve.layers.quantization import awq_triton
 
-        with self.assertRaisesRegex(ValueError, "CUDA"):
-            awq_triton_linear(
-                torch.zeros((1, 128), dtype=torch.bfloat16),
-                torch.zeros((128, 8), dtype=torch.int32),
-                torch.zeros((1, 8), dtype=torch.int32),
-                torch.ones((1, 64), dtype=torch.bfloat16),
-                group_size=128,
-            )
+        for triton_value in (awq_triton.triton, None):
+            with self.subTest(triton_available=triton_value is not None):
+                with mock.patch.object(awq_triton, "triton", triton_value):
+                    with self.assertRaisesRegex(ValueError, "CUDA"):
+                        awq_triton.awq_triton_linear(
+                            torch.zeros((1, 128), dtype=torch.bfloat16),
+                            torch.zeros((128, 8), dtype=torch.int32),
+                            torch.zeros((1, 8), dtype=torch.int32),
+                            torch.ones((1, 64), dtype=torch.bfloat16),
+                            group_size=128,
+                        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_kernel_matches_reference_for_decode_token_counts(self):
