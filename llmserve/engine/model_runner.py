@@ -41,7 +41,10 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = Qwen3ForCausalLM(
+            hf_config,
+            quant_config=config.quant_config,
+        )
         load_model(self.model, config.model)
         self.speculative_executor = SpeculativeExecutor(self)
         self.draft_model = self.load_draft_model()
@@ -224,6 +227,33 @@ class ModelRunner:
                 k_cache=self.kv_cache[0],
                 v_cache=self.kv_cache[1],
             )
+
+    def get_memory_metrics(self):
+        seen_storages = set()
+        model_runtime_bytes = 0
+        for tensor in list(self.model.parameters()) + list(self.model.buffers()):
+            if tensor.numel() == 0:
+                continue
+            storage = tensor.untyped_storage()
+            key = (str(tensor.device), storage.data_ptr())
+            if key in seen_storages:
+                continue
+            seen_storages.add(key)
+            model_runtime_bytes += storage.nbytes()
+        _, total_bytes = torch.cuda.mem_get_info()
+        return {
+            "model_runtime_bytes": model_runtime_bytes,
+            "kv_cache_bytes": self.kv_cache.numel() * self.kv_cache.element_size(),
+            "kv_block_bytes": (
+                self.kv_cache.numel()
+                * self.kv_cache.element_size()
+                // self.config.num_kvcache_blocks
+            ),
+            "cuda_allocated_bytes": torch.cuda.memory_allocated(),
+            "cuda_reserved_bytes": torch.cuda.memory_reserved(),
+            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "cuda_total_bytes": total_bytes,
+        }
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

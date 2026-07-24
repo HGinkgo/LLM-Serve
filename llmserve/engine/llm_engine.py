@@ -85,6 +85,9 @@ class LLMEngine:
         self.speculative_batch_calls = 0
         self.speculative_batch_sequences = 0
         self.speculative_max_batch_size = 0
+        reset_scheduler_metrics = getattr(self.scheduler, "reset_metrics", None)
+        if reset_scheduler_metrics is not None:
+            reset_scheduler_metrics()
 
     # 把用户请求放进系统
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
@@ -366,6 +369,14 @@ class LLMEngine:
 
     def get_metrics(self):
         now = perf_counter()
+        kv_cache_metrics = (
+            self.scheduler.kv_capacity_metrics()
+            if hasattr(self.scheduler, "kv_capacity_metrics")
+            else {}
+        )
+        memory_metrics = getattr(self.model_runner, "get_memory_metrics", None)
+        if memory_metrics is not None:
+            kv_cache_metrics.update(memory_metrics())
         requests = []
         ttfts = []
         burst_itls = []
@@ -537,6 +548,7 @@ class LLMEngine:
                         total_speculative_steps,
                     ),
                 },
+                "kv_cache": kv_cache_metrics,
             },
             "requests": sorted(requests, key=lambda request: request["seq_id"]),
         }

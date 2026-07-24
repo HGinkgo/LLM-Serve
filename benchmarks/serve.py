@@ -141,9 +141,17 @@ def run_point(
     active_speculative_model = speculative_model if enable_speculative else None
     engine_kwargs = {
         "enforce_eager": runtime.get("enforce_eager", True),
+        "awq_backend": runtime.get("awq_backend", "cuda"),
         "enable_chunked_prefill": runtime.get("enable_chunked_prefill", False),
+        "enable_kv_capacity_admission": runtime.get(
+            "enable_kv_capacity_admission", False
+        ),
         "max_model_len": runtime["max_model_len"],
         "max_num_batched_tokens": runtime["max_num_batched_tokens"],
+        "max_num_seqs": runtime.get("max_num_seqs", 512),
+        "gpu_memory_utilization": runtime.get(
+            "gpu_memory_utilization", 0.9
+        ),
         "speculative_model": active_speculative_model,
         "speculative_gamma": runtime.get("speculative_gamma", 3),
         "speculative_tree_nodes": runtime.get("speculative_tree_nodes", 0),
@@ -223,6 +231,7 @@ def run_point(
     for name in ("batch_calls", "mean_batch_size", "max_batch_size"):
         if name in engine_speculative:
             metrics["speculative"][name] = engine_speculative[name]
+    metrics["kv_cache"] = observation["engine_summary"].get("kv_cache", {})
 
     public_config = deepcopy(point)
     public_config["model"] = Path(model).name

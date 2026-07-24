@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "date": "2026-07-24",
+  "source_commit": "b32ba391160fb21e020bbaa7df5f287f38705460",
+  "source_worktree_dirty": true,
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "gpu_memory_bytes": 25296044032,
+    "python": "3.10.20",
+    "torch": "2.7.1+cu128",
+    "vllm_control": "0.11.0"
+  },
+  "checkpoints": {
+    "bf16": "Qwen3-8B",
+    "official_awq": "Qwen3-8B-AWQ",
+    "llmserve_awq": "Qwen3-8B-LLMServe-AWQ"
+  },
+  "quantization": {
+    "format": "autoawq-gemm",
+    "bits": 4,
+    "group_size": 128,
+    "zero_point": true,
+    "activation_dtype": "bfloat16",
+    "calibration_samples": 32,
+    "calibration_tokens": 6353,
+    "quantized_projections": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  },
+  "quality": {
+    "dataset": "WikiText-2 raw test split",
+    "definition": "non-overlapping fixed-block causal perplexity",
+    "evaluation_tokens": 2048,
+    "left_padding": true
+  },
+  "llmserve_capacity": {
+    "suite": "awq-capacity-confirm",
+    "profile": "128 input / 256 output",
+    "runs_per_point": 3,
+    "warmup_seconds": 45,
+    "measurement_seconds": 120,
+    "concurrencies": [48, 64, 96, 128],
+    "runtime_model_memory_gib": {"bf16": 15.2759647369, "awq": 5.8573856354},
+    "kv_cache_gib": {"bf16": 5.34375, "awq": 14.73046875},
+    "kv_blocks": {"bf16": 152, "awq": 419},
+    "slo_ms": {"ttft_p99": 10000, "tpot_p99": 250, "e2e_p99": 120000},
+    "points_complete": 24,
+    "points_failed": 0
+  },
+  "marlin_control": {
+    "command": "vllm bench throughput",
+    "backend": "vllm 0.11.0 awq_marlin",
+    "profile": "128 input / 32 output",
+    "concurrencies": [1, 4, 8, 16],
+    "runs_per_point": 3,
+    "points_complete": 24,
+    "points_failed": 0,
+    "awq_marlin_logs_confirmed": 12
+  },
+  "claim_boundary": "Calibration and checkpoint export are implemented by LLM-Serve. Marlin throughput is an external vLLM backend control, not a custom-kernel result."
+}

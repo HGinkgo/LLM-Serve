@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "name": "awq-capacity-confirm",
+  "runs": 3,
+  "profiles": {
+    "capacity-decode": {
+      "classes": [
+        {
+          "name": "capacity-decode",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 256
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "capacity-confirm-closed-loop",
+      "arrival": "closed-loop",
+      "profile": "capacity-decode",
+      "max_concurrencies": [48, 64, 96, 128],
+      "warmup_seconds": 45,
+      "measurement_seconds": 120,
+      "variants": [
+        {
+          "name": "baseline"
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "awq_backend": "cuda",
+        "argmax_sampler": true,
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "gpu_memory_utilization": 0.9,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 192
+      },
+      "slo_ms": {
+        "ttft": 10000,
+        "tpot": 250,
+        "e2e": 120000
+      }
+    }
+  ]
+}

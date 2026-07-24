@@ -1,0 +1,4 @@
+checkpoint,mode,evaluation_tokens,perplexity,mean_nll,peak_cuda_memory_gib,ppl_change_vs_bf16_pct
+Qwen3-8B,bf16,2048,27.1494217923,3.3013557494,15.4483509064,
+Qwen3-8B-AWQ,awq-reference,2048,29.2732740156,3.3766749501,6.5241801739,7.8228354604
+Qwen3-8B-LLMServe-AWQ,awq-reference,2048,30.5923723228,3.4207507074,6.5241801739,12.6807111226

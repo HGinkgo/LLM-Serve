@@ -121,6 +121,70 @@ class BenchmarkServeTests(unittest.TestCase):
         logits = torch.tensor([[0.0, 2.0, 1.0]])
         self.assertEqual(engine.model_runner.sampler(logits, None).item(), 1)
 
+    def test_run_point_passes_awq_backend_to_engine(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        factory_calls = []
+        point = make_point()
+        point["runtime"]["awq_backend"] = "reference"
+
+        def engine_factory(model, **kwargs):
+            factory_calls.append(kwargs)
+            return FakeEngine(clock)
+
+        run_point(
+            point,
+            model="/models/Qwen3-8B-AWQ",
+            engine_factory=engine_factory,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(factory_calls[0]["awq_backend"], "reference")
+
+    def test_run_point_passes_capacity_admission_and_reports_kv_metrics(self):
+        from benchmarks.serve import run_point
+
+        class CapacityFakeEngine(FakeEngine):
+            def get_metrics(self):
+                metrics = super().get_metrics()
+                metrics["summary"]["kv_cache"] = {
+                    "enabled": True,
+                    "total_blocks": 321,
+                    "preemptions": 0,
+                }
+                return metrics
+
+        clock = FakeClock()
+        factory_calls = []
+        point = make_point()
+        point["runtime"].update({
+            "enable_kv_capacity_admission": True,
+            "max_num_seqs": 128,
+            "gpu_memory_utilization": 0.92,
+        })
+
+        def engine_factory(model, **kwargs):
+            factory_calls.append(kwargs)
+            return CapacityFakeEngine(clock)
+
+        result = run_point(
+            point,
+            model="/models/Qwen3-8B-AWQ",
+            engine_factory=engine_factory,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertTrue(factory_calls[0]["enable_kv_capacity_admission"])
+        self.assertEqual(factory_calls[0]["max_num_seqs"], 128)
+        self.assertEqual(factory_calls[0]["gpu_memory_utilization"], 0.92)
+        self.assertEqual(result["metrics"]["kv_cache"]["total_blocks"], 321)
+        self.assertEqual(result["metrics"]["kv_cache"]["preemptions"], 0)
+
     def test_closed_loop_result_reports_latency_sample_request_count(self):
         from benchmarks.serve import run_point
 

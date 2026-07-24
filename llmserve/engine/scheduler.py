@@ -35,6 +35,17 @@ class Scheduler:
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        self.enable_kv_capacity_admission = config.enable_kv_capacity_admission
+        self.max_model_len = config.max_model_len
+        self.speculative_reserve_tokens = (
+            config.speculative_gamma + 2
+            if config.speculative_model is not None
+            else 0
+        )
+        self._reserved_blocks: dict[int, int] = {}
+        self.preemption_count = 0
+        self.admission_deferred_count = 0
+        self.peak_reserved_blocks = 0
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
     # 调度器启动时会记住调度预算、建好 block 管理器、准备两个队列：waiting 和 running。
@@ -43,7 +54,66 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        if self.enable_kv_capacity_admission:
+            required = self._projected_blocks(seq)
+            total = len(self.block_manager.blocks)
+            if required > total:
+                raise ValueError(
+                    f"request requires {required} KV blocks but KV capacity is {total}"
+                )
         self.waiting.append(seq)
+
+    def _projected_blocks(self, seq: Sequence) -> int:
+        final_tokens = min(
+            seq.num_prompt_tokens + seq.max_tokens,
+            self.max_model_len,
+        )
+        reserved_tokens = final_tokens + self.speculative_reserve_tokens
+        block_size = self.block_manager.block_size
+        return (reserved_tokens + block_size - 1) // block_size
+
+    def _try_reserve(self, seq: Sequence) -> bool:
+        if not self.enable_kv_capacity_admission:
+            return True
+        if seq.seq_id in self._reserved_blocks:
+            return True
+        required = self._projected_blocks(seq)
+        reserved = sum(self._reserved_blocks.values())
+        if reserved + required > len(self.block_manager.blocks):
+            self.admission_deferred_count += 1
+            return False
+        self._reserved_blocks[seq.seq_id] = required
+        self.peak_reserved_blocks = max(
+            self.peak_reserved_blocks,
+            reserved + required,
+        )
+        return True
+
+    def _release_reservation(self, seq: Sequence):
+        self._reserved_blocks.pop(seq.seq_id, None)
+
+    def reset_metrics(self):
+        self.preemption_count = 0
+        self.admission_deferred_count = 0
+        self.peak_reserved_blocks = sum(self._reserved_blocks.values())
+
+    def kv_capacity_metrics(self) -> dict:
+        total_blocks = len(self.block_manager.blocks)
+        reserved_blocks = sum(self._reserved_blocks.values())
+        return {
+            "enabled": self.enable_kv_capacity_admission,
+            "total_blocks": total_blocks,
+            "used_blocks": len(self.block_manager.used_block_ids),
+            "free_blocks": len(self.block_manager.free_block_ids),
+            "reserved_blocks": reserved_blocks,
+            "active_reservations": len(self._reserved_blocks),
+            "peak_reserved_blocks": self.peak_reserved_blocks,
+            "reservation_utilization": (
+                reserved_blocks / total_blocks if total_blocks else 0.0
+            ),
+            "preemptions": self.preemption_count,
+            "admission_deferrals": self.admission_deferred_count,
+        }
 
     def schedule(self) -> SchedulerOutput:
         # 挑出本轮要上 GPU 的序列，并显式区分 prefill/decode 分组。
@@ -60,7 +130,9 @@ class Scheduler:
             seq = self.waiting[0]
             num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):    # no budget
+            if remaining == 0 or not self._try_reserve(seq):
+                break
+            if not seq.block_table and not self.block_manager.can_allocate(seq):    # no budget
                 break
             if remaining < num_tokens and scheduled_seqs:    # only allow chunked prefill for the first seq
                 break
@@ -138,6 +210,8 @@ class Scheduler:
         # 剩余预算再给 waiting 队列里的长 prompt 做 prefill chunk。
         while self.waiting and num_scheduled_seqs < self.max_num_seqs and token_budget > 0:
             seq = self.waiting[0]
+            if not self._try_reserve(seq):
+                break
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
                     break
@@ -168,6 +242,7 @@ class Scheduler:
     # ===== 2026-06-07 chunked prefill =====
 
     def preempt(self, seq: Sequence):
+        self.preemption_count += 1
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
@@ -203,6 +278,7 @@ class Scheduler:
         if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
             seq.status = SequenceStatus.FINISHED
             self.block_manager.deallocate(seq)
+            self._release_reservation(seq)
             self.running.remove(seq)
 
     # ===== 2026-07-07 EAGLE speculative decoding =====
@@ -223,6 +299,7 @@ class Scheduler:
         ):
             seq.status = SequenceStatus.FINISHED
             self.block_manager.deallocate(seq)
+            self._release_reservation(seq)
             if seq in self.running:
                 self.running.remove(seq)
     # ===== 2026-07-07 EAGLE speculative decoding =====

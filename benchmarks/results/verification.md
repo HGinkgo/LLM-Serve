@@ -41,3 +41,25 @@ git diff --check
 - 结果扫描未发现本地绝对路径、workspace 路径、traceback 或端口冲突错误。
 
 Poisson 与 closed-loop suite 分别使用一张 RTX 3090；双卡只用于并行执行独立 suite，不是 tensor parallel。
+
+## AWQ 收口验证
+
+验证日期：2026-07-24。AWQ 容量结果对应 dirty source commit `b32ba391160fb21e020bbaa7df5f287f38705460`，公开 metadata 保留该事实。
+
+```bash
+CUDA_VISIBLE_DEVICES="" conda run -n nano-vllm \
+  python -m unittest discover -s tests
+
+CUDA_VISIBLE_DEVICES=0 conda run -n nano-vllm python -m unittest \
+  tests.test_awq_reference tests.test_awq_linear_backend \
+  tests.test_awq_linear_profile tests.test_awq_triton tests.test_awq_cuda \
+  tests.test_awq_quality tests.test_awq_quantizer \
+  tests.test_qwen3_awq_calibration tests.test_quantize_qwen3_awq_cli \
+  tests.test_linear_profile -v
+```
+
+结果：CPU 回归 `198 tests, skipped=15`；AWQ/CUDA/量化器定向回归 `61 tests`，零失败。`compileall`、`git diff --check` 和 AWQ 公开 CSV/JSON 自校验均以状态码 0 结束。
+
+- LLM-Serve 容量矩阵 BF16/AWQ 共 `24/24` points，零失败，每个 point 都有非零 latency cohort。
+- vLLM Marlin 控制实验共 `24/24` points，12 个 AWQ log 均确认 `awq_marlin`。
+- `awq-w4a16/` 未包含绝对模型路径、校准文本、checkpoint、逐层 cache 或原始日志。

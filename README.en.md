@@ -4,7 +4,7 @@
 
 [![CPU tests](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml)
 
-LLM-Serve is an educational single-GPU inference runtime focused on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, and EAGLE-style speculative decoding.
+LLM-Serve is an educational single-GPU inference runtime focused on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, EAGLE-style speculative decoding, and AWQ W4A16 inference.
 
 The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vllm`. The scheduler changes, chunked prefill path, benchmark system, and speculative decoding runtime are independently designed and implemented in this repository.
 
@@ -14,6 +14,7 @@ The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vll
 - Iteration-level continuous batching with explicit prefill/decode groups.
 - Decode-first chunked prefill for mixed prefill/decode batches.
 - EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy verification, and timing metrics.
+- Qwen3 AWQ W4A16 calibration, standard AutoAWQ GEMM checkpoint export, reference/Triton/CUDA Linear backends, and KV capacity admission.
 - Reproducible Poisson request-rate and closed-loop concurrency suites with throughput, goodput, TTFT, TPOT, burst ITL, output-event latency, E2E, queue depth, and speculative metrics.
 - A validated single-GPU Qwen3-8B BF16 path and optional fixed-tree experiments.
 
@@ -22,6 +23,7 @@ The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vll
 - `llmserve/engine/`: scheduling, KV block management, target execution, and speculative orchestration.
 - `llmserve/models/`: Qwen3 and EAGLE3 definitions and checkpoint loading.
 - `llmserve/speculative/`: draft, verification sampling, fixed trees, and Tree KV management.
+- `llmserve/quantization/`: Qwen3 AWQ calibration, layer-wise quantization, checkpoint export, and quality evaluation.
 - `llmserve/layers/`: attention, linear, sampling, and other model building blocks.
 - `benchmarks/`: workloads, arrivals, metrics, point/suite runners, and public results.
 - `tests/`: CPU tests plus optional checkpoint and CUDA kernel coverage.
@@ -89,7 +91,21 @@ The mixed profile combines 80% `128 input / 128 output` requests with 20% `4096 
 
 At Poisson rates `{0.5, 1.5, 2.5}`, throughput remains effectively flat (`0.992x-1.000x`), while TPOT P99 drops by about `19%-20%` and E2E P99 by about `14%-17%`. Chunked prefill is therefore presented as a scheduling and tail-latency mechanism, not an unconditional throughput optimization.
 
-All 72 sanitized run JSON files, per-run CSVs, three-run aggregates, and manifests are published under [`benchmarks/results/`](benchmarks/results/).
+### AWQ W4A16
+
+The repository implements activation-aware Qwen3-8B calibration with layer-wise error propagation, quantizes the seven QKV/O/gate/up/down Linear projections, and exports a standard AutoAWQ GEMM checkpoint. On a fixed 2,048-token evaluation drawn from 32 WikiText-2 samples:
+
+| Model | Perplexity | Peak evaluation memory | PPL vs BF16 |
+| :--- | ---: | ---: | ---: |
+| BF16 | 27.149 | 15.45 GiB | - |
+| Official Qwen3-8B-AWQ | 29.273 | 6.52 GiB | +7.8% |
+| LLM-Serve calibrated AWQ | 30.592 | 6.52 GiB | +12.7% |
+
+With LLM-Serve's custom CUDA backend, runtime model memory falls from `15.276 GiB` to `5.857 GiB` and KV blocks increase from `152` to `419`. In the final RTX 3090 closed-loop capacity matrix, the maximum SLO-valid concurrency rises from `64` for BF16 to `128` for AWQ. AWQ's SLO-valid peak output throughput is still only `0.871x` of BF16, so this is presented as a capacity result rather than a custom-kernel speed win.
+
+The same checkpoint completes 24/24 control points with vLLM 0.11 AWQ-Marlin. AWQ/BF16 output-throughput ratios at concurrency 1/4/8/16 are `1.390x/1.316x/1.322x/1.316x`. This validates checkpoint compatibility with a mature W4A16 backend; the speedup belongs to vLLM Marlin, not to LLM-Serve's custom CUDA kernel.
+
+All 72 sanitized serving run JSON files, per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
 
 ## Metric Semantics
 
@@ -113,11 +129,12 @@ export LLMSERVE_TEST_SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
 python -m unittest discover -s tests
 ```
 
-CUDA-specific Tree KV tests run only when CUDA is available. GitHub Actions runs the remaining tests with CPU PyTorch.
+AWQ CUDA tests, real-checkpoint generation, and capacity matrices require an RTX 3090 or another SM80+ GPU. CUDA-specific Tree KV tests run only when CUDA is available. GitHub Actions runs the remaining tests with CPU PyTorch.
 
 ## Scope
 
 - The primary target is single-GPU Qwen3-8B; two non-NVLink GPUs are not presented as a tensor-parallel performance platform.
 - Speculative CUDA Graph is not implemented. Fixed-tree speculation remains disabled by default.
+- The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, eager execution, and TP=1. The Marlin run is an external-backend control experiment.
 - The project intentionally omits an OpenAI-compatible HTTP layer; benchmarks drive the in-process runtime directly.
 - The codebase retains the original MIT license.

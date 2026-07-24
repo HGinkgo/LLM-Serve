@@ -13,8 +13,10 @@ description = "A single-GPU LLM inference engine focused on serving systems, sch
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
+    "ninja",
     "triton>=3.0.0",
     "transformers>=4.51.0",
+    "accelerate>=1.0.0",
     "flash-attn",
     "xxhash",
 ]
@@ -25,3 +27,6 @@ Homepage="https://github.com/HGinkgo/LLM-Serve"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["llmserve*", "benchmarks*"]
+
+[tool.setuptools.package-data]
+llmserve = ["layers/quantization/csrc/*.cu"]

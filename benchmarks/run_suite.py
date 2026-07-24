@@ -72,6 +72,12 @@ AGGREGATE_METRICS = (
     ("metrics.speculative_batch_size.mean", 1.0, "requests"),
     ("metrics.waiting_queue_size.p99", 1.0, "requests"),
     ("metrics.running_queue_size.p99", 1.0, "requests"),
+    ("metrics.kv_cache.total_blocks", 1.0, "blocks"),
+    ("metrics.kv_cache.peak_reserved_blocks", 1.0, "blocks"),
+    ("metrics.kv_cache.preemptions", 1.0, "count"),
+    ("metrics.kv_cache.admission_deferrals", 1.0, "count"),
+    ("metrics.kv_cache.kv_cache_bytes", 1.0 / (1024 ** 3), "GiB"),
+    ("metrics.kv_cache.model_runtime_bytes", 1.0 / (1024 ** 3), "GiB"),
 )
 
 

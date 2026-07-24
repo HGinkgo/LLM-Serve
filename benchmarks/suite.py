@@ -166,6 +166,20 @@ def build_summary_rows(results: list[dict]) -> list[dict]:
         "speculative_batch_size_mean": (
             "metrics.speculative_batch_size.mean", 1.0
         ),
+        "kv_total_blocks": ("metrics.kv_cache.total_blocks", 1.0),
+        "kv_peak_reserved_blocks": (
+            "metrics.kv_cache.peak_reserved_blocks", 1.0
+        ),
+        "kv_preemptions": ("metrics.kv_cache.preemptions", 1.0),
+        "kv_admission_deferrals": (
+            "metrics.kv_cache.admission_deferrals", 1.0
+        ),
+        "kv_cache_gib": (
+            "metrics.kv_cache.kv_cache_bytes", 1.0 / (1024 ** 3)
+        ),
+        "model_runtime_gib": (
+            "metrics.kv_cache.model_runtime_bytes", 1.0 / (1024 ** 3)
+        ),
     }
     for request_class in ("short", "long"):
         for latency_name in ("ttft", "tpot", "e2e"):

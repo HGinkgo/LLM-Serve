@@ -1,6 +1,8 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from transformers import AutoConfig
+
+from llmserve.layers.quantization.awq import AWQRuntimeConfig
 
 
 @dataclass(slots=True)
@@ -13,9 +15,11 @@ class Config:
     tensor_parallel_size: int = 1
     distributed_init_method: str = "tcp://localhost:2333"
     enforce_eager: bool = False
+    awq_backend: str = "cuda"
     # ===== 2026-06-07 chunked prefill =====
     # Stage 2 的实验调度开关；默认关闭，保留原始 baseline 行为。
     enable_chunked_prefill: bool = False
+    enable_kv_capacity_admission: bool = False
     # ===== 2026-06-07 chunked prefill =====
     speculative_model: str | None = None
     speculative_gamma: int = 3
@@ -23,6 +27,7 @@ class Config:
     speculative_accept_mode: str = "greedy"
     speculative_trace: bool = False
     hf_config: AutoConfig | None = None
+    quant_config: AWQRuntimeConfig | None = field(init=False, default=None)
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -38,7 +43,18 @@ class Config:
             assert self.speculative_accept_mode == "greedy"
             assert self.speculative_model is not None
         assert self.speculative_accept_mode in {"greedy", "rejection"}
+        if self.awq_backend not in {"reference", "triton", "cuda"}:
+            raise ValueError("awq_backend must be 'reference', 'triton', or 'cuda'")
         if self.speculative_model is not None:
             assert os.path.isdir(self.speculative_model)
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if getattr(self.hf_config, "quantization_config", None) is not None:
+            self.quant_config = replace(
+                AWQRuntimeConfig.from_hf_config(self.hf_config),
+                execution_backend=self.awq_backend,
+            )
+            if self.tensor_parallel_size != 1:
+                raise ValueError("AWQ tensor parallel is not supported")
+            if not self.enforce_eager:
+                raise ValueError("AWQ reference backend requires enforce_eager=True")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

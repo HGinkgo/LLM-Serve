@@ -1,0 +1,9 @@
+backend,concurrency,runs,output_tps_mean,output_tps_stddev,awq_over_bf16
+bf16,1,3,45.0623,0.0921,
+awq-marlin,1,3,62.6412,0.4249,1.3901
+bf16,4,3,152.5479,0.3779,
+awq-marlin,4,3,200.7642,2.1322,1.3161
+bf16,8,3,259.5367,0.3841,
+awq-marlin,8,3,343.1126,1.4835,1.3220
+bf16,16,3,399.1587,0.7303,
+awq-marlin,16,3,525.2303,2.6427,1.3158

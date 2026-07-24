@@ -67,6 +67,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in suite_paths},
             {
+                "awq-capacity-confirm.json",
                 "formal-closed-loop.json",
                 "formal-poisson.json",
                 "pilot.json",
@@ -84,6 +85,22 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 self.assertTrue(all(
                     experiment["measurement_seconds"] >= 30
                     for experiment in suite["experiments"]
+                ))
+            if path.name == "awq-capacity-confirm.json":
+                self.assertEqual(suite["runs"], 3)
+                self.assertEqual(len(points), 12)
+                self.assertEqual(
+                    {point["max_concurrency"] for point in points},
+                    {48, 64, 96, 128},
+                )
+                self.assertTrue(all(
+                    point["warmup_seconds"] == 45
+                    and point["measurement_seconds"] == 120
+                    for point in points
+                ))
+                self.assertTrue(all(
+                    point["runtime"]["enable_kv_capacity_admission"]
+                    for point in points
                 ))
             if path.name.startswith("formal-"):
                 self.assertEqual(suite["runs"], 3)
@@ -222,6 +239,14 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     },
                 },
                 "speculative": {"acceptance_rate": None},
+                "kv_cache": {
+                    "total_blocks": 321,
+                    "peak_reserved_blocks": 256,
+                    "preemptions": 0,
+                    "admission_deferrals": 12,
+                    "kv_cache_bytes": 8 * 1024 ** 3,
+                    "model_runtime_bytes": 6 * 1024 ** 3,
+                },
             },
         }
 
@@ -236,6 +261,11 @@ class BenchmarkSuiteTests(unittest.TestCase):
         self.assertEqual(row["short_e2e_p50_ms"], 1000.0)
         self.assertIsNone(row["long_ttft_p99_ms"])
         self.assertIsNone(row["acceptance_rate"])
+        self.assertEqual(row["kv_total_blocks"], 321)
+        self.assertEqual(row["kv_peak_reserved_blocks"], 256)
+        self.assertEqual(row["kv_preemptions"], 0)
+        self.assertEqual(row["kv_cache_gib"], 8.0)
+        self.assertEqual(row["model_runtime_gib"], 6.0)
 
     def test_aggregate_results_skips_missing_values_and_scales_units(self):
         from benchmarks.suite import aggregate_results

@@ -10,7 +10,9 @@
 - `metrics.py`：吞吐、延迟、goodput 和 EAGLE 聚合。
 - `serve.py`：执行单个 benchmark point。
 - `run_suite.py`：展开 suite，每点启动独立子进程，处理恢复、失败和 CSV 汇总。
-- `suites/`：smoke、capacity pilot 和正式三轮矩阵。
+- `linear_profile.py`：按 Qwen3 实际 QKV、O、gate/up、down shape 测量 dense Linear CUDA latency。
+- `awq_linear_profile.py`：从真实 AWQ checkpoint 加载 layer 权重，对比反量化、matmul、reference、Triton 与自研 CUDA forward。
+- `suites/`：smoke、serving 正式矩阵和 AWQ 容量确认矩阵。
 - `results/`：公开 manifest、逐运行 CSV、aggregate CSV 与完整脱敏 run JSON。
 
 ## Workload
@@ -60,6 +62,56 @@ CUDA_VISIBLE_DEVICES=1 python -m benchmarks.run_suite \
   --distributed-init-method tcp://localhost:2334
 ```
 
+短 Linear profiling 用于定位 AWQ kernel 优化优先级：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.linear_profile \
+  --model "$MODEL_PATH" \
+  --dtype bfloat16 \
+  --num-tokens 1,4,8,16 \
+  --output /tmp/qwen3-dense-linear.json
+```
+
+这里的 `num_tokens` 是 GEMM 的 M，不是 request concurrency。输出是隔离的 Linear microbenchmark，只用于比较投影 shape 和执行后端；端到端结论仍以 Poisson/closed-loop suite 为准。
+
+AWQ Linear backend profiling：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.awq_linear_profile \
+  --model /path/to/Qwen3-8B-AWQ \
+  --num-tokens 1,4,8,16 \
+  --warmup 10 \
+  --repeats 50 \
+  --output /tmp/qwen3-awq-linear.json
+```
+
+`dequantize` 与 `matmul` 分别隔离计时，`reference`、`triton` 与 `cuda` 统计三条完整 Linear backend。自研 CUDA 路径在模型加载时完成权重 repack，并复用预分配的 split-K workspace；这些 microbenchmark 用于定位 kernel 工作，不替代端到端延迟。
+
+自制 Qwen3 AWQ checkpoint：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.run_suite \
+  --suite benchmarks/suites/awq-capacity-confirm.json \
+  --output-dir /tmp/llmserve-awq-capacity \
+  --model /path/to/Qwen3-8B-LLMServe-AWQ \
+  --distributed-init-method tcp://localhost:2335 \
+  --resume
+```
+
+同一 suite 还要用 BF16 checkpoint 在同型号 GPU 上顺序运行，并使用不同输出目录和 distributed endpoint。矩阵覆盖 concurrency `{48, 64, 96, 128}`，每点 warmup `45s`、measurement `120s`、重复三次；它是长测试，不属于日常回归。
+
+量化与导出命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m llmserve.quantization.quantize_qwen3 \
+  --model /path/to/Qwen3-8B \
+  --output /path/to/Qwen3-8B-LLMServe-AWQ \
+  --calib-file /path/to/calibration.txt \
+  --cache-dir /tmp/qwen3-awq-calibration-cache
+```
+
+质量验证使用 `python -m llmserve.quantization.awq_quality`，分别以 `--mode bf16` 和 `--mode awq-reference` 运行。当前量化器固定为 Qwen3、W4A16、group size 128、非对称 zero，并输出标准 AutoAWQ GEMM checkpoint。CUDA backend 只支持该格式、BF16 activation/scales、SM80+、eager 和单卡 TP=1；首次加载会通过 PyTorch JIT 编译扩展。
+
 ## 输出
 
 每个 suite 输出：
@@ -89,4 +141,4 @@ closed-loop output throughput 统计 measurement window 内产生的 token；req
 
 公开数据基于 commit `ad35e65`，Qwen3-8B、RedHatAI Qwen3-8B EAGLE3 speculator、BF16 eager、argmax、固定 `gamma=3` 和 RTX 3090 24GB。Poisson 与 closed-loop suite 同时在两张独立 3090 上运行，但每个 suite/engine 始终只使用单卡，不是 tensor parallel。
 
-核心结论见仓库根目录 README；原始数值以 [`results/formal-poisson/aggregate.csv`](results/formal-poisson/aggregate.csv) 和 [`results/formal-closed-loop/aggregate.csv`](results/formal-closed-loop/aggregate.csv) 为准。
+核心结论见仓库根目录 README；serving 原始数值以 [`results/formal-poisson/aggregate.csv`](results/formal-poisson/aggregate.csv) 和 [`results/formal-closed-loop/aggregate.csv`](results/formal-closed-loop/aggregate.csv) 为准，AWQ 脱敏汇总与实验边界见 [`results/awq-w4a16/`](results/awq-w4a16/)。

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "source_point_id": "capacity-confirm-closed-loop-baseline-concurrency-128-r1",
+  "backend": "awq-cuda",
+  "complete": true,
+  "git_commit": "b32ba391160fb21e020bbaa7df5f287f38705460",
+  "git_dirty": true,
+  "config": {
+    "workload": "128 input / 256 output",
+    "max_concurrency": 128,
+    "warmup_seconds": 45,
+    "measurement_seconds": 120,
+    "max_model_len": 512,
+    "max_num_batched_tokens": 2048,
+    "max_num_seqs": 192,
+    "gpu_memory_utilization": 0.9,
+    "enable_kv_capacity_admission": true
+  },
+  "metrics": {
+    "completed_requests": 399,
+    "output_tokens_per_second": 1047.4583333333333,
+    "latency_sample_requests": 271,
+    "goodput_requests_per_second": 2.2583333333333333,
+    "ttft_p99_ms": 1245.3446436673403,
+    "tpot_p99_ms": 128.16522396078298,
+    "e2e_p99_ms": 33504.051628150046,
+    "scheduled_batch_size_mean": 128.0,
+    "waiting_queue_size_p99": 0.0,
+    "kv_total_blocks": 419,
+    "kv_peak_reserved_blocks": 256,
+    "kv_admission_deferrals": 0,
+    "model_runtime_bytes": 6289319936,
+    "kv_cache_bytes": 15816720384
+  },
+  "requests_omitted": true
+}

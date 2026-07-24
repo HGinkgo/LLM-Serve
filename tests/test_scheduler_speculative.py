@@ -25,7 +25,56 @@ class SchedulerSpeculativeTest(unittest.TestCase):
         scheduler.enable_chunked_prefill = True
         scheduler.waiting = deque()
         scheduler.running = deque()
+        scheduler.enable_kv_capacity_admission = False
+        scheduler.max_model_len = 4096
+        scheduler.speculative_reserve_tokens = 0
+        scheduler._reserved_blocks = {}
+        scheduler.preemption_count = 0
+        scheduler.admission_deferred_count = 0
+        scheduler.peak_reserved_blocks = 0
         return scheduler
+
+    def test_capacity_admission_defers_request_instead_of_preempting(self):
+        scheduler = self.make_scheduler()
+        scheduler.enable_chunked_prefill = False
+        scheduler.enable_kv_capacity_admission = True
+        scheduler.block_manager = BlockManager(num_blocks=3, block_size=4)
+        sampling = SimpleNamespace(temperature=1.0, max_tokens=4, ignore_eos=True)
+        first = Sequence([1, 2, 3, 4], sampling)
+        second = Sequence([5, 6, 7, 8], sampling)
+        scheduler.add(first)
+        scheduler.add(second)
+
+        output = scheduler.schedule()
+
+        self.assertEqual(output.prefill_seqs, [first])
+        self.assertEqual(list(scheduler.waiting), [second])
+        self.assertEqual(scheduler.preemption_count, 0)
+        self.assertEqual(scheduler.admission_deferred_count, 1)
+        self.assertEqual(scheduler.kv_capacity_metrics()["reserved_blocks"], 2)
+
+    def test_capacity_reservation_is_released_when_request_finishes(self):
+        scheduler = self.make_scheduler()
+        scheduler.enable_chunked_prefill = False
+        scheduler.enable_kv_capacity_admission = True
+        sampling = SimpleNamespace(temperature=1.0, max_tokens=1, ignore_eos=True)
+        seq = Sequence([1, 2, 3, 4], sampling)
+        scheduler.add(seq)
+        output = scheduler.schedule()
+
+        scheduler.postprocess(output, [7])
+
+        self.assertTrue(seq.is_finished)
+        self.assertEqual(scheduler.kv_capacity_metrics()["reserved_blocks"], 0)
+
+    def test_capacity_admission_rejects_request_larger_than_cache(self):
+        scheduler = self.make_scheduler()
+        scheduler.enable_kv_capacity_admission = True
+        scheduler.block_manager = BlockManager(num_blocks=2, block_size=4)
+        sampling = SimpleNamespace(temperature=1.0, max_tokens=8, ignore_eos=True)
+
+        with self.assertRaisesRegex(ValueError, "KV capacity"):
+            scheduler.add(Sequence([1, 2, 3, 4], sampling))
 
     def test_schedule_returns_explicit_mixed_batch_groups_without_negative_sentinel(self):
         scheduler = self.make_scheduler()
