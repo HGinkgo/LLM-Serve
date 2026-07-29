@@ -13,7 +13,7 @@ LLM-Serve 是一个面向单机单卡场景的教学型 LLM 推理引擎，重�
 - PagedAttention 风格 KV Cache：block table、KV block 分配回收和 prefix cache。
 - Continuous batching：iteration-level scheduler，显式区分 prefill/decode 序列。
 - Chunked prefill：decode-first，把剩余 token budget 分给长 prompt prefill。
-- EAGLE 风格投机解码：batched draft、packed target verification、per-request draft KV、greedy verification，以及 acceptance/timing 指标。
+- EAGLE 风格投机解码：batched draft、packed target verification、per-request draft KV、greedy verification，以及 acceptance/timing 指标；线性 target verify CUDA Graph 为显式 opt-in 路径。
 - AWQ W4A16：Qwen3 activation-aware 校准、标准 AutoAWQ GEMM checkpoint 导出、reference/Triton/CUDA Linear backend，以及 KV 容量准入。
 - Serving benchmark：Poisson request-rate 扫描与 closed-loop 固定并发，覆盖吞吐、goodput、TTFT、TPOT、burst ITL、output-event latency、E2E、queue depth 和 speculative timing。
 - Qwen3-8B 单卡 BF16 路径，以及可选的固定候选树实验实现。
@@ -65,6 +65,8 @@ python -m benchmarks.run_suite \
 
 `formal-closed-loop.json` 是固定并发补充实验。两个 suite 并行使用两张卡时，需要分别指定不同的 `--distributed-init-method`，例如 `tcp://localhost:2333` 与 `tcp://localhost:2334`。每个点都在独立子进程中运行，失败会记录 JSON 并继续，其余细节见 [`benchmarks/README.md`](benchmarks/README.md)。
 
+Stage 8 target verify CUDA Graph 对照使用 `benchmarks/suites/stage8-graph-formal.json`，在干净的 `3bb5d21` commit 上复现 1/4/8 并发三轮矩阵。
+
 ## Benchmark 结果
 
 正式结果基于 commit `ad35e65`，Qwen3-8B + RedHatAI Qwen3-8B EAGLE3 speculator，BF16 eager，固定 `gamma=3`，argmax，单张 RTX 3090 24GB。每个配置重复三次；Poisson 与 closed-loop 回答不同问题，不能混成一个 speedup。
@@ -80,6 +82,18 @@ decode-heavy workload 为 `256 input / 256 output`。closed-loop 中 EAGLE 明�
 | 8 | 172.36 | 267.39 | **1.551x** | 1.421x |
 
 Poisson request-rate `{0.25, 0.75, 1.25}` 下，有限 workload 的 output throughput 只提高 `1.025x-1.042x`，E2E P99 为 baseline 的 `1.068x-1.220x`。这说明 EAGLE 的收益高度依赖持续饱和与 batch 形态，不能用 closed-loop 峰值代替在线到达场景结论。三档 acceptance rate 均值约 `45.5%-46.8%`，acceptance length 约 `2.37-2.40 tokens/step`。
+
+### Target Verify CUDA Graph
+
+Stage 8 在同一 EAGLE workload 下隔离比较 target verify eager 与 target verify CUDA Graph；两组都使用 `enforce_eager=true`，因此不把普通 decode CUDA Graph 的收益混入结果。正式 suite 为 `128 input / 128 output`、`gamma=3`、closed-loop、并发 `1/4/8`，每点重复三次：
+
+| 并发 | Eager output tok/s | Graph output tok/s | 吞吐提升 | Verify 加速 | Graph 命中率 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 39.0 | **69.4** | **1.779x** | 2.17x | 98% |
+| 4 | 139.8 | **217.9** | **1.558x** | 2.00x | 93% |
+| 8 | 241.5 | **342.6** | **1.419x** | 1.79x | 84%-85% |
+
+Graph 捕获 `batch={1,4,8}`、`context frontier={256,1024}` 共 6 张图；不匹配 shape 或 speculative reservation 超出 workspace 时自动回退 eager。结果显示收益随 batch 增大递减，但 draft proposal 与 target decode 基本不变，主要瓶颈仍在 target verify。完整 manifest、CSV 和 18 个脱敏 run JSON 见 [`benchmarks/results/stage8-graph-formal/`](benchmarks/results/stage8-graph-formal/)。
 
 ### Chunked Prefill
 
@@ -107,7 +121,7 @@ LLM-Serve 自研 CUDA backend 的 runtime model memory 从 `15.276 GiB` 降至 `
 
 同一个自制 checkpoint 在 vLLM 0.11 AWQ-Marlin 上完成 24/24 个对照点，concurrency 1/4/8/16 的 AWQ/BF16 output throughput 为 `1.390x/1.316x/1.322x/1.316x`。这证明 checkpoint 格式与成熟 W4A16 backend 兼容；该吞吐收益属于 vLLM Marlin，不是 LLM-Serve 自研 CUDA kernel 的成绩。
 
-完整的 72 份 serving 脱敏 run JSON、逐运行 CSV、三轮均值/标准差和 manifest，以及 AWQ 质量/容量/Marlin 汇总位于 [`benchmarks/results/`](benchmarks/results/)。
+已有 serving 主线的 72 份脱敏 run JSON，以及 Stage 8 的 18 份 Graph 对照 run JSON、逐运行 CSV、三轮均值/标准差和 manifest，均位于 [`benchmarks/results/`](benchmarks/results/)。
 
 ## 指标口径
 
@@ -138,7 +152,7 @@ AWQ CUDA 测试、真实 checkpoint 生成和容量矩阵需要 RTX 3090 或其�
 ## 边界
 
 - 当前主配置是单卡 Qwen3-8B，不把双卡无 NVLink 环境包装成 tensor-parallel 性能平台。
-- speculative CUDA Graph 尚未实现；固定候选树默认关闭，不作为主性能结论。
+- speculative CUDA Graph 目前只支持线性 EAGLE、greedy、单卡 TP=1，并通过显式开关启用；固定 batch/context bucket 之外自动 eager fallback。固定候选树默认关闭，不作为主性能结论。
 - AWQ runtime 只支持 Qwen3、AutoAWQ GEMM、W4A16 group-128、BF16 activation/scales、eager 和 TP=1；Marlin 对照仅作为外部 backend 控制实验。
 - 项目不提供 OpenAI HTTP API 层，benchmark 直接驱动 in-process engine，聚焦 runtime 与 scheduler。
 - 代码保留原始 MIT License。

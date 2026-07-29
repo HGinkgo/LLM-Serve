@@ -13,7 +13,7 @@ The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vll
 - PagedAttention-style KV cache allocation, recycling, block tables, and prefix cache.
 - Iteration-level continuous batching with explicit prefill/decode groups.
 - Decode-first chunked prefill for mixed prefill/decode batches.
-- EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy verification, and timing metrics.
+- EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy verification, and timing metrics; an explicit opt-in CUDA Graph path for linear target verification.
 - Qwen3 AWQ W4A16 calibration, standard AutoAWQ GEMM checkpoint export, reference/Triton/CUDA Linear backends, and KV capacity admission.
 - Reproducible Poisson request-rate and closed-loop concurrency suites with throughput, goodput, TTFT, TPOT, burst ITL, output-event latency, E2E, queue depth, and speculative metrics.
 - A validated single-GPU Qwen3-8B BF16 path and optional fixed-tree experiments.
@@ -63,6 +63,8 @@ python -m benchmarks.run_suite \
 
 `formal-closed-loop.json` provides the fixed-concurrency complement. When running both suites concurrently on two GPUs, pass distinct distributed endpoints such as `tcp://localhost:2333` and `tcp://localhost:2334`. Each point runs in an independent subprocess. See [`benchmarks/README.md`](benchmarks/README.md) for schemas and execution details.
 
+Reproduce the Stage 8 target-verify CUDA Graph comparison with `benchmarks/suites/stage8-graph-formal.json` from a clean `3bb5d21` commit; it runs three repetitions at concurrency 1/4/8.
+
 ## Results
 
 The public results use commit `ad35e65`, Qwen3-8B with the RedHatAI Qwen3-8B EAGLE3 speculator, BF16 eager mode, fixed `gamma=3`, argmax sampling, and one RTX 3090 24GB per suite. Every configuration has three independent runs.
@@ -78,6 +80,18 @@ The decode-heavy profile is `256 input / 256 output`:
 | 8 | 172.36 | 267.39 | **1.551x** | 1.421x |
 
 At Poisson request rates `{0.25, 0.75, 1.25}`, finite-workload output throughput improves by only `1.025x-1.042x`, while E2E P99 is `1.068x-1.220x` of baseline. The result is deliberately workload-specific: saturated capacity gains do not imply lower online request latency.
+
+### Target Verify CUDA Graph
+
+Stage 8 isolates target-verify eager versus target-verify CUDA Graph under the same EAGLE workload. Both variants use `enforce_eager=true`, so ordinary decode CUDA Graph is excluded from the comparison. The formal suite uses `128 input / 128 output`, `gamma=3`, closed-loop concurrency `{1,4,8}`, and three repetitions per point:
+
+| Concurrency | Eager output tok/s | Graph output tok/s | Throughput gain | Verify speedup | Graph hit rate |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 39.0 | **69.4** | **1.779x** | 2.17x | 98% |
+| 4 | 139.8 | **217.9** | **1.558x** | 2.00x | 93% |
+| 8 | 241.5 | **342.6** | **1.419x** | 1.79x | 84%-85% |
+
+The backend captures six graphs for `batch={1,4,8}` and `context frontier={256,1024}`. Unsupported shapes and speculative reservation overflow fall back to eager. The gain decreases with batch size, while draft proposal and target decode remain nearly unchanged; target verification is still the dominant stage. The full manifest, CSV files, and 18 sanitized run JSON files are published in [`benchmarks/results/stage8-graph-formal/`](benchmarks/results/stage8-graph-formal/).
 
 ### Chunked Prefill
 
@@ -105,7 +119,7 @@ With LLM-Serve's custom CUDA backend, runtime model memory falls from `15.276 Gi
 
 The same checkpoint completes 24/24 control points with vLLM 0.11 AWQ-Marlin. AWQ/BF16 output-throughput ratios at concurrency 1/4/8/16 are `1.390x/1.316x/1.322x/1.316x`. This validates checkpoint compatibility with a mature W4A16 backend; the speedup belongs to vLLM Marlin, not to LLM-Serve's custom CUDA kernel.
 
-All 72 sanitized serving run JSON files, per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
+The existing serving line contains 72 sanitized run JSON files; Stage 8 adds 18 Graph comparison runs. Per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
 
 ## Metric Semantics
 
@@ -134,7 +148,7 @@ AWQ CUDA tests, real-checkpoint generation, and capacity matrices require an RTX
 ## Scope
 
 - The primary target is single-GPU Qwen3-8B; two non-NVLink GPUs are not presented as a tensor-parallel performance platform.
-- Speculative CUDA Graph is not implemented. Fixed-tree speculation remains disabled by default.
+- Speculative CUDA Graph currently supports linear EAGLE, greedy acceptance, single-GPU TP=1, and explicit opt-in only; unsupported batch/context buckets fall back to eager. Fixed-tree speculation remains disabled by default.
 - The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, eager execution, and TP=1. The Marlin run is an external-backend control experiment.
 - The project intentionally omits an OpenAI-compatible HTTP layer; benchmarks drive the in-process runtime directly.
 - The codebase retains the original MIT license.

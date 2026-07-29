@@ -6,9 +6,10 @@
 
 - `formal-poisson/`：36 个 run，Poisson request-rate 主实验。
 - `formal-closed-loop/`：36 个 run，固定并发稳态补充实验。
+- `stage8-graph-formal/`：18 个 run，线性 EAGLE target verify eager/ CUDA Graph 对照。
 - `awq-w4a16/`：AWQ 质量、LLM-Serve 容量矩阵和 vLLM Marlin 控制实验的脱敏汇总。
 
-每个目录包含 `manifest.json`、`summary.csv`、`aggregate.csv` 和 `runs/*.json`。72 个 run 均为 `complete=true`，对应 commit `ad35e65cacdcb306362268c3a60923abd199b431`，模型 revision 和软硬件环境见各自 manifest。
+每个 serving 目录包含 `manifest.json`、`summary.csv`、`aggregate.csv` 和 `runs/*.json`。原有 72 个 run 对应 commit `ad35e65cacdcb306362268c3a60923abd199b431`；Stage 8 的 18 个 run 对应 commit `3bb5d21ad5fd9ae0044943d93255a4542cc5ca75`。模型 revision 和软硬件环境见各自 manifest。
 
 公开文件已经扫描，不包含本地绝对路径、prompt token、凭据、traceback 或 host-specific workspace 信息。`summary.csv` 与 `aggregate.csv` 由 suite runner 直接从 run JSON 生成，不经过手工改写。
 

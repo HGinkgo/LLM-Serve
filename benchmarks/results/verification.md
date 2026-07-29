@@ -63,3 +63,14 @@ CUDA_VISIBLE_DEVICES=0 conda run -n nano-vllm python -m unittest \
 - LLM-Serve 容量矩阵 BF16/AWQ 共 `24/24` points，零失败，每个 point 都有非零 latency cohort。
 - vLLM Marlin 控制实验共 `24/24` points，12 个 AWQ log 均确认 `awq_marlin`。
 - `awq-w4a16/` 未包含绝对模型路径、校准文本、checkpoint、逐层 cache 或原始日志。
+
+## Stage 8 Target Verify CUDA Graph
+
+验证日期：2026-07-29。正式 Graph 对照对应 commit `3bb5d21ad5fd9ae0044943d93255a4542cc5ca75`，使用 Qwen3-8B、EAGLE3 draft、RTX 3090 和 CUDA 12.8。
+
+- `stage8-graph-formal/manifest.json`：18/18 points 完成，零失败。
+- 两个 variant 均为 `enforce_eager=true`；Graph variant 额外启用 target verify CUDA Graph，排除普通 decode CUDA Graph 干扰。
+- Graph 捕获 6 个固定 shape，batch `1/4/8`、context frontier `256/1024`；正式点均完成，无 OOM 或 capture failure。
+- Graph 对 eager 的 output throughput 提升为：concurrency 1/4/8 分别 `1.779x/1.558x/1.419x`。
+- 18 个公开 run JSON 已扫描，无绝对路径、prompt token、绝对时间戳、traceback 或凭据。
+- 当前 worktree CPU 回归：`217 tests, skipped=5, OK`；4096 max-model-len 的固定 prompt token consistency check 通过，实际命中 Graph 且无 eager fallback。
