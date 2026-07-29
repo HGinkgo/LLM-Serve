@@ -72,6 +72,8 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "formal-poisson.json",
                 "pilot.json",
                 "smoke.json",
+                "stage8-graph-formal.json",
+                "stage8-graph-smoke.json",
             },
         )
         for path in suite_paths:

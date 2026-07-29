@@ -167,6 +167,7 @@ class CheckSpeculativeCorrectnessTest(unittest.TestCase):
             speculative_gamma=3,
             speculative_accept_mode="greedy",
             speculative_trace=True,
+            enable_speculative_cuda_graph=False,
             argmax_sampler=True,
             max_model_len=64,
             max_num_batched_tokens=64,
@@ -187,6 +188,7 @@ class CheckSpeculativeCorrectnessTest(unittest.TestCase):
         self.assertEqual(report["config"]["prompt"], "Explain speculative decoding briefly.")
         self.assertEqual(report["config"]["speculative_accept_mode"], "greedy")
         self.assertTrue(report["config"]["speculative_trace"])
+        self.assertFalse(report["config"]["enable_speculative_cuda_graph"])
         self.assertTrue(report["config"]["argmax_sampler"])
         self.assertIsNone(report["config"]["prompt_token_ids"])
         self.assertFalse(report["checks"]["token_ids_match"])

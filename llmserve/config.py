@@ -26,6 +26,7 @@ class Config:
     speculative_tree_nodes: int = 0
     speculative_accept_mode: str = "greedy"
     speculative_trace: bool = False
+    enable_speculative_cuda_graph: bool = False
     hf_config: AutoConfig | None = None
     quant_config: AWQRuntimeConfig | None = field(init=False, default=None)
     eos: int = -1
@@ -42,6 +43,18 @@ class Config:
             assert self.speculative_gamma == 3
             assert self.speculative_accept_mode == "greedy"
             assert self.speculative_model is not None
+        if self.enable_speculative_cuda_graph and self.speculative_tree_nodes:
+            raise ValueError(
+                "speculative CUDA Graph supports linear speculative decoding only"
+            )
+        if self.enable_speculative_cuda_graph and self.speculative_model is None:
+            raise ValueError(
+                "speculative CUDA Graph requires a speculative model"
+            )
+        if self.enable_speculative_cuda_graph and self.speculative_accept_mode != "greedy":
+            raise ValueError(
+                "speculative CUDA Graph requires greedy acceptance"
+            )
         assert self.speculative_accept_mode in {"greedy", "rejection"}
         if self.awq_backend not in {"reference", "triton", "cuda"}:
             raise ValueError("awq_backend must be 'reference', 'triton', or 'cuda'")

@@ -165,9 +165,43 @@ class FakeBatchModelRunner(FakeModelRunner):
                     timing={"target_verify_time": 0.02, "total_time": 0.03},
                 ),
             ]
-        raise AssertionError(method_name)
 
 
+class FakeGraphModelRunner(FakeModelRunner):
+    enforce_eager = False
+    _target_verify_graph_backend = object()
+
+
+class FakeGraphWithoutSpecModelRunner(FakeNormalModelRunner):
+    enforce_eager = False
+    _target_verify_graph_backend = object()
+
+
+class LLMEngineSpeculativeGateTest(unittest.TestCase):
+
+    def test_cuda_graph_backend_allows_linear_speculation_without_eager(self):
+        engine = LLMEngine.__new__(LLMEngine)
+        seq = Sequence([1, 2, 3])
+        engine.model_runner = FakeGraphModelRunner()
+        engine.scheduler = FakeScheduler(seq)
+
+        self.assertTrue(
+            engine._can_run_speculative_step(
+                SchedulerOutput([seq], [], [seq], 1)
+            )
+        )
+
+    def test_cuda_graph_backend_does_not_enable_speculation_without_draft(self):
+        engine = LLMEngine.__new__(LLMEngine)
+        seq = Sequence([1, 2, 3])
+        engine.model_runner = FakeGraphWithoutSpecModelRunner()
+        engine.scheduler = FakeScheduler(seq)
+
+        self.assertFalse(
+            engine._can_run_speculative_step(
+                SchedulerOutput([seq], [], [seq], 1)
+            )
+        )
 class LLMEngineSpeculativeTest(unittest.TestCase):
     def test_reset_metrics_requires_idle_engine_and_clears_counters(self):
         engine = object.__new__(LLMEngine)

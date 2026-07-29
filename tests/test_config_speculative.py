@@ -21,6 +21,35 @@ class ConfigSpeculativeTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.make_config(speculative_gamma=0)
 
+    def test_speculative_cuda_graph_is_disabled_by_default(self):
+        config = self.make_config()
+
+        self.assertFalse(config.enable_speculative_cuda_graph)
+
+    def test_speculative_cuda_graph_requires_linear_speculation(self):
+        with tempfile.TemporaryDirectory() as model_dir, tempfile.TemporaryDirectory() as draft_dir, patch(
+            "llmserve.config.AutoConfig.from_pretrained",
+            return_value=SimpleNamespace(max_position_embeddings=4096),
+        ), self.assertRaisesRegex(ValueError, "linear speculative"):
+            Config(
+                model_dir,
+                speculative_model=draft_dir,
+                speculative_tree_nodes=6,
+                enable_speculative_cuda_graph=True,
+            )
+
+    def test_speculative_cuda_graph_requires_greedy_acceptance(self):
+        with tempfile.TemporaryDirectory() as model_dir, tempfile.TemporaryDirectory() as draft_dir, patch(
+            "llmserve.config.AutoConfig.from_pretrained",
+            return_value=SimpleNamespace(max_position_embeddings=4096),
+        ), self.assertRaisesRegex(ValueError, "greedy acceptance"):
+            Config(
+                model_dir,
+                speculative_model=draft_dir,
+                speculative_accept_mode="rejection",
+                enable_speculative_cuda_graph=True,
+            )
+
     def test_completed_tree_kv_ablation_is_not_a_runtime_config(self):
         config = self.make_config()
 

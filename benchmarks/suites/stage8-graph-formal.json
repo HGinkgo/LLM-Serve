@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "name": "stage8-graph-formal",
+  "runs": 3,
+  "profiles": {
+    "decode-heavy": {
+      "classes": [
+        {
+          "name": "decode",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 128
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "eagle-target-verify-graph",
+      "arrival": "closed-loop",
+      "profile": "decode-heavy",
+      "max_concurrencies": [1, 4, 8],
+      "warmup_seconds": 5,
+      "measurement_seconds": 60,
+      "variants": [
+        {
+          "name": "eagle-graph",
+          "enable_speculative": true
+        },
+        {
+          "name": "eagle-eager",
+          "enable_speculative": true,
+          "enforce_eager": true,
+          "enable_speculative_cuda_graph": false
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "argmax_sampler": true,
+        "warmup": true,
+        "max_model_len": 1024,
+        "max_num_batched_tokens": 2048,
+        "speculative_gamma": 3,
+        "speculative_accept_mode": "greedy",
+        "enable_speculative_cuda_graph": true
+      }
+    }
+  ]
+}

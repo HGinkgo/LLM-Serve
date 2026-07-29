@@ -361,7 +361,10 @@ class LLMEngine:
             return False
         if getattr(self.model_runner, "draft_model", None) is None:
             return False
-        if not getattr(self.model_runner, "enforce_eager", False):
+        if (
+            not getattr(self.model_runner, "enforce_eager", False)
+            and getattr(self.model_runner, "_target_verify_graph_backend", None) is None
+        ):
             return False
         if getattr(self.model_runner, "world_size", 1) != 1:
             return False

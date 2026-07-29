@@ -144,6 +144,33 @@ class BenchmarkServeTests(unittest.TestCase):
 
         self.assertEqual(factory_calls[0]["awq_backend"], "reference")
 
+    def test_run_point_passes_speculative_cuda_graph_to_engine(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        factory_calls = []
+        point = make_point()
+        point["runtime"].update({
+            "enable_speculative": True,
+            "enable_speculative_cuda_graph": True,
+        })
+
+        def engine_factory(model, **kwargs):
+            factory_calls.append(kwargs)
+            return FakeEngine(clock)
+
+        run_point(
+            point,
+            model="/models/Qwen3-8B",
+            speculative_model="/models/eagle3",
+            engine_factory=engine_factory,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertTrue(factory_calls[0]["enable_speculative_cuda_graph"])
+
     def test_run_point_passes_capacity_admission_and_reports_kv_metrics(self):
         from benchmarks.serve import run_point
 

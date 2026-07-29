@@ -9,6 +9,7 @@ from llmserve.engine.sequence import Sequence
 from llmserve.engine.scheduler import SchedulerOutput
 from llmserve.engine.speculative_executor import SpeculativeExecutor
 from llmserve.speculative.tree_kv import TreeKVCacheManager
+from llmserve.speculative.target_graph import TargetVerifyGraphBackend
 from llmserve.speculative.types import SpeculativeDecodeOutput
 from llmserve.models.qwen3 import Qwen3ForCausalLM
 from llmserve.layers.sampler import Sampler
@@ -52,6 +53,7 @@ class ModelRunner:
         self.speculative_tree_nodes = config.speculative_tree_nodes
         self.speculative_accept_mode = config.speculative_accept_mode
         self.speculative_trace = config.speculative_trace
+        self._target_verify_graph_backend = None
         self.draft_kv_cache = {}
         self._prefill_aux_chunks = {}
         self._prev_correction = {}
@@ -59,6 +61,16 @@ class ModelRunner:
         self.warmup_model()
         # 真正跑一次模型，把模型执行的峰值显存测出来，计算给 KV cache 留多少空间
         self.allocate_kv_cache()
+        if config.enable_speculative_cuda_graph:
+            self._target_verify_graph_backend = TargetVerifyGraphBackend(
+                self.model,
+                gamma=self.speculative_gamma,
+                max_batch_size=self.config.max_num_seqs,
+                max_model_len=self.config.max_model_len,
+                block_size=self.block_size,
+                device=f"cuda:{rank}",
+            )
+            self._target_verify_graph_backend.capture()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -241,7 +253,7 @@ class ModelRunner:
             seen_storages.add(key)
             model_runtime_bytes += storage.nbytes()
         _, total_bytes = torch.cuda.mem_get_info()
-        return {
+        metrics = {
             "model_runtime_bytes": model_runtime_bytes,
             "kv_cache_bytes": self.kv_cache.numel() * self.kv_cache.element_size(),
             "kv_block_bytes": (
@@ -254,6 +266,10 @@ class ModelRunner:
             "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             "cuda_total_bytes": total_bytes,
         }
+        graph_backend = getattr(self, "_target_verify_graph_backend", None)
+        if graph_backend is not None:
+            metrics["speculative_cuda_graph"] = graph_backend.metrics()
+        return metrics
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

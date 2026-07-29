@@ -67,6 +67,7 @@ def parse_args():
     parser.add_argument("--speculative-tree-nodes", type=int, choices=[0, 6, 10], default=0)
     parser.add_argument("--speculative-accept-mode", choices=["greedy", "rejection"], default="greedy")
     parser.add_argument("--speculative-trace", action="store_true")
+    parser.add_argument("--enable-speculative-cuda-graph", action="store_true")
     parser.add_argument("--argmax-sampler", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=64)
     parser.add_argument("--max-num-batched-tokens", type=int, default=64)
@@ -104,6 +105,7 @@ def run_single_request(
     speculative_accept_mode: str,
     speculative_trace: bool,
     argmax_sampler: bool,
+    enable_speculative_cuda_graph: bool,
     max_model_len: int,
     max_num_batched_tokens: int,
     max_steps: int,
@@ -122,6 +124,7 @@ def run_single_request(
             speculative_tree_nodes=speculative_tree_nodes,
             speculative_accept_mode=speculative_accept_mode,
             speculative_trace=speculative_trace,
+            enable_speculative_cuda_graph=enable_speculative_cuda_graph,
         )
         if argmax_sampler:
             engine.model_runner.sampler = ArgmaxSampler()
@@ -404,6 +407,7 @@ def run_comparison(args) -> dict:
         speculative_accept_mode=args.speculative_accept_mode,
         speculative_trace=args.speculative_trace,
         argmax_sampler=args.argmax_sampler,
+        enable_speculative_cuda_graph=False,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_steps=args.max_steps,
@@ -420,6 +424,7 @@ def run_comparison(args) -> dict:
         speculative_accept_mode=args.speculative_accept_mode,
         speculative_trace=args.speculative_trace,
         argmax_sampler=args.argmax_sampler,
+        enable_speculative_cuda_graph=args.enable_speculative_cuda_graph,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_steps=args.max_steps,
@@ -438,6 +443,7 @@ def run_comparison(args) -> dict:
             "speculative_tree_nodes": speculative_tree_nodes,
             "speculative_accept_mode": args.speculative_accept_mode,
             "speculative_trace": args.speculative_trace,
+            "enable_speculative_cuda_graph": args.enable_speculative_cuda_graph,
             "argmax_sampler": args.argmax_sampler,
             "max_model_len": args.max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,

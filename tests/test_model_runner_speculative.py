@@ -207,6 +207,44 @@ class ModelRunnerSpeculativeTest(unittest.TestCase):
         self.assertEqual(metadata["max_seqlen_k"], 8)
         self.assertEqual(metadata["verify_lengths"], [3, 3])
 
+    def test_target_verify_uses_cuda_graph_backend_when_shape_matches(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.block_size = 4
+        runner.speculative_gamma = 3
+        runner.model = FakeTargetModel()
+        runner.prepare_block_tables = lambda seqs: torch.tensor(
+            [seq.block_table for seq in seqs], dtype=torch.int32
+        )
+        graph_calls = []
+
+        class FakeGraphBackend:
+            def run_if_supported(self, metadata, block_tables):
+                key = SimpleNamespace(batch_size=1, context_frontier=256)
+                graph_calls.append((metadata, block_tables.clone(), key))
+                return torch.zeros(4, 8), self._aux
+
+        graph_backend = FakeGraphBackend()
+        graph_backend._aux = self.make_aux_hidden([100, 101, 102, 103])
+        runner._target_verify_graph_backend = graph_backend
+
+        seq = Sequence([1, 2, 3, 4, 5])
+        seq.block_table = [10, 11, 12]
+
+        output = ModelRunner.run_target_verify_batch_with_eagle3_aux(
+            runner,
+            [seq],
+            [30],
+            [[31, 32, 33]],
+            [0],
+        )[0]
+
+        self.assertEqual(len(graph_calls), 1)
+        self.assertEqual(graph_calls[0][2].batch_size, 1)
+        self.assertEqual(graph_calls[0][2].context_frontier, 256)
+        self.assertEqual(tuple(output.target_logits.shape), (4, 8))
+        self.assertEqual(tuple(output.target_aux_hidden.shape), (4, 12))
+        self.assertEqual(runner.model.forward_calls, [])
+
     def test_run_speculative_batch_uses_one_target_verify_for_two_sequences(self):
         runner = ModelRunner.__new__(ModelRunner)
         runner.draft_model = FakeDraftModel()
@@ -292,6 +330,10 @@ class ModelRunnerSpeculativeTest(unittest.TestCase):
         self.assertEqual(outputs[0].timing["draft_compact_time"], 0.004)
         self.assertEqual(outputs[1].timing["draft_forward_time"], 0.006)
         self.assertEqual(outputs[1].timing["draft_sample_time"], 0.007)
+        for output in outputs:
+            self.assertGreaterEqual(output.timing["target_decode_host_time"], 0.0)
+            self.assertGreaterEqual(output.timing["target_verify_host_time"], 0.0)
+            self.assertGreaterEqual(output.timing["kv_update_host_time"], 0.0)
         self.assertEqual(runner._prev_correction[0][0], 15)
         self.assertEqual(runner._prev_correction[1][0], 14)
 
@@ -438,8 +480,11 @@ class ModelRunnerSpeculativeTest(unittest.TestCase):
         ):
             self.assertGreaterEqual(output.timing[name], 0.0)
         self.assertGreaterEqual(output.timing["target_verify_time"], 0.0)
+        self.assertGreaterEqual(output.timing["target_decode_host_time"], 0.0)
+        self.assertGreaterEqual(output.timing["target_verify_host_time"], 0.0)
         self.assertGreaterEqual(output.timing["accept_time"], 0.0)
         self.assertGreaterEqual(output.timing["kv_update_time"], 0.0)
+        self.assertGreaterEqual(output.timing["kv_update_host_time"], 0.0)
         self.assertGreaterEqual(output.timing["trace_time"], 0.0)
         self.assertGreaterEqual(output.timing["total_time"], 0.0)
         self.assertEqual(

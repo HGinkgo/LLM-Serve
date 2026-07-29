@@ -159,6 +159,9 @@ def run_point(
             "speculative_accept_mode", "greedy"
         ),
         "speculative_trace": runtime.get("speculative_trace", False),
+        "enable_speculative_cuda_graph": runtime.get(
+            "enable_speculative_cuda_graph", False
+        ),
     }
     if distributed_init_method is not None:
         engine_kwargs["distributed_init_method"] = distributed_init_method

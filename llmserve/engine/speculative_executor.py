@@ -19,6 +19,7 @@ from llmserve.speculative.tree import (
     select_greedy_tree_path,
 )
 from llmserve.utils.context import set_context, reset_context
+from llmserve.utils.stage_profiler import StageProfiler
 
 
 class SpeculativeExecutor:
@@ -117,6 +118,13 @@ class SpeculativeExecutor:
             name: float(proposal_timing.get(name, 0.0))
             for name in cls.draft_stage_timing_names
         }
+
+    def _new_stage_profiler(self, *stage_names: str) -> StageProfiler:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", getattr(self, "rank", torch.cuda.current_device()))
+        else:
+            device = torch.device("cpu")
+        return StageProfiler(device, stage_names)
 
     def _update_single_draft_kv(
         self,
@@ -359,12 +367,28 @@ class SpeculativeExecutor:
             draft_token_ids,
             base_offsets,
         )
+        block_tables = self.prepare_block_tables(seqs)
+
+        graph_backend = getattr(self, "_target_verify_graph_backend", None)
+        graph_output = (
+            graph_backend.run_if_supported(metadata, block_tables)
+            if graph_backend is not None
+            else None
+        )
+        if graph_output is not None:
+            logits, aux_hidden = graph_output
+            logits_by_seq = torch.split(logits, metadata["verify_lengths"], dim=0)
+            aux_by_seq = torch.split(aux_hidden, metadata["verify_lengths"], dim=0)
+            return [
+                Eagle3TargetVerifyOutput(seq_logits, seq_aux)
+                for seq_logits, seq_aux in zip(logits_by_seq, aux_by_seq)
+            ]
+
         input_ids = torch.tensor(metadata["input_ids"], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(metadata["positions"], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(metadata["slot_mapping"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(metadata["cu_seqlens_q"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(metadata["cu_seqlens_k"], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
 
         set_context(
             True,
@@ -543,7 +567,7 @@ class SpeculativeExecutor:
     def run_speculative_single(self, seq: Sequence) -> SpeculativeDecodeOutput:
         assert self.draft_model is not None
         total_start = perf_counter()
-        target_decode_time = 0.0
+        profiler = self._new_stage_profiler("target_decode", "target_verify", "kv_update")
         trace_time = 0.0
         prev_correction = getattr(self, "_prev_correction", {})
         merged = seq.seq_id in prev_correction
@@ -552,10 +576,9 @@ class SpeculativeExecutor:
             # 本轮复用它作为 start token，并在 verify 阶段从 len(seq)-1 覆盖该 KV 槽。
             start_token_id, start_aux_hidden = prev_correction[seq.seq_id]
         else:
-            stage_start = perf_counter()
-            target_decode = self.run_target_decode_with_eagle3_aux([seq])
+            with profiler.stage("target_decode"):
+                target_decode = self.run_target_decode_with_eagle3_aux([seq])
             reset_context()
-            target_decode_time = perf_counter() - stage_start
             start_token_id = target_decode.token_ids[0]
             start_aux_hidden = target_decode.aux_hidden.view(1, 1, -1)
         temperature = seq.temperature
@@ -582,14 +605,14 @@ class SpeculativeExecutor:
             draft_sampling_mode="greedy" if accept_mode == "greedy" else "sample",
         )
         draft_proposal_time = perf_counter() - stage_start
-        stage_start = perf_counter()
-        verify_output = self.run_target_verify_with_eagle3_aux(
-            seq,
-            start_token_id,
-            draft_sequence.draft_token_ids,
-            base_offset=-1 if merged else 0,
-        )
-        target_verify_time = perf_counter() - stage_start
+        with profiler.stage("target_verify"):
+            verify_output = self.run_target_verify_with_eagle3_aux(
+                seq,
+                start_token_id,
+                draft_sequence.draft_token_ids,
+                base_offset=-1 if merged else 0,
+            )
+        profiler.finish()
         stage_start = perf_counter()
         draft_token_ids = torch.tensor(
             draft_sequence.draft_token_ids,
@@ -634,23 +657,26 @@ class SpeculativeExecutor:
                 draft_kv_len=draft_kv_len,
             )
             trace_time = perf_counter() - stage_start
-        stage_start = perf_counter()
-        self._update_single_draft_kv(
-            seq,
-            draft_sequence.past_kv,
-            draft_kv_len,
-            token_ids,
-            verify_output.target_aux_hidden,
-            sample_result.num_accepted,
-            gamma,
-        )
-        kv_update_time = perf_counter() - stage_start
+        with profiler.stage("kv_update"):
+            self._update_single_draft_kv(
+                seq,
+                draft_sequence.past_kv,
+                draft_kv_len,
+                token_ids,
+                verify_output.target_aux_hidden,
+                sample_result.num_accepted,
+                gamma,
+            )
+        stage_timings = profiler.finish()
         timing = {
-            "target_decode_time": target_decode_time,
+            "target_decode_time": stage_timings["target_decode"].device_seconds,
+            "target_decode_host_time": stage_timings["target_decode"].host_seconds,
             "draft_proposal_time": draft_proposal_time,
-            "target_verify_time": target_verify_time,
+            "target_verify_time": stage_timings["target_verify"].device_seconds,
+            "target_verify_host_time": stage_timings["target_verify"].host_seconds,
             "accept_time": accept_time,
-            "kv_update_time": kv_update_time,
+            "kv_update_time": stage_timings["kv_update"].device_seconds,
+            "kv_update_host_time": stage_timings["kv_update"].host_seconds,
             "trace_time": trace_time,
             "total_time": perf_counter() - total_start,
         }
@@ -719,19 +745,18 @@ class SpeculativeExecutor:
             return [self.run_speculative_single(seqs[0])]
 
         total_start = perf_counter()
+        profiler = self._new_stage_profiler("target_decode", "target_verify", "kv_update")
         if not hasattr(self, "_prev_correction"):
             self._prev_correction = {}
         prev_correction = getattr(self, "_prev_correction", {})
         merged_by_seq = {seq.seq_id: seq.seq_id in prev_correction for seq in seqs}
         decode_seqs = [seq for seq in seqs if not merged_by_seq[seq.seq_id]]
-        target_decode_time = 0.0
         decoded_starts = {}
 
         if decode_seqs:
-            stage_start = perf_counter()
-            target_decode = self.run_target_decode_with_eagle3_aux(decode_seqs)
+            with profiler.stage("target_decode"):
+                target_decode = self.run_target_decode_with_eagle3_aux(decode_seqs)
             reset_context()
-            target_decode_time = perf_counter() - stage_start
             for index, seq in enumerate(decode_seqs):
                 decoded_starts[seq.seq_id] = (
                     target_decode.token_ids[index],
@@ -770,16 +795,14 @@ class SpeculativeExecutor:
 
         self._generate_speculative_draft_sequences(states, accept_mode)
 
-        stage_start = perf_counter()
-        verify_outputs = self.run_target_verify_batch_with_eagle3_aux(
-            seqs,
-            [state["start_token_id"] for state in states],
-            [state["draft_sequence"].draft_token_ids for state in states],
-            [-1 if state["merged"] else 0 for state in states],
-        )
-        target_verify_time = perf_counter() - stage_start
-        target_decode_share = target_decode_time / len(decode_seqs) if decode_seqs else 0.0
-        target_verify_share = target_verify_time / len(seqs)
+        with profiler.stage("target_verify"):
+            verify_outputs = self.run_target_verify_batch_with_eagle3_aux(
+                seqs,
+                [state["start_token_id"] for state in states],
+                [state["draft_sequence"].draft_token_ids for state in states],
+                [-1 if state["merged"] else 0 for state in states],
+            )
+        profiler.finish()
 
         outputs = []
         for state, verify_output in zip(states, verify_outputs):
@@ -830,23 +853,19 @@ class SpeculativeExecutor:
                 )
                 trace_time = perf_counter() - stage_start
 
-            stage_start = perf_counter()
-            self._update_single_draft_kv(
-                seq,
-                draft_sequence.past_kv,
-                state["draft_kv_len"],
-                token_ids,
-                verify_output.target_aux_hidden,
-                sample_result.num_accepted,
-                state["gamma"],
-            )
-            kv_update_time = perf_counter() - stage_start
+            with profiler.stage("kv_update"):
+                self._update_single_draft_kv(
+                    seq,
+                    draft_sequence.past_kv,
+                    state["draft_kv_len"],
+                    token_ids,
+                    verify_output.target_aux_hidden,
+                    sample_result.num_accepted,
+                    state["gamma"],
+                )
             timing = {
-                "target_decode_time": target_decode_share if not state["merged"] else 0.0,
                 "draft_proposal_time": state["draft_proposal_time"],
-                "target_verify_time": target_verify_share,
                 "accept_time": accept_time,
-                "kv_update_time": kv_update_time,
                 "trace_time": trace_time,
                 "total_time": 0.0,
             }
@@ -861,7 +880,22 @@ class SpeculativeExecutor:
                 debug=debug,
             ))
 
+        stage_timings = profiler.finish()
+        target_decode_divisor = len(decode_seqs) if decode_seqs else 1
+        target_decode_time = stage_timings["target_decode"].device_seconds / target_decode_divisor
+        target_decode_host_time = stage_timings["target_decode"].host_seconds / target_decode_divisor
+        target_verify_time = stage_timings["target_verify"].device_seconds / len(seqs)
+        target_verify_host_time = stage_timings["target_verify"].host_seconds / len(seqs)
+        kv_update_time = stage_timings["kv_update"].device_seconds / len(seqs)
+        kv_update_host_time = stage_timings["kv_update"].host_seconds / len(seqs)
         total_time_share = (perf_counter() - total_start) / len(seqs)
-        for output in outputs:
+        for output, state in zip(outputs, states):
+            merged = state["merged"]
+            output.timing["target_decode_time"] = 0.0 if merged else target_decode_time
+            output.timing["target_decode_host_time"] = 0.0 if merged else target_decode_host_time
+            output.timing["target_verify_time"] = target_verify_time
+            output.timing["target_verify_host_time"] = target_verify_host_time
+            output.timing["kv_update_time"] = kv_update_time
+            output.timing["kv_update_host_time"] = kv_update_host_time
             output.timing["total_time"] = total_time_share
         return outputs
