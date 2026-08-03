@@ -76,6 +76,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-prefill-batch-sweep.json",
                 "pd-decode-graph-formal.json",
                 "pd-prefill-graph-crossover.json",
+                "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
@@ -186,6 +187,32 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     and point["runtime"]["prefill_enforce_eager"]
                     and not point["runtime"]["decode_enforce_eager"]
                     for point in points
+                ))
+            if path.name == "pd-kv-pipeline-formal.json":
+                self.assertEqual(suite["runs"], 3)
+                self.assertEqual(len(points), 18)
+                self.assertEqual(
+                    {point["max_concurrency"] for point in points},
+                    {32, 48, 64},
+                )
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"pd-inline-b4-graph", "pd-shared-b4-graph"},
+                )
+                shared_points = [
+                    point
+                    for point in points
+                    if point["variant"] == "pd-shared-b4-graph"
+                ]
+                self.assertTrue(all(
+                    point["runtime"]["pd"]
+                    and point["runtime"]["prefill_batch_size"] == 4
+                    and point["runtime"]["prefill_enforce_eager"]
+                    and not point["runtime"]["decode_enforce_eager"]
+                    and point["runtime"]["kv_slot_count"] == 2
+                    and point["warmup_seconds"] == 30
+                    and point["measurement_seconds"] == 60
+                    for point in shared_points
                 ))
             if path.name.startswith("formal-"):
                 self.assertEqual(suite["runs"], 3)
