@@ -4,7 +4,7 @@
 
 [![CPU tests](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml)
 
-LLM-Serve is an educational single-GPU inference runtime focused on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, EAGLE-style speculative decoding, and AWQ W4A16 inference.
+LLM-Serve is an educational inference runtime with a single-GPU baseline and a dual-GPU Prefill/Decode serving path. It focuses on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, EAGLE-style speculative decoding, and AWQ W4A16 inference.
 
 The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vllm`. The scheduler changes, chunked prefill path, benchmark system, and speculative decoding runtime are independently designed and implemented in this repository.
 
@@ -15,6 +15,7 @@ The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vll
 - Decode-first chunked prefill for mixed prefill/decode batches.
 - EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy verification, and timing metrics; an explicit opt-in CUDA Graph path for linear target verification.
 - Qwen3 AWQ W4A16 calibration, standard AutoAWQ GEMM checkpoint export, reference/Triton/CUDA Linear backends, and KV capacity admission.
+- Dual-GPU PD serving with independent Prefill/Decode workers, logical KV handoff, reusable pinned shared-memory slots, ACK/backpressure pipelining, and role-specific Decode CUDA Graphs.
 - Reproducible Poisson request-rate and closed-loop concurrency suites with throughput, goodput, TTFT, TPOT, burst ITL, output-event latency, E2E, queue depth, and speculative metrics.
 - A validated single-GPU Qwen3-8B BF16 path and optional fixed-tree experiments.
 
@@ -24,6 +25,7 @@ The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vll
 - `llmserve/models/`: Qwen3 and EAGLE3 definitions and checkpoint loading.
 - `llmserve/speculative/`: draft, verification sampling, fixed trees, and Tree KV management.
 - `llmserve/quantization/`: Qwen3 AWQ calibration, layer-wise quantization, checkpoint export, and quality evaluation.
+- `llmserve/pd/`: Prefill/Decode protocols, logical KV handoff, shared slots, worker lifecycle, and serving orchestration.
 - `llmserve/layers/`: attention, linear, sampling, and other model building blocks.
 - `benchmarks/`: workloads, arrivals, metrics, point/suite runners, and public results.
 - `tests/`: CPU tests plus optional checkpoint and CUDA kernel coverage.
@@ -65,9 +67,23 @@ python -m benchmarks.run_suite \
 
 Reproduce the Stage 8 target-verify CUDA Graph comparison with `benchmarks/suites/stage8-graph-formal.json` from a clean `3bb5d21` commit; it runs three repetitions at concurrency 1/4/8.
 
+The dual-GPU KV transport comparison uses `benchmarks/suites/pd-kv-pipeline-formal.json`. Prefill and Decode workers use GPU 0/1 by default, and the matrix isolates inline Queue Tensor transfer versus pinned shared-memory slots.
+
 ## Results
 
 The public results use commit `ad35e65`, Qwen3-8B with the RedHatAI Qwen3-8B EAGLE3 speculator, BF16 eager mode, fixed `gamma=3`, argmax sampling, and one RTX 3090 24GB per suite. Every configuration has three independent runs.
+
+### Dual-GPU PD KV Pipeline
+
+The PD comparison uses Qwen3-8B BF16 on two RTX 3090 GPUs, `128 input / 64 output`, Prefill batch 4, and Decode CUDA Graphs. The only changed variable is KV transport: the baseline sends tensors through a process Queue, while the shared path sends descriptors for two reusable pinned shared-memory slots and reclaims them through acknowledgements.
+
+| Concurrency | Inline req/s | Shared req/s | Throughput gain | TTFT P50 |
+| :--- | ---: | ---: | ---: | ---: |
+| 32 | 16.29 | **17.89** | **1.098x** | 207 -> 132 ms |
+| 48 | 18.62 | **20.71** | **1.112x** | 227 -> 138 ms |
+| 64 | 21.31 | **28.11** | **1.319x** | 639 -> 136 ms |
+
+At concurrency 64, Prefill response-queue time falls from `47.4 ms` to `0.25 ms`, Decode admission from `14.5 ms` to `1.13 ms`, and Prefill roundtrip from `186.6 ms` to `134.2 ms`; model forward and KV export/copy are unchanged. The gain therefore comes from removing large cross-process Tensor serialization and handoff blocking, not faster model computation. All 18 formal points completed, with no inline fallback on the shared path and all slots reclaimed. See [`benchmarks/results/pd-kv-pipeline-formal/`](benchmarks/results/pd-kv-pipeline-formal/).
 
 ### EAGLE
 
@@ -119,7 +135,7 @@ With LLM-Serve's custom CUDA backend, runtime model memory falls from `15.276 Gi
 
 The same checkpoint completes 24/24 control points with vLLM 0.11 AWQ-Marlin. AWQ/BF16 output-throughput ratios at concurrency 1/4/8/16 are `1.390x/1.316x/1.322x/1.316x`. This validates checkpoint compatibility with a mature W4A16 backend; the speedup belongs to vLLM Marlin, not to LLM-Serve's custom CUDA kernel.
 
-The existing serving line contains 72 sanitized run JSON files; Stage 8 adds 18 Graph comparison runs. Per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
+The existing serving line contains 72 sanitized run JSON files; Stage 8 adds 18 Graph comparison runs, and the dual-GPU PD comparison adds 18 reduced sanitized runs. Per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
 
 ## Metric Semantics
 
@@ -147,7 +163,7 @@ AWQ CUDA tests, real-checkpoint generation, and capacity matrices require an RTX
 
 ## Scope
 
-- The primary target is single-GPU Qwen3-8B; two non-NVLink GPUs are not presented as a tensor-parallel performance platform.
+- The primary target is single-GPU Qwen3-8B. The dual-GPU path is Prefill/Decode disaggregation; two non-NVLink GPUs are not presented as a tensor-parallel performance platform.
 - Speculative CUDA Graph currently supports linear EAGLE, greedy acceptance, single-GPU TP=1, and explicit opt-in only; unsupported batch/context buckets fall back to eager. Fixed-tree speculation remains disabled by default.
 - The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, eager execution, and TP=1. The Marlin run is an external-backend control experiment.
 - The project intentionally omits an OpenAI-compatible HTTP layer; benchmarks drive the in-process runtime directly.

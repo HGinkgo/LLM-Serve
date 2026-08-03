@@ -74,3 +74,14 @@ CUDA_VISIBLE_DEVICES=0 conda run -n nano-vllm python -m unittest \
 - Graph 对 eager 的 output throughput 提升为：concurrency 1/4/8 分别 `1.779x/1.558x/1.419x`。
 - 18 个公开 run JSON 已扫描，无绝对路径、prompt token、绝对时间戳、traceback 或凭据。
 - 当前 worktree CPU 回归：`217 tests, skipped=5, OK`；4096 max-model-len 的固定 prompt token consistency check 通过，实际命中 Graph 且无 eager fallback。
+
+## Dual-GPU PD KV Pipeline
+
+验证日期：2026-08-03。正式 PD KV transport 对照对应 commit `e779a6aa4186683327060697b8c04f3da12c0284`，使用 Qwen3-8B BF16、双 RTX 3090 和 CUDA 12.8。
+
+- `pd-kv-pipeline-formal/manifest.json`：18/18 points 完成，零失败。
+- 两个 variant 均使用 Prefill batch 4、eager Prefill 和 Decode CUDA Graph，只改变 inline Queue Tensor / pinned shared-memory slot transport。
+- concurrency 32/48/64 的 shared/inline request throughput 为 `1.098x/1.112x/1.319x`；并发 64 的三轮标准差为 `0.08 req/s`。
+- 9 个 shared points 均未触发 inline fallback；每个 run 最终为 `free_slots=2`、`pending_transfers=0`，无 OOM、worker timeout 或 Graph capture failure。
+- 18 个公开 run 删除重复的 request records 和 per-batch timing detail，保留 suite 聚合指标、Queue/slot samples、Graph counters 与 worker health；扫描未发现绝对路径、prompt token IDs、traceback 或凭据。
+- 合并前 CPU 回归：`274 tests, skipped=5, OK`；真实双卡 4-request smoke 的 token IDs 与 inline 基线完全一致。

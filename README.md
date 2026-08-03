@@ -4,7 +4,7 @@
 
 [![CPU tests](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml)
 
-LLM-Serve 是一个面向单机单卡场景的教学型 LLM 推理引擎，重点实现并验证高吞吐 serving 背后的核心机制：Paged KV Cache、continuous batching、chunked prefill、serving benchmark、EAGLE 风格投机解码，以及 AWQ W4A16 推理。
+LLM-Serve 是一个以单机单卡为基线、扩展到单机双卡 Prefill/Decode 分离的教学型 LLM 推理引擎，重点实现并验证高吞吐 serving 背后的核心机制：Paged KV Cache、continuous batching、chunked prefill、serving benchmark、EAGLE 风格投机解码，以及 AWQ W4A16 推理。
 
 项目早期骨架参考了 vLLM PagedAttention 论文和 `nano-vllm` 教学实现。后续 scheduler 改造、chunked prefill、benchmark 系统和 speculative decoding runtime 均在本仓库中独立设计与实现。
 
@@ -15,6 +15,7 @@ LLM-Serve 是一个面向单机单卡场景的教学型 LLM 推理引擎，重�
 - Chunked prefill：decode-first，把剩余 token budget 分给长 prompt prefill。
 - EAGLE 风格投机解码：batched draft、packed target verification、per-request draft KV、greedy verification，以及 acceptance/timing 指标；线性 target verify CUDA Graph 为显式 opt-in 路径。
 - AWQ W4A16：Qwen3 activation-aware 校准、标准 AutoAWQ GEMM checkpoint 导出、reference/Triton/CUDA Linear backend，以及 KV 容量准入。
+- 双卡 PD Serving：独立 Prefill/Decode Worker、continuous batching、logical KV handoff、可复用 pinned shared-memory KV slot、ACK/backpressure 流水线和 role-specific Decode CUDA Graph。
 - Serving benchmark：Poisson request-rate 扫描与 closed-loop 固定并发，覆盖吞吐、goodput、TTFT、TPOT、burst ITL、output-event latency、E2E、queue depth 和 speculative timing。
 - Qwen3-8B 单卡 BF16 路径，以及可选的固定候选树实验实现。
 
@@ -24,6 +25,7 @@ LLM-Serve 是一个面向单机单卡场景的教学型 LLM 推理引擎，重�
 - `llmserve/models/`：Qwen3 与 EAGLE3 网络定义和 checkpoint 加载。
 - `llmserve/speculative/`：draft、verification sampling、固定树与 Tree KV 管理。
 - `llmserve/quantization/`：Qwen3 AWQ 校准、逐层量化、checkpoint 导出和质量评估。
+- `llmserve/pd/`：双进程 Prefill/Decode 协议、KV handoff、共享槽位、Worker 生命周期和 serving 编排。
 - `llmserve/layers/`：attention、linear、sampling 等基础组件。
 - `benchmarks/`：workload、arrival、指标、单点 runner、suite runner、公开结果。
 - `tests/`：CPU 单元测试、可选真实 checkpoint 集成测试和 CUDA kernel 测试。
@@ -67,9 +69,23 @@ python -m benchmarks.run_suite \
 
 Stage 8 target verify CUDA Graph 对照使用 `benchmarks/suites/stage8-graph-formal.json`，在干净的 `3bb5d21` commit 上复现 1/4/8 并发三轮矩阵。
 
+双卡 PD KV Pipeline 对照使用 `benchmarks/suites/pd-kv-pipeline-formal.json`。Prefill 和 Decode Worker 默认分别使用 GPU 0/1，正式矩阵比较 Queue inline Tensor 与 pinned shared-memory slot 两种 KV transport。
+
 ## Benchmark 结果
 
 正式结果基于 commit `ad35e65`，Qwen3-8B + RedHatAI Qwen3-8B EAGLE3 speculator，BF16 eager，固定 `gamma=3`，argmax，单张 RTX 3090 24GB。每个配置重复三次；Poisson 与 closed-loop 回答不同问题，不能混成一个 speedup。
+
+### 双卡 PD KV Pipeline
+
+PD 对照基于 Qwen3-8B BF16、双 RTX 3090、`128 input / 64 output`、Prefill batch 4 和 Decode CUDA Graph。两组只改变 KV transport：inline 基线通过进程 Queue 传递 Tensor，shared 路径通过两个可复用 pinned shared-memory slot 传递 descriptor，并用 ACK 控制回收。
+
+| 并发 | Inline req/s | Shared req/s | 吞吐提升 | TTFT P50 |
+| :--- | ---: | ---: | ---: | ---: |
+| 32 | 16.29 | **17.89** | **1.098x** | 207 -> 132 ms |
+| 48 | 18.62 | **20.71** | **1.112x** | 227 -> 138 ms |
+| 64 | 21.31 | **28.11** | **1.319x** | 639 -> 136 ms |
+
+在并发 64 时，Prefill response Queue 从 `47.4 ms` 降至 `0.25 ms`，Decode admit 从 `14.5 ms` 降至 `1.13 ms`，Prefill roundtrip 从 `186.6 ms` 降至 `134.2 ms`；模型 forward 和 KV export/copy 基本不变。因此收益来自消除跨进程大 Tensor 序列化与 handoff 阻塞，而不是模型计算变快。18/18 个正式 point 全部完成，shared 路径零 inline fallback，所有槽位最终回收。完整结果见 [`benchmarks/results/pd-kv-pipeline-formal/`](benchmarks/results/pd-kv-pipeline-formal/)。
 
 ### EAGLE
 
@@ -121,7 +137,7 @@ LLM-Serve 自研 CUDA backend 的 runtime model memory 从 `15.276 GiB` 降至 `
 
 同一个自制 checkpoint 在 vLLM 0.11 AWQ-Marlin 上完成 24/24 个对照点，concurrency 1/4/8/16 的 AWQ/BF16 output throughput 为 `1.390x/1.316x/1.322x/1.316x`。这证明 checkpoint 格式与成熟 W4A16 backend 兼容；该吞吐收益属于 vLLM Marlin，不是 LLM-Serve 自研 CUDA kernel 的成绩。
 
-已有 serving 主线的 72 份脱敏 run JSON，以及 Stage 8 的 18 份 Graph 对照 run JSON、逐运行 CSV、三轮均值/标准差和 manifest，均位于 [`benchmarks/results/`](benchmarks/results/)。
+已有 serving 主线的 72 份脱敏 run JSON、Stage 8 的 18 份 Graph 对照，以及双卡 PD KV Pipeline 的 18 份精简脱敏 run、逐运行 CSV、三轮均值/标准差和 manifest，均位于 [`benchmarks/results/`](benchmarks/results/)。
 
 ## 指标口径
 
@@ -151,7 +167,7 @@ AWQ CUDA 测试、真实 checkpoint 生成和容量矩阵需要 RTX 3090 或其�
 
 ## 边界
 
-- 当前主配置是单卡 Qwen3-8B，不把双卡无 NVLink 环境包装成 tensor-parallel 性能平台。
+- 当前主配置是单卡 Qwen3-8B；双卡用于 Prefill/Decode 分离，不把无 NVLink 环境包装成 tensor-parallel 性能平台。
 - speculative CUDA Graph 目前只支持线性 EAGLE、greedy、单卡 TP=1，并通过显式开关启用；固定 batch/context bucket 之外自动 eager fallback。固定候选树默认关闭，不作为主性能结论。
 - AWQ runtime 只支持 Qwen3、AutoAWQ GEMM、W4A16 group-128、BF16 activation/scales、eager 和 TP=1；Marlin 对照仅作为外部 backend 控制实验。
 - 项目不提供 OpenAI HTTP API 层，benchmark 直接驱动 in-process engine，聚焦 runtime 与 scheduler。
