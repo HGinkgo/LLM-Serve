@@ -11,6 +11,11 @@ import torch
 from llmserve.engine.scheduler import SchedulerOutput
 from llmserve.pd.kv_transfer import export_logical_kv
 from llmserve.pd.protocol import KVTransferDescriptor, RequestEnvelope
+from llmserve.pd.shared_slots import (
+    KVSlotLease,
+    SharedKVSlotPool,
+    SharedKVSlotReader,
+)
 from llmserve.sampling_params import SamplingParams
 
 
@@ -19,7 +24,7 @@ class PrefillHandoff:
     envelope: RequestEnvelope
     first_token_id: int
     descriptor: KVTransferDescriptor
-    kv_payload: torch.Tensor
+    kv_payload: torch.Tensor | None = None
     prefill_timing_ms: dict[str, float | int] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -32,8 +37,12 @@ class PrefillHandoff:
             or self.descriptor.target_worker != "decode"
         ):
             raise ValueError("KV handoff has an invalid worker direction")
+        if self.descriptor.transport == "shared_slot":
+            if self.kv_payload is not None:
+                raise ValueError("shared-slot handoff cannot carry an inline tensor")
+            return
         if not isinstance(self.kv_payload, torch.Tensor):
-            raise ValueError("KV handoff payload must be a tensor")
+            raise ValueError("inline KV handoff payload must be a tensor")
         expected_shape = (
             2,
             self.descriptor.num_layers,
@@ -58,7 +67,18 @@ class PrefillHandoff:
         return self.envelope.request_id
 
 
-def _to_host_payload(payload: torch.Tensor) -> torch.Tensor:
+def _to_host_payload(
+    payload: torch.Tensor,
+    destination: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if destination is not None:
+        if tuple(destination.shape) != tuple(payload.shape):
+            raise ValueError("shared KV destination shape does not match payload")
+        non_blocking = payload.device.type == "cuda" and destination.is_pinned()
+        destination.copy_(payload, non_blocking=non_blocking)
+        if non_blocking:
+            torch.cuda.current_stream(payload.device).synchronize()
+        return destination
     if payload.device.type == "cpu":
         return payload.contiguous()
     host = torch.empty_like(
@@ -73,8 +93,9 @@ def _to_host_payload(payload: torch.Tensor) -> torch.Tensor:
 class PrefillWorkerRuntime:
     """Run prompt prefill and detach its prompt KV from the local engine."""
 
-    def __init__(self, engine):
+    def __init__(self, engine, slot_pool: SharedKVSlotPool | None = None):
         self.engine = engine
+        self.slot_pool = slot_pool
 
     def prefill(self, envelope: RequestEnvelope) -> PrefillHandoff:
         return self.prefill_batch([envelope])[0]
@@ -84,6 +105,8 @@ class PrefillWorkerRuntime:
         envelope: RequestEnvelope,
         seq,
         first_token_id: int,
+        slot_lease: KVSlotLease | None = None,
+        token_offset: int = 0,
     ) -> PrefillHandoff:
         logical_tokens = seq.num_prompt_tokens
         payload = export_logical_kv(
@@ -91,10 +114,22 @@ class PrefillWorkerRuntime:
             seq.block_table,
             logical_tokens,
         )
-        payload = _to_host_payload(payload)
+        transfer_id = f"{envelope.request_id}-{uuid4().hex}"
+        if slot_lease is not None:
+            destination = self.slot_pool.writable_view(
+                slot_lease,
+                token_offset=token_offset,
+                num_tokens=logical_tokens,
+            )
+            _to_host_payload(payload, destination)
+            host_payload = None
+            transport = "shared_slot"
+        else:
+            host_payload = _to_host_payload(payload)
+            transport = "inline"
         descriptor = KVTransferDescriptor(
             request_id=envelope.request_id,
-            transfer_id=f"{envelope.request_id}-{uuid4().hex}",
+            transfer_id=transfer_id,
             num_tokens=logical_tokens,
             num_layers=payload.size(1),
             num_kv_heads=payload.size(3),
@@ -102,13 +137,31 @@ class PrefillWorkerRuntime:
             dtype=str(payload.dtype).replace("torch.", ""),
             block_size=self.engine.model_runner.block_size,
             payload_nbytes=payload.numel() * payload.element_size(),
+            transport=transport,
+            slot_id=slot_lease.slot_id if slot_lease is not None else None,
+            slot_generation=(
+                slot_lease.generation if slot_lease is not None else None
+            ),
+            token_offset=token_offset,
         )
         return PrefillHandoff(
             envelope=envelope,
             first_token_id=int(first_token_id),
             descriptor=descriptor,
-            kv_payload=payload,
+            kv_payload=host_payload,
         )
+
+    def release_transfers(self, transfer_ids: list[str]) -> dict[str, int]:
+        if self.slot_pool is None:
+            if transfer_ids:
+                raise ValueError("inline Prefill Worker has no shared transfers")
+            return {}
+        transfer_ids = list(transfer_ids)
+        if transfer_ids:
+            self.slot_pool.mark_consuming(set(transfer_ids))
+            for transfer_id in transfer_ids:
+                self.slot_pool.ack(transfer_id)
+        return self.slot_pool.stats()
 
     def prefill_batch(
         self,
@@ -131,6 +184,16 @@ class PrefillWorkerRuntime:
         envelope_by_seq_id = {}
         owned_seq_ids = set()
         handoffs_by_request_id = {}
+        slot_lease = None
+        token_offsets = {}
+        if self.slot_pool is not None:
+            total_tokens = sum(len(envelope.prompt_token_ids) for envelope in envelopes)
+            if total_tokens <= self.slot_pool.handle.capacity_tokens:
+                slot_lease = self.slot_pool.acquire(total_tokens)
+                token_offset = 0
+                for envelope in envelopes:
+                    token_offsets[envelope.request_id] = token_offset
+                    token_offset += len(envelope.prompt_token_ids)
         batch_started_at = perf_counter()
         model_forward_ms = 0.0
         kv_export_copy_ms = 0.0
@@ -192,6 +255,11 @@ class PrefillWorkerRuntime:
                         envelope_by_seq_id[seq.seq_id],
                         seq,
                         token_id,
+                        slot_lease=slot_lease,
+                        token_offset=token_offsets.get(
+                            envelope_by_seq_id[seq.seq_id].request_id,
+                            0,
+                        ),
                     )
                     kv_export_copy_ms += (
                         perf_counter() - export_started_at
@@ -223,18 +291,34 @@ class PrefillWorkerRuntime:
             }
             for handoff in handoffs_by_request_id.values():
                 handoff.prefill_timing_ms = dict(batch_timing)
+            if slot_lease is not None:
+                self.slot_pool.mark_ready(
+                    slot_lease,
+                    {
+                        handoff.descriptor.transfer_id
+                        for handoff in handoffs_by_request_id.values()
+                    },
+                )
             return [handoffs_by_request_id[request_id] for request_id in request_ids]
         except Exception:
             for seq_id in list(owned_seq_ids):
                 self.engine.scheduler.remove_sequence(seq_by_id[seq_id])
+            if slot_lease is not None:
+                self.slot_pool.cancel(slot_lease)
             raise
 
 
 class DecodeWorkerRuntime:
     """Admit a Prefill handoff into the Decode Worker engine."""
 
-    def __init__(self, engine):
+    def __init__(self, engine, slot_reader: SharedKVSlotReader | None = None):
         self.engine = engine
+        self.slot_reader = slot_reader
+
+    def attach_shared_slots(self, handle):
+        if self.slot_reader is not None:
+            raise RuntimeError("Decode Worker shared KV slots are already attached")
+        self.slot_reader = SharedKVSlotReader(handle)
 
     def admit_batch(self, handoffs: list[PrefillHandoff]) -> list[dict]:
         handoffs = list(handoffs)
@@ -255,11 +339,17 @@ class DecodeWorkerRuntime:
             max_tokens=handoff.envelope.max_tokens,
             ignore_eos=handoff.envelope.ignore_eos,
         )
+        if handoff.descriptor.transport == "shared_slot":
+            if self.slot_reader is None:
+                raise RuntimeError("Decode Worker has no shared KV slot reader")
+            kv_payload = self.slot_reader.read_descriptor(handoff.descriptor)
+        else:
+            kv_payload = handoff.kv_payload
         seq_id = self.engine.add_prefilled_request(
             list(handoff.envelope.prompt_token_ids),
             handoff.first_token_id,
             sampling_params,
-            handoff.kv_payload,
+            kv_payload,
         )
         finished = (
             handoff.envelope.max_tokens <= 1
@@ -268,8 +358,11 @@ class DecodeWorkerRuntime:
                 and handoff.first_token_id == self.engine.scheduler.eos
             )
         )
-        return {
+        admission = {
             "seq_id": seq_id,
             "finished": finished,
             "output_token_ids": [handoff.first_token_id] if finished else None,
         }
+        if handoff.descriptor.transport == "shared_slot":
+            admission["transfer_id"] = handoff.descriptor.transfer_id
+        return admission

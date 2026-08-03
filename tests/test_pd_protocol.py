@@ -73,6 +73,43 @@ class TestKVTransferDescriptor(unittest.TestCase):
         with self.assertRaises(ValueError):
             KVTransferDescriptor(1, "x", 128, 36, 8, 128, "bfloat16", 256, -1)
 
+    def test_shared_slot_round_trip_preserves_transport_location(self):
+        descriptor = KVTransferDescriptor(
+            request_id=7,
+            transfer_id="handoff-7-1",
+            num_tokens=128,
+            num_layers=36,
+            num_kv_heads=8,
+            head_dim=128,
+            dtype="bfloat16",
+            block_size=256,
+            payload_nbytes=18874368,
+            transport="shared_slot",
+            slot_id=1,
+            slot_generation=3,
+            token_offset=256,
+        )
+
+        restored = KVTransferDescriptor.from_payload(descriptor.to_payload())
+
+        self.assertEqual(restored, descriptor)
+        self.assertEqual(restored.layout_version, 2)
+
+    def test_shared_slot_requires_complete_location_metadata(self):
+        with self.assertRaisesRegex(ValueError, "slot metadata"):
+            KVTransferDescriptor(
+                request_id=7,
+                transfer_id="handoff-7-1",
+                num_tokens=128,
+                num_layers=36,
+                num_kv_heads=8,
+                head_dim=128,
+                dtype="bfloat16",
+                block_size=256,
+                payload_nbytes=18874368,
+                transport="shared_slot",
+            )
+
 
 class TestRequestLifecycle(unittest.TestCase):
 

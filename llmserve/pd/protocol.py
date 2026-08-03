@@ -96,6 +96,10 @@ class KVTransferDescriptor:
     source_worker: str = "prefill"
     target_worker: str = "decode"
     layout_version: int = 1
+    transport: str = "inline"
+    slot_id: int | None = None
+    slot_generation: int | None = None
+    token_offset: int = 0
 
     def __post_init__(self):
         if not isinstance(self.request_id, int) or self.request_id < 0:
@@ -120,6 +124,21 @@ class KVTransferDescriptor:
             raise ValueError("source and target workers must differ")
         if self.layout_version <= 0:
             raise ValueError("layout_version must be positive")
+        if self.transport not in {"inline", "shared_slot"}:
+            raise ValueError("unsupported KV transport")
+        if self.transport == "shared_slot":
+            if (
+                not isinstance(self.slot_id, int)
+                or self.slot_id < 0
+                or not isinstance(self.slot_generation, int)
+                or self.slot_generation <= 0
+                or not isinstance(self.token_offset, int)
+                or self.token_offset < 0
+            ):
+                raise ValueError("shared KV transport requires complete slot metadata")
+            object.__setattr__(self, "layout_version", 2)
+        elif self.slot_id is not None or self.slot_generation is not None:
+            raise ValueError("inline KV transport cannot carry slot metadata")
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -135,6 +154,10 @@ class KVTransferDescriptor:
             "source_worker": self.source_worker,
             "target_worker": self.target_worker,
             "layout_version": self.layout_version,
+            "transport": self.transport,
+            "slot_id": self.slot_id,
+            "slot_generation": self.slot_generation,
+            "token_offset": self.token_offset,
         }
 
     @classmethod
@@ -153,6 +176,10 @@ class KVTransferDescriptor:
                 source_worker=payload.get("source_worker", "prefill"),
                 target_worker=payload.get("target_worker", "decode"),
                 layout_version=payload.get("layout_version", 1),
+                transport=payload.get("transport", "inline"),
+                slot_id=payload.get("slot_id"),
+                slot_generation=payload.get("slot_generation"),
+                token_offset=payload.get("token_offset", 0),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid KV transfer descriptor payload") from error

@@ -76,6 +76,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-prefill-batch-sweep.json",
                 "pd-decode-graph-formal.json",
                 "pd-prefill-graph-crossover.json",
+                "pd-kv-pipeline-smoke.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
                 "stage8-graph-smoke.json",
@@ -333,6 +334,11 @@ class BenchmarkSuiteTests(unittest.TestCase):
                         "worker_ms": 90.0,
                         "model_forward_ms": 80.0,
                         "kv_export_copy_ms": 4.0,
+                        "prefill_command_queue_ms": 1.0,
+                        "prefill_response_queue_ms": 5.0,
+                        "decode_command_queue_ms": 2.0,
+                        "decode_worker_admit_ms": 6.0,
+                        "decode_response_queue_ms": 3.0,
                     },
                 },
                 "kv_cache": {
@@ -363,6 +369,11 @@ class BenchmarkSuiteTests(unittest.TestCase):
         self.assertEqual(row["pd_prefill_worker_mean_ms"], 90.0)
         self.assertEqual(row["pd_prefill_model_forward_mean_ms"], 80.0)
         self.assertEqual(row["pd_prefill_kv_export_copy_mean_ms"], 4.0)
+        self.assertEqual(row["pd_prefill_command_queue_mean_ms"], 1.0)
+        self.assertEqual(row["pd_prefill_response_queue_mean_ms"], 5.0)
+        self.assertEqual(row["pd_decode_command_queue_mean_ms"], 2.0)
+        self.assertEqual(row["pd_decode_worker_admit_mean_ms"], 6.0)
+        self.assertEqual(row["pd_decode_response_queue_mean_ms"], 3.0)
         self.assertEqual(row["kv_total_blocks"], 321)
         self.assertEqual(row["kv_peak_reserved_blocks"], 256)
         self.assertEqual(row["kv_preemptions"], 0)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import multiprocessing as mp
 from queue import Empty
+from time import perf_counter
 from typing import Any
 
 from llmserve.pd.process import worker_main
@@ -25,6 +26,8 @@ class PDConfig:
     decode_init_method: str = "tcp://127.0.0.1:24432"
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
     request_timeout_seconds: float = 120.0
+    kv_slot_count: int = 2
+    kv_slot_capacity_tokens: int = 1024
 
     def __post_init__(self):
         if self.prefill_gpu < 0 or self.decode_gpu < 0:
@@ -35,6 +38,23 @@ class PDConfig:
             raise ValueError("worker distributed endpoints must be different")
         if self.request_timeout_seconds <= 0:
             raise ValueError("request timeout must be positive")
+        if (
+            not isinstance(self.kv_slot_count, int)
+            or self.kv_slot_count < 0
+            or self.kv_slot_count == 1
+        ):
+            raise ValueError("KV slot count must be zero or at least two")
+        if (
+            not isinstance(self.kv_slot_capacity_tokens, int)
+            or self.kv_slot_capacity_tokens <= 0
+        ):
+            raise ValueError("KV slot capacity must be a positive integer")
+
+    def transport_config(self) -> dict[str, int]:
+        return {
+            "slot_count": self.kv_slot_count,
+            "capacity_tokens": self.kv_slot_capacity_tokens,
+        }
 
     def engine_kwargs_for(self, role: str) -> dict[str, Any]:
         if role not in {"prefill", "decode"}:
@@ -67,6 +87,8 @@ class PDCoordinator:
         self.context = context or mp.get_context("spawn")
         self._workers: dict[str, Any] = {}
         self._started = False
+        self._transport_handle = None
+        self._last_rpc_timing: dict[str, dict[str, float | None]] = {}
 
     def start(self):
         if self._started:
@@ -87,6 +109,7 @@ class PDCoordinator:
                         self.config.engine_kwargs_for(role),
                         command_queue,
                         response_queue,
+                        self.config.transport_config(),
                     ),
                     name=f"llmserve-{role}-worker",
                 )
@@ -100,6 +123,18 @@ class PDCoordinator:
             for role in ("prefill", "decode"):
                 self._wait_worker_ready(role)
             self._started = True
+            prefill_ready = self._workers["prefill"].get("ready_result") or {}
+            self._transport_handle = prefill_ready.get("kv_slot_handle")
+            if self.config.kv_slot_count and self._transport_handle is None:
+                raise PDWorkerError("Prefill Worker did not publish shared KV slots")
+            if self._transport_handle is not None:
+                self._call(
+                    "decode",
+                    {
+                        "type": "attach_shared_slots",
+                        "handle": self._transport_handle,
+                    },
+                )
         except Exception:
             self._abort_startup()
             raise
@@ -126,6 +161,7 @@ class PDCoordinator:
                 f"{role} worker returned an invalid readiness response"
             )
         worker["ready"] = True
+        worker["ready_result"] = result
 
     def _abort_startup(self):
         for worker in self._workers.values():
@@ -144,13 +180,44 @@ class PDCoordinator:
         if not self._started:
             self.start()
         worker = self._workers[role]
+        command = dict(command)
+        parent_sent_at = perf_counter()
+        command["_rpc_parent_sent_at"] = parent_sent_at
         worker["commands"].put(command)
+        parent_put_at = perf_counter()
         try:
             response = worker["responses"].get(
                 timeout=self.config.request_timeout_seconds
             )
         except Empty as error:
             raise PDWorkerError(f"{role} worker timed out") from error
+        parent_received_at = perf_counter()
+        remote_timing = response.get("timing") or {}
+        worker_received_at = remote_timing.get("worker_received_at")
+        worker_reply_enqueued_at = remote_timing.get("worker_reply_enqueued_at")
+        timings = getattr(self, "_last_rpc_timing", None)
+        if timings is None:
+            self._last_rpc_timing = {}
+        self._last_rpc_timing[role] = {
+            "roundtrip_ms": (parent_received_at - parent_sent_at) * 1000,
+            "parent_queue_put_ms": (parent_put_at - parent_sent_at) * 1000,
+            "command_queue_ms": (
+                (worker_received_at - parent_put_at) * 1000
+                if worker_received_at is not None
+                else None
+            ),
+            "worker_service_ms": (
+                (worker_reply_enqueued_at - worker_received_at) * 1000
+                if worker_received_at is not None
+                and worker_reply_enqueued_at is not None
+                else None
+            ),
+            "response_queue_ms": (
+                (parent_received_at - worker_reply_enqueued_at) * 1000
+                if worker_reply_enqueued_at is not None
+                else None
+            ),
+        }
         if not response.get("ok"):
             error = response.get("error") or {}
             detail = (
@@ -160,6 +227,9 @@ class PDCoordinator:
             )
             raise PDWorkerError(f"{role} worker failed: {detail}")
         return response.get("result")
+
+    def last_rpc_timing(self, role: str) -> dict[str, float | None]:
+        return dict(getattr(self, "_last_rpc_timing", {}).get(role, {}))
 
     def worker_health(self) -> dict[str, dict[str, Any]]:
         """Return process-level health without sending a worker command."""
@@ -174,17 +244,27 @@ class PDCoordinator:
             }
         return health
 
-    def prefill_batch(self, envelopes):
+    def prefill_batch(self, envelopes, release_transfer_ids=()):
         return self._call(
             "prefill",
             {
                 "type": "prefill_batch",
                 "envelopes": [envelope.to_payload() for envelope in envelopes],
+                "release_transfer_ids": list(release_transfer_ids),
             },
         )
 
     def admit_batch(self, handoffs):
         return self._call("decode", {"type": "admit_batch", "handoffs": handoffs})
+
+    def release_prefill_transfers(self, transfer_ids):
+        return self._call(
+            "prefill",
+            {
+                "type": "release_transfers",
+                "transfer_ids": list(transfer_ids),
+            },
+        )
 
     def decode_step(self):
         return self._call("decode", {"type": "step"})
@@ -198,7 +278,7 @@ class PDCoordinator:
     def close(self):
         if not self._started:
             return
-        for role in ("prefill", "decode"):
+        for role in ("decode", "prefill"):
             worker = self._workers.get(role)
             if worker is None:
                 continue
@@ -216,6 +296,7 @@ class PDCoordinator:
             worker["responses"].close()
         self._workers.clear()
         self._started = False
+        self._transport_handle = None
 
     def __enter__(self):
         self.start()

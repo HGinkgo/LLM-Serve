@@ -254,6 +254,8 @@ class BenchmarkServeTests(unittest.TestCase):
             "pd": True,
             "prefill_enforce_eager": True,
             "decode_enforce_eager": False,
+            "kv_slot_count": 2,
+            "kv_slot_capacity_tokens": 1024,
         })
 
         def engine_factory(model, **kwargs):
@@ -271,6 +273,8 @@ class BenchmarkServeTests(unittest.TestCase):
 
         self.assertTrue(factory_calls[0]["prefill_enforce_eager"])
         self.assertFalse(factory_calls[0]["decode_enforce_eager"])
+        self.assertEqual(factory_calls[0]["kv_slot_count"], 2)
+        self.assertEqual(factory_calls[0]["kv_slot_capacity_tokens"], 1024)
 
     def test_closed_loop_result_reports_latency_sample_request_count(self):
         from benchmarks.serve import run_point

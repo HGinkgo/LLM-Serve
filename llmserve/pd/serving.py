@@ -30,6 +30,8 @@ class PDServingEngine:
         self._active_by_decode_seq: dict[int, int] = {}
         self._prefill_future: Future | None = None
         self._prefill_future_meta: dict | None = None
+        self._pending_transfer_acks: list[str] = []
+        self._slot_release_samples: list[dict] = []
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
         self.last_step_events: dict = {}
@@ -68,15 +70,32 @@ class PDServingEngine:
         while self._pending and len(batch) < self.prefill_batch_size:
             batch.append(self._pending.popleft())
         submitted_at = perf_counter()
+        release_transfer_ids = self._pending_transfer_acks
+        self._pending_transfer_acks = []
         self._prefill_future = self._executor.submit(
             self.coordinator.prefill_batch,
             batch,
+            release_transfer_ids=release_transfer_ids,
         )
         self._prefill_future_meta = {
             "request_ids": [envelope.request_id for envelope in batch],
             "batch_size": len(batch),
             "submitted_at": submitted_at,
+            "released_transfer_ids": list(release_transfer_ids),
         }
+
+    def _flush_transfer_acks(self):
+        if self._prefill_future is not None or not self._pending_transfer_acks:
+            return
+        transfer_ids = self._pending_transfer_acks
+        stats = self.coordinator.release_prefill_transfers(transfer_ids)
+        self._pending_transfer_acks = []
+        self._slot_release_samples.append(
+            {
+                "transfer_ids": list(transfer_ids),
+                "slot_stats": deepcopy(stats),
+            }
+        )
 
     def _collect_prefill(self):
         future = self._prefill_future
@@ -85,19 +104,28 @@ class PDServingEngine:
         meta = self._prefill_future_meta or {}
         handoffs = list(future.result())
         finished_at = perf_counter()
+        prefill_rpc_timing = self.coordinator.last_rpc_timing("prefill")
         if len(handoffs) != meta.get("batch_size"):
             raise RuntimeError("Prefill Worker returned an incomplete batch")
         self._prefill_future = None
         self._prefill_future_meta = None
+        self._start_prefill()
         admit_started_at = perf_counter()
         admissions = list(self.coordinator.admit_batch(handoffs))
         admit_finished_at = perf_counter()
+        decode_rpc_timing = self.coordinator.last_rpc_timing("decode")
         if len(admissions) != len(handoffs):
             raise RuntimeError("Decode Worker returned an incomplete admission batch")
         for handoff, admission in zip(handoffs, admissions):
             request_id = handoff.request_id
             if request_id not in self._requests:
                 raise RuntimeError("Decode Worker admitted an unknown request")
+            descriptor = getattr(handoff, "descriptor", None)
+            if getattr(descriptor, "transport", "inline") == "shared_slot":
+                transfer_id = admission.get("transfer_id")
+                if transfer_id != descriptor.transfer_id:
+                    raise RuntimeError("Decode Worker returned an invalid transfer ACK")
+                self._pending_transfer_acks.append(transfer_id)
             if admission.get("finished"):
                 self._requests[request_id]["finished_without_step"] = list(
                     admission.get("output_token_ids") or ()
@@ -137,8 +165,45 @@ class PDServingEngine:
                     if worker_total_ms is not None
                     else None
                 ),
+                "prefill_parent_queue_put_ms": prefill_rpc_timing.get(
+                    "parent_queue_put_ms"
+                ),
+                "prefill_command_queue_ms": prefill_rpc_timing.get(
+                    "command_queue_ms"
+                ),
+                "prefill_response_queue_ms": prefill_rpc_timing.get(
+                    "response_queue_ms"
+                ),
+                "decode_parent_queue_put_ms": decode_rpc_timing.get(
+                    "parent_queue_put_ms"
+                ),
+                "decode_command_queue_ms": decode_rpc_timing.get(
+                    "command_queue_ms"
+                ),
+                "decode_worker_admit_ms": decode_rpc_timing.get(
+                    "worker_service_ms"
+                ),
+                "decode_response_queue_ms": decode_rpc_timing.get(
+                    "response_queue_ms"
+                ),
+                "shared_slot_id": (
+                    getattr(getattr(handoffs[0], "descriptor", None), "slot_id", None)
+                    if handoffs
+                    else None
+                ),
+                "shared_slot_generation": (
+                    getattr(
+                        getattr(handoffs[0], "descriptor", None),
+                        "slot_generation",
+                        None,
+                    )
+                    if handoffs
+                    else None
+                ),
             }
         )
+        if self._prefill_future is None and not self._pending:
+            self._flush_transfer_acks()
         return True
 
     def _record_queue_sample(self):
@@ -151,6 +216,7 @@ class PDServingEngine:
                     self._prefill_future is not None
                     and not self._prefill_future.done()
                 ),
+                "pending_transfer_acks": len(self._pending_transfer_acks),
             }
         )
 
@@ -168,6 +234,7 @@ class PDServingEngine:
                 self._collect_prefill()
                 self._start_prefill()
             if not self._active_by_decode_seq:
+                self._flush_transfer_acks()
                 finished = []
                 for request_id, request in self._requests.items():
                     token_ids = request.pop("finished_without_step", None)
@@ -200,7 +267,12 @@ class PDServingEngine:
         return outputs, int(result.get("num_tokens", 0))
 
     def is_finished(self):
-        return not self._pending and self._prefill_future is None and not self._active_by_decode_seq
+        return (
+            not self._pending
+            and self._prefill_future is None
+            and not self._active_by_decode_seq
+            and not self._pending_transfer_acks
+        )
 
     def reset_metrics(self):
         if not self.is_finished():
@@ -258,6 +330,11 @@ class PDServingEngine:
             "kv_export_copy_ms": "prefill_kv_export_copy_ms",
             "parent_overhead_ms": "prefill_parent_overhead_ms",
             "forward_calls": "prefill_forward_calls",
+            "prefill_command_queue_ms": "prefill_command_queue_ms",
+            "prefill_response_queue_ms": "prefill_response_queue_ms",
+            "decode_command_queue_ms": "decode_command_queue_ms",
+            "decode_worker_admit_ms": "decode_worker_admit_ms",
+            "decode_response_queue_ms": "decode_response_queue_ms",
         }
         prefill_timing = {}
         for output_name, field_name in timing_fields.items():
@@ -279,6 +356,7 @@ class PDServingEngine:
             "prefill_batches_detail": deepcopy(self._prefill_batches),
             "prefill_timing": prefill_timing,
             "queue_samples": deepcopy(self._queue_samples),
+            "slot_release_samples": deepcopy(self._slot_release_samples),
             "worker_health": self.coordinator.worker_health(),
         }
         return {"requests": sorted(requests, key=lambda item: item["seq_id"]), "summary": summary}

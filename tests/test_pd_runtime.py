@@ -11,6 +11,7 @@ from llmserve.pd.runtime import (
     PrefillHandoff,
     PrefillWorkerRuntime,
 )
+from llmserve.pd.shared_slots import SharedKVSlotPool, SharedKVSlotReader
 from llmserve.sampling_params import SamplingParams
 
 
@@ -225,6 +226,59 @@ class TestPDRuntime(unittest.TestCase):
         self.assertGreaterEqual(timing["worker_total_ms"], 0.0)
         self.assertGreaterEqual(timing["model_forward_ms"], 0.0)
         self.assertGreaterEqual(timing["kv_export_copy_ms"], 0.0)
+
+    def test_shared_slot_handoff_carries_only_descriptors_and_decode_reads_slices(self):
+        prefill_engine = FakeBatchPrefillEngine()
+        prefill_engine.model_runner.kv_cache[:, :, 0] = 7.0
+        prefill_engine.model_runner.kv_cache[:, :, 1] = 8.0
+        pool = SharedKVSlotPool.create(
+            slot_count=2,
+            capacity_tokens=8,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+        )
+        envelopes = [
+            RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True),
+            RequestEnvelope(8, (5, 6), 4, 1.0, True),
+        ]
+
+        handoffs = PrefillWorkerRuntime(prefill_engine, slot_pool=pool).prefill_batch(
+            envelopes
+        )
+
+        self.assertTrue(all(handoff.kv_payload is None for handoff in handoffs))
+        self.assertEqual(
+            [handoff.descriptor.transport for handoff in handoffs],
+            ["shared_slot", "shared_slot"],
+        )
+        self.assertEqual(
+            [handoff.descriptor.token_offset for handoff in handoffs],
+            [0, 4],
+        )
+
+        decode_engine = FakeDecodeEngine()
+        reader = SharedKVSlotReader(pool.handle, register_cuda=False)
+        admissions = DecodeWorkerRuntime(
+            decode_engine,
+            slot_reader=reader,
+        ).admit_batch(handoffs)
+
+        self.assertEqual(
+            [admission["transfer_id"] for admission in admissions],
+            [handoff.descriptor.transfer_id for handoff in handoffs],
+        )
+        self.assertEqual(
+            [float(call[0][3][0, 0, 0, 0, 0]) for call in decode_engine.calls],
+            [7.0, 8.0],
+        )
+
+        PrefillWorkerRuntime(prefill_engine, slot_pool=pool).release_transfers(
+            [handoff.descriptor.transfer_id for handoff in handoffs]
+        )
+        self.assertEqual(pool.stats()["free_slots"], 2)
 
     def test_prefill_runtime_completes_partial_chunks_before_handoff(self):
         engine = FakeChunkedPrefillEngine()

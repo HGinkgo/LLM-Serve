@@ -58,6 +58,37 @@ class TestPDConfig(unittest.TestCase):
         self.assertTrue(config.engine_kwargs_for("prefill")["enforce_eager"])
         self.assertFalse(config.engine_kwargs_for("decode")["enforce_eager"])
 
+    def test_shared_slot_config_is_transport_only_and_validated(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            kv_slot_count=2,
+            kv_slot_capacity_tokens=1024,
+        )
+
+        self.assertEqual(
+            config.transport_config(),
+            {"slot_count": 2, "capacity_tokens": 1024},
+        )
+        self.assertNotIn("kv_slot_count", config.engine_kwargs_for("prefill"))
+
+        with self.assertRaisesRegex(ValueError, "slot count"):
+            PDConfig(
+                model="/models/qwen3",
+                prefill_gpu=0,
+                decode_gpu=1,
+                kv_slot_count=1,
+            )
+
+        disabled = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            kv_slot_count=0,
+        )
+        self.assertEqual(disabled.transport_config()["slot_count"], 0)
+
     def test_rejects_same_gpu_for_both_workers(self):
         with self.assertRaises(ValueError):
             PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=0)
@@ -94,11 +125,44 @@ class TestPDConfig(unittest.TestCase):
         }
         envelope = RequestEnvelope(7, (1, 2, 3), 4, 1.0, True)
 
-        result = coordinator.prefill_batch([envelope])
+        result = coordinator.prefill_batch(
+            [envelope],
+            release_transfer_ids=["transfer-previous"],
+        )
 
         self.assertEqual(result, ["handoff"])
         self.assertEqual(queue.commands[0]["type"], "prefill_batch")
         self.assertEqual(queue.commands[0]["envelopes"], [envelope.to_payload()])
+        self.assertEqual(
+            queue.commands[0]["release_transfer_ids"],
+            ["transfer-previous"],
+        )
+        timing = coordinator.last_rpc_timing("prefill")
+        self.assertGreaterEqual(timing["roundtrip_ms"], 0.0)
+        self.assertIn("parent_queue_put_ms", timing)
+
+    def test_admit_batch_tracks_descriptor_only_transfer_ids(self):
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        queue = FakeQueue(
+            responses=[
+                {
+                    "ok": True,
+                    "result": [{"seq_id": 9, "transfer_id": "transfer-7"}],
+                }
+            ]
+        )
+        coordinator._workers = {
+            "decode": {"commands": queue, "responses": queue},
+        }
+
+        result = coordinator.admit_batch(["descriptor-only-handoff"])
+
+        self.assertEqual(result[0]["transfer_id"], "transfer-7")
+        self.assertEqual(queue.commands[0]["type"], "admit_batch")
 
     def test_worker_rpc_surfaces_remote_error(self):
         config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)

@@ -11,6 +11,8 @@ class FakePDCoordinator:
 
     def __init__(self):
         self.prefill_calls = []
+        self.prefill_release_calls = []
+        self.explicit_release_calls = []
         self.admit_calls = []
         self.decode_calls = 0
         self.decode_called = Event()
@@ -21,8 +23,9 @@ class FakePDCoordinator:
     def start(self):
         return None
 
-    def prefill_batch(self, envelopes):
+    def prefill_batch(self, envelopes, release_transfer_ids=()):
         self.prefill_calls.append(list(envelopes))
+        self.prefill_release_calls.append(list(release_transfer_ids))
         if len(self.prefill_calls) == 2:
             self.second_prefill_started.set()
             if not self.allow_second_prefill.wait(timeout=2):
@@ -51,6 +54,27 @@ class FakePDCoordinator:
             }
             for handoff in handoffs
         ]
+
+    def release_prefill_transfers(self, transfer_ids):
+        self.explicit_release_calls.append(list(transfer_ids))
+        return {"free_slots": 2}
+
+    def last_rpc_timing(self, role):
+        if role == "prefill":
+            return {
+                "roundtrip_ms": 12.0,
+                "parent_queue_put_ms": 0.1,
+                "command_queue_ms": 0.2,
+                "worker_service_ms": 10.0,
+                "response_queue_ms": 1.7,
+            }
+        return {
+            "roundtrip_ms": 3.0,
+            "parent_queue_put_ms": 0.1,
+            "command_queue_ms": 0.2,
+            "worker_service_ms": 2.0,
+            "response_queue_ms": 0.7,
+        }
 
     def decode_step(self):
         self.decode_calls += 1
@@ -178,6 +202,73 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual(
             engine.get_metrics()["summary"]["pd"]["prefill_timing"]["worker_ms"],
             12.0,
+        )
+
+    def test_metrics_split_prefill_and_admit_rpc_queue_latency(self):
+        coordinator = FakePDCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine.add_request([1, 2], SamplingParams(max_tokens=1))
+
+        engine.step()
+        timing = engine.get_metrics()["summary"]["pd"]["prefill_batches_detail"][0]
+
+        self.assertEqual(timing["prefill_command_queue_ms"], 0.2)
+        self.assertEqual(timing["prefill_response_queue_ms"], 1.7)
+        self.assertEqual(timing["decode_command_queue_ms"], 0.2)
+        self.assertEqual(timing["decode_worker_admit_ms"], 2.0)
+        self.assertEqual(timing["decode_response_queue_ms"], 0.7)
+
+    def test_shared_transfer_ack_is_piggybacked_then_tail_is_flushed(self):
+        class SharedCoordinator(FakePDCoordinator):
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                self.prefill_calls.append(list(envelopes))
+                self.prefill_release_calls.append(list(release_transfer_ids))
+                return [
+                    SimpleNamespace(
+                        request_id=envelope.request_id,
+                        descriptor=SimpleNamespace(
+                            transport="shared_slot",
+                            transfer_id=f"transfer-{envelope.request_id}",
+                            slot_id=envelope.request_id % 2,
+                            slot_generation=1,
+                        ),
+                        prefill_timing_ms={
+                            "worker_total_ms": 12.0,
+                            "model_forward_ms": 8.0,
+                            "kv_export_copy_ms": 2.0,
+                            "forward_calls": 1,
+                        },
+                    )
+                    for envelope in envelopes
+                ]
+
+            def admit_batch(self, handoffs):
+                self.admit_calls.append(list(handoffs))
+                return [
+                    {
+                        "seq_id": 100 + handoff.request_id,
+                        "finished": False,
+                        "output_token_ids": None,
+                        "transfer_id": handoff.descriptor.transfer_id,
+                    }
+                    for handoff in handoffs
+                ]
+
+        coordinator = SharedCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        for token in (1, 2, 3):
+            engine.add_request([token], SamplingParams(max_tokens=2))
+
+        while not engine.is_finished():
+            engine.step()
+
+        self.assertEqual(
+            coordinator.prefill_release_calls,
+            [[], [], ["transfer-0"]],
+        )
+        self.assertEqual(
+            coordinator.explicit_release_calls,
+            [["transfer-1", "transfer-2"]],
         )
 
 

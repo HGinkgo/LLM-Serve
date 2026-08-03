@@ -16,6 +16,8 @@ def build_parser():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--enable-chunked-prefill", action="store_true")
     parser.add_argument("--prompt-repeat", type=int, default=1)
+    parser.add_argument("--kv-slot-count", type=int, default=2)
+    parser.add_argument("--kv-slot-capacity-tokens", type=int, default=1024)
     parser.add_argument("--print-metrics", action="store_true")
     return parser
 
@@ -45,6 +47,8 @@ def main():
         model=args.model,
         prefill_gpu=args.prefill_gpu,
         decode_gpu=args.decode_gpu,
+        kv_slot_count=args.kv_slot_count,
+        kv_slot_capacity_tokens=args.kv_slot_capacity_tokens,
         engine_kwargs={
             "max_model_len": args.max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,

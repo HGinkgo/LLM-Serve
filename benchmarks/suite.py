@@ -191,6 +191,21 @@ def build_summary_rows(results: list[dict]) -> list[dict]:
         "pd_prefill_parent_overhead_mean_ms": (
             "metrics.pd.prefill_timing.parent_overhead_ms", 1.0
         ),
+        "pd_prefill_command_queue_mean_ms": (
+            "metrics.pd.prefill_timing.prefill_command_queue_ms", 1.0
+        ),
+        "pd_prefill_response_queue_mean_ms": (
+            "metrics.pd.prefill_timing.prefill_response_queue_ms", 1.0
+        ),
+        "pd_decode_command_queue_mean_ms": (
+            "metrics.pd.prefill_timing.decode_command_queue_ms", 1.0
+        ),
+        "pd_decode_worker_admit_mean_ms": (
+            "metrics.pd.prefill_timing.decode_worker_admit_ms", 1.0
+        ),
+        "pd_decode_response_queue_mean_ms": (
+            "metrics.pd.prefill_timing.decode_response_queue_ms", 1.0
+        ),
         "pd_prefill_forward_calls_mean": (
             "metrics.pd.prefill_timing.forward_calls", 1.0
         ),

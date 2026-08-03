@@ -82,6 +82,8 @@ def _default_pd_engine_factory(model, **kwargs):
     prefill_batch_size = kwargs.pop("prefill_batch_size", 1)
     prefill_enforce_eager = kwargs.pop("prefill_enforce_eager", True)
     decode_enforce_eager = kwargs.pop("decode_enforce_eager", True)
+    kv_slot_count = kwargs.pop("kv_slot_count", 2)
+    kv_slot_capacity_tokens = kwargs.pop("kv_slot_capacity_tokens", 1024)
     coordinator = PDCoordinator(
         PDConfig(
             model=model,
@@ -91,6 +93,8 @@ def _default_pd_engine_factory(model, **kwargs):
             decode_enforce_eager=decode_enforce_eager,
             prefill_init_method=prefill_init_method,
             decode_init_method=decode_init_method,
+            kv_slot_count=kv_slot_count,
+            kv_slot_capacity_tokens=kv_slot_capacity_tokens,
             engine_kwargs=kwargs,
         )
     )
@@ -223,6 +227,10 @@ def run_point(
                 ),
                 "prefill_init_method": runtime.get("prefill_init_method"),
                 "decode_init_method": runtime.get("decode_init_method"),
+                "kv_slot_count": runtime.get("kv_slot_count", 2),
+                "kv_slot_capacity_tokens": runtime.get(
+                    "kv_slot_capacity_tokens", 1024
+                ),
             }
         )
     if distributed_init_method is not None:
