@@ -119,6 +119,24 @@ class FakeDraftModel:
 
 class ModelRunnerSpeculativeTest(unittest.TestCase):
 
+    def test_cuda_graph_metrics_report_replays_and_fallbacks(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.enforce_eager = False
+        runner.graphs = {1: object(), 2: object()}
+        runner.cudagraph_replays = 7
+        runner.cudagraph_replays_by_bs = {1: 5, 2: 2}
+        runner.cudagraph_replays_by_graph_size = {1: 3, 2: 4}
+        runner.cudagraph_fallbacks = {"prefill": 3}
+
+        metrics = ModelRunner.get_cuda_graph_metrics(runner)
+
+        self.assertTrue(metrics["enabled"])
+        self.assertEqual(metrics["captured_graphs"], 2)
+        self.assertEqual(metrics["replays"], 7)
+        self.assertEqual(metrics["replays_by_batch_size"], {1: 5, 2: 2})
+        self.assertEqual(metrics["replays_by_graph_size"], {1: 3, 2: 4})
+        self.assertEqual(metrics["fallbacks"], {"prefill": 3})
+
     def make_aux_hidden(self, markers):
         aux = torch.zeros(len(markers), 12)
         for i, marker in enumerate(markers):

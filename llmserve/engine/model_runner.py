@@ -58,6 +58,10 @@ class ModelRunner:
         self._prefill_aux_chunks = {}
         self._prev_correction = {}
         self.sampler = Sampler()
+        self.cudagraph_replays = 0
+        self.cudagraph_replays_by_bs = {}
+        self.cudagraph_replays_by_graph_size = {}
+        self.cudagraph_fallbacks = {}
         self.warmup_model()
         # 真正跑一次模型，把模型执行的峰值显存测出来，计算给 KV cache 留多少空间
         self.allocate_kv_cache()
@@ -223,8 +227,17 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        budget_bytes = int(
+            total * config.gpu_memory_utilization - used - peak + current
+        )
+        config.num_kvcache_blocks = budget_bytes // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError(
+                "insufficient GPU memory for one KV cache block: "
+                f"budget={budget_bytes} bytes, block={block_bytes} bytes, "
+                f"total={total}, used={used}, peak={peak}, current={current}, "
+                f"utilization={config.gpu_memory_utilization}"
+            )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         attention_layers = [
             module for module in self.model.modules()
@@ -270,6 +283,42 @@ class ModelRunner:
         if graph_backend is not None:
             metrics["speculative_cuda_graph"] = graph_backend.metrics()
         return metrics
+
+    def get_cuda_graph_metrics(self):
+        graphs = getattr(self, "graphs", {})
+        return {
+            "enabled": not self.enforce_eager,
+            "captured_graphs": len(graphs),
+            "replays": getattr(self, "cudagraph_replays", 0),
+            "replays_by_batch_size": dict(
+                sorted(
+                    getattr(self, "cudagraph_replays_by_bs", {}).items(),
+                    key=lambda item: item[0],
+                )
+            ),
+            "replays_by_graph_size": dict(
+                sorted(
+                    getattr(self, "cudagraph_replays_by_graph_size", {}).items(),
+                    key=lambda item: item[0],
+                )
+            ),
+            "fallbacks": dict(
+                sorted(
+                    getattr(self, "cudagraph_fallbacks", {}).items(),
+                )
+            ),
+        }
+
+    def reset_cuda_graph_metrics(self):
+        self.cudagraph_replays = 0
+        self.cudagraph_replays_by_bs.clear()
+        self.cudagraph_replays_by_graph_size.clear()
+        self.cudagraph_fallbacks.clear()
+
+    def _record_cudagraph_fallback(self, reason: str):
+        self.cudagraph_fallbacks[reason] = (
+            self.cudagraph_fallbacks.get(reason, 0) + 1
+        )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -355,12 +404,20 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill:
+            if not self.enforce_eager:
+                self._record_cudagraph_fallback("prefill")
+            return self.model.compute_logits(self.model(input_ids, positions))
+        if self.enforce_eager:
+            return self.model.compute_logits(self.model(input_ids, positions))
+        if input_ids.size(0) > 512:
+            self._record_cudagraph_fallback("batch_over_512")
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_size = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[graph_size]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -370,6 +427,13 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
+            self.cudagraph_replays += 1
+            self.cudagraph_replays_by_bs[bs] = (
+                self.cudagraph_replays_by_bs.get(bs, 0) + 1
+            )
+            self.cudagraph_replays_by_graph_size[graph_size] = (
+                self.cudagraph_replays_by_graph_size.get(graph_size, 0) + 1
+            )
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     @torch.inference_mode()

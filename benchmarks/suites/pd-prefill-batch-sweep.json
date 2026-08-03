@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "name": "pd-prefill-batch-sweep",
+  "runs": 3,
+  "profiles": {
+    "decode-heavy": {
+      "classes": [
+        {
+          "name": "decode",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 64
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "pd-prefill-batch",
+      "arrival": "closed-loop",
+      "profile": "decode-heavy",
+      "max_concurrencies": [32, 48, 64],
+      "warmup_seconds": 30,
+      "measurement_seconds": 60,
+      "variants": [
+        {
+          "name": "baseline"
+        },
+        {
+          "name": "pd-b1",
+          "pd": true,
+          "prefill_batch_size": 1
+        },
+        {
+          "name": "pd-b2",
+          "pd": true,
+          "prefill_batch_size": 2
+        },
+        {
+          "name": "pd-b4",
+          "pd": true,
+          "prefill_batch_size": 4
+        },
+        {
+          "name": "pd-b8",
+          "pd": true,
+          "prefill_batch_size": 8
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "argmax_sampler": false,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9
+      },
+      "slo_ms": {
+        "ttft": 10000,
+        "tpot": 250,
+        "e2e": 120000
+      }
+    }
+  ]
+}

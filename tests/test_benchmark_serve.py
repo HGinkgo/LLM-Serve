@@ -212,6 +212,66 @@ class BenchmarkServeTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["kv_cache"]["total_blocks"], 321)
         self.assertEqual(result["metrics"]["kv_cache"]["preemptions"], 0)
 
+    def test_run_point_preserves_pd_metrics_in_unified_result(self):
+        from benchmarks.serve import run_point
+
+        class PDFakeEngine(FakeEngine):
+            def get_metrics(self):
+                metrics = super().get_metrics()
+                metrics["summary"]["pd"] = {
+                    "prefill_batches": 2,
+                    "prefill_batch_size_mean": 1.0,
+                }
+                metrics["summary"]["cuda_graph"] = {
+                    "enabled": True,
+                    "replays": 4,
+                }
+                return metrics
+
+        point = make_point()
+        point["runtime"]["pd"] = True
+        clock = FakeClock()
+        result = run_point(
+            point,
+            model="/models/Qwen3-8B",
+            engine_factory=lambda *args, **kwargs: PDFakeEngine(clock),
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(result["metrics"]["pd"]["prefill_batches"], 2)
+        self.assertTrue(result["metrics"]["cuda_graph"]["enabled"])
+        self.assertEqual(result["metrics"]["cuda_graph"]["replays"], 4)
+
+    def test_run_point_passes_pd_worker_eager_modes(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        factory_calls = []
+        point = make_point()
+        point["runtime"].update({
+            "pd": True,
+            "prefill_enforce_eager": True,
+            "decode_enforce_eager": False,
+        })
+
+        def engine_factory(model, **kwargs):
+            factory_calls.append(kwargs)
+            return FakeEngine(clock)
+
+        run_point(
+            point,
+            model="/models/Qwen3-8B",
+            engine_factory=engine_factory,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertTrue(factory_calls[0]["prefill_enforce_eager"])
+        self.assertFalse(factory_calls[0]["decode_enforce_eager"])
+
     def test_closed_loop_result_reports_latency_sample_request_count(self):
         from benchmarks.serve import run_point
 

@@ -57,6 +57,46 @@ def _default_engine_factory(model, **kwargs):
     return LLM(model, **kwargs)
 
 
+def _next_worker_endpoint(endpoint: str | None):
+    if endpoint and endpoint.startswith("tcp://"):
+        try:
+            prefix, port = endpoint.rsplit(":", 1)
+            return f"{prefix}:{int(port) + 1}"
+        except (TypeError, ValueError):
+            pass
+    return "tcp://127.0.0.1:24432"
+
+
+def _default_pd_engine_factory(model, **kwargs):
+    from llmserve.pd import PDConfig, PDCoordinator, PDServingEngine
+
+    distributed_init_method = kwargs.pop("distributed_init_method", None)
+    prefill_init_method = kwargs.pop("prefill_init_method", None)
+    decode_init_method = kwargs.pop("decode_init_method", None)
+    if prefill_init_method is None:
+        prefill_init_method = distributed_init_method or "tcp://127.0.0.1:24431"
+    if decode_init_method is None:
+        decode_init_method = _next_worker_endpoint(prefill_init_method)
+    prefill_gpu = kwargs.pop("prefill_gpu", 0)
+    decode_gpu = kwargs.pop("decode_gpu", 1)
+    prefill_batch_size = kwargs.pop("prefill_batch_size", 1)
+    prefill_enforce_eager = kwargs.pop("prefill_enforce_eager", True)
+    decode_enforce_eager = kwargs.pop("decode_enforce_eager", True)
+    coordinator = PDCoordinator(
+        PDConfig(
+            model=model,
+            prefill_gpu=prefill_gpu,
+            decode_gpu=decode_gpu,
+            prefill_enforce_eager=prefill_enforce_eager,
+            decode_enforce_eager=decode_enforce_eager,
+            prefill_init_method=prefill_init_method,
+            decode_init_method=decode_init_method,
+            engine_kwargs=kwargs,
+        )
+    )
+    return PDServingEngine(coordinator, prefill_batch_size=prefill_batch_size)
+
+
 def _default_sampling_params(spec):
     from llmserve import SamplingParams
 
@@ -135,8 +175,14 @@ def run_point(
     enable_speculative = runtime.get("enable_speculative", False)
     if enable_speculative and not speculative_model:
         raise ValueError("speculative_model is required for speculative variants")
+    if runtime.get("pd", False) and enable_speculative:
+        raise ValueError("PD benchmark currently requires speculative decoding to be disabled")
 
-    engine_factory = engine_factory or _default_engine_factory
+    engine_factory = engine_factory or (
+        _default_pd_engine_factory
+        if runtime.get("pd", False)
+        else _default_engine_factory
+    )
     make_sampling_params = make_sampling_params or _default_sampling_params
     active_speculative_model = speculative_model if enable_speculative else None
     engine_kwargs = {
@@ -163,10 +209,26 @@ def run_point(
             "enable_speculative_cuda_graph", False
         ),
     }
+    if runtime.get("pd", False):
+        engine_kwargs.update(
+            {
+                "prefill_gpu": runtime.get("prefill_gpu", 0),
+                "decode_gpu": runtime.get("decode_gpu", 1),
+                "prefill_batch_size": runtime.get("prefill_batch_size", 1),
+                "prefill_enforce_eager": runtime.get(
+                    "prefill_enforce_eager", True
+                ),
+                "decode_enforce_eager": runtime.get(
+                    "decode_enforce_eager", True
+                ),
+                "prefill_init_method": runtime.get("prefill_init_method"),
+                "decode_init_method": runtime.get("decode_init_method"),
+            }
+        )
     if distributed_init_method is not None:
         engine_kwargs["distributed_init_method"] = distributed_init_method
     engine = engine_factory(model, **engine_kwargs)
-    if runtime.get("argmax_sampler", False):
+    if runtime.get("argmax_sampler", False) and hasattr(engine, "model_runner"):
         engine.model_runner.sampler = ArgmaxSampler()
     classes = _workload_classes(point)
     try:
@@ -235,6 +297,10 @@ def run_point(
         if name in engine_speculative:
             metrics["speculative"][name] = engine_speculative[name]
     metrics["kv_cache"] = observation["engine_summary"].get("kv_cache", {})
+    metrics["pd"] = observation["engine_summary"].get("pd", {})
+    metrics["cuda_graph"] = observation["engine_summary"].get(
+        "cuda_graph", {}
+    )
 
     public_config = deepcopy(point)
     public_config["model"] = Path(model).name

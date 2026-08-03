@@ -76,6 +76,33 @@ class SchedulerSpeculativeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "KV capacity"):
             scheduler.add(Sequence([1, 2, 3, 4], sampling))
 
+    def test_remove_sequence_releases_local_kv_ownership(self):
+        scheduler = self.make_scheduler()
+        seq = Sequence([1, 2, 3, 4, 5])
+        scheduler.block_manager.allocate(seq)
+        scheduler.running.append(seq)
+
+        scheduler.remove_sequence(seq)
+        scheduler.remove_sequence(seq)
+
+        self.assertEqual(list(scheduler.running), [])
+        self.assertEqual(list(scheduler.waiting), [])
+        self.assertEqual(len(scheduler.block_manager.used_block_ids), 0)
+        self.assertEqual(len(scheduler.block_manager.free_block_ids), 8)
+
+    def test_admit_prefilled_sequence_allocates_decode_worker_blocks(self):
+        scheduler = self.make_scheduler()
+        sampling = SimpleNamespace(temperature=1.0, max_tokens=8, ignore_eos=True)
+        seq = Sequence([1, 2, 3, 4], sampling)
+        seq.append_token(77)
+
+        scheduler.admit_prefilled(seq, cached_tokens=4)
+
+        self.assertEqual(seq.num_cached_tokens, 4)
+        self.assertEqual(seq.status, SequenceStatus.RUNNING)
+        self.assertEqual(list(scheduler.running), [seq])
+        self.assertEqual(len(seq.block_table), 2)
+
     def test_schedule_returns_explicit_mixed_batch_groups_without_negative_sentinel(self):
         scheduler = self.make_scheduler()
         running = Sequence([1, 2, 3, 4])

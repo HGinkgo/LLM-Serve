@@ -166,6 +166,34 @@ def build_summary_rows(results: list[dict]) -> list[dict]:
         "speculative_batch_size_mean": (
             "metrics.speculative_batch_size.mean", 1.0
         ),
+        "cuda_graph_captured_graphs": (
+            "metrics.cuda_graph.captured_graphs", 1.0
+        ),
+        "cuda_graph_replays": ("metrics.cuda_graph.replays", 1.0),
+        "pd_prefill_roundtrip_mean_ms": (
+            "metrics.pd.prefill_timing.roundtrip_ms", 1.0
+        ),
+        "pd_prefill_admit_mean_ms": (
+            "metrics.pd.prefill_timing.admit_ms", 1.0
+        ),
+        "pd_prefill_handoff_path_mean_ms": (
+            "metrics.pd.prefill_timing.handoff_path_ms", 1.0
+        ),
+        "pd_prefill_worker_mean_ms": (
+            "metrics.pd.prefill_timing.worker_ms", 1.0
+        ),
+        "pd_prefill_model_forward_mean_ms": (
+            "metrics.pd.prefill_timing.model_forward_ms", 1.0
+        ),
+        "pd_prefill_kv_export_copy_mean_ms": (
+            "metrics.pd.prefill_timing.kv_export_copy_ms", 1.0
+        ),
+        "pd_prefill_parent_overhead_mean_ms": (
+            "metrics.pd.prefill_timing.parent_overhead_ms", 1.0
+        ),
+        "pd_prefill_forward_calls_mean": (
+            "metrics.pd.prefill_timing.forward_calls", 1.0
+        ),
         "kv_total_blocks": ("metrics.kv_cache.total_blocks", 1.0),
         "kv_peak_reserved_blocks": (
             "metrics.kv_cache.peak_reserved_blocks", 1.0

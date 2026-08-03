@@ -7,6 +7,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer                  # prompt 编码，输出 token 编码
+import torch
 import torch.multiprocessing as mp
 
 from llmserve.config import Config
@@ -14,6 +15,7 @@ from llmserve.sampling_params import SamplingParams
 from llmserve.engine.sequence import Sequence
 from llmserve.engine.scheduler import Scheduler
 from llmserve.engine.model_runner import ModelRunner
+from llmserve.pd.kv_transfer import import_logical_kv
 
 
 class LLMEngine:
@@ -88,22 +90,23 @@ class LLMEngine:
         reset_scheduler_metrics = getattr(self.scheduler, "reset_metrics", None)
         if reset_scheduler_metrics is not None:
             reset_scheduler_metrics()
+        model_runner = getattr(self, "model_runner", None)
+        reset_graph_metrics = getattr(
+            model_runner, "reset_cuda_graph_metrics", None
+        )
+        if reset_graph_metrics is not None:
+            reset_graph_metrics()
 
-    # 把用户请求放进系统
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
-        now = perf_counter()
-        self.request_metrics[seq.seq_id] = {
+    def _new_request_metric(self, seq: Sequence, arrival_time: float | None = None):
+        return {
             "seq_id": seq.seq_id,
-            "arrival_time": now,
+            "arrival_time": perf_counter() if arrival_time is None else arrival_time,
             "first_token_time": None,
             "token_times": [],
             "output_event_times": [],
             "speculative_step_latencies": [],
             "finish_time": None,
-            "prompt_tokens": len(prompt),
+            "prompt_tokens": seq.num_prompt_tokens,
             "output_tokens": 0,
             "success": False,
             "failure_reason": None,
@@ -116,7 +119,54 @@ class LLMEngine:
             "speculative_trace": [],
             "speculative_timing": {},
         }
+
+    # 把用户请求放进系统
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)
+        seq = Sequence(prompt, sampling_params)
+        self.request_metrics[seq.seq_id] = self._new_request_metric(seq)
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def add_prefilled_request(
+        self,
+        prompt_token_ids: list[int] | tuple[int, ...],
+        first_token_id: int,
+        sampling_params: SamplingParams,
+        kv_payload: torch.Tensor,
+    ):
+        """Admit a request after another worker has computed its prompt KV."""
+        prompt_token_ids = list(prompt_token_ids)
+        seq = Sequence(prompt_token_ids, sampling_params)
+        seq.append_token(int(first_token_id))
+        self.scheduler.admit_prefilled(seq, cached_tokens=len(prompt_token_ids))
+        try:
+            import_logical_kv(
+                self.model_runner.kv_cache,
+                seq.block_table,
+                kv_payload,
+            )
+        except Exception:
+            self.scheduler.remove_sequence(seq)
+            raise
+
+        now = perf_counter()
+        metric = self._new_request_metric(seq, arrival_time=now)
+        metric["first_token_time"] = now
+        metric["token_times"] = [now]
+        metric["output_event_times"] = [now]
+        metric["output_tokens"] = 1
+        self.request_metrics[seq.seq_id] = metric
+
+        eos = getattr(self.scheduler, "eos", -1)
+        if (
+            seq.num_completion_tokens >= seq.max_tokens
+            or (not seq.ignore_eos and first_token_id == eos)
+        ):
+            metric["finish_time"] = now
+            metric["success"] = True
+            self.scheduler.remove_sequence(seq)
         return seq.seq_id
 
     @staticmethod
@@ -380,6 +430,8 @@ class LLMEngine:
         memory_metrics = getattr(self.model_runner, "get_memory_metrics", None)
         if memory_metrics is not None:
             kv_cache_metrics.update(memory_metrics())
+        graph_metrics = getattr(self.model_runner, "get_cuda_graph_metrics", None)
+        cuda_graph_metrics = graph_metrics() if graph_metrics is not None else {}
         requests = []
         ttfts = []
         burst_itls = []
@@ -552,6 +604,7 @@ class LLMEngine:
                     ),
                 },
                 "kv_cache": kv_cache_metrics,
+                "cuda_graph": cuda_graph_metrics,
             },
             "requests": sorted(requests, key=lambda request: request["seq_id"]),
         }

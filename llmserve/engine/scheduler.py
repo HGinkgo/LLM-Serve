@@ -248,6 +248,42 @@ class Scheduler:
         self.waiting.appendleft(seq)
     # 资源不够时，把这条请求先踢下场，清掉它的 KV cache，占位释放出来，然后把它插回等待队列前面
 
+    def remove_sequence(self, seq: Sequence):
+        """Release a sequence owned by this worker without producing a token.
+
+        PD handoff uses this after the Prefill Worker has copied prompt KV to
+        the transport. The Decode Worker creates a new local Sequence and
+        block table, so worker-local ownership must be released here.
+        """
+        try:
+            self.waiting.remove(seq)
+        except ValueError:
+            pass
+        try:
+            self.running.remove(seq)
+        except ValueError:
+            pass
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+        self._release_reservation(seq)
+        seq.num_scheduled_tokens = 0
+
+    def admit_prefilled(self, seq: Sequence, cached_tokens: int):
+        """Admit a sequence whose prompt KV arrived from another worker."""
+        if seq.block_table or seq in self.waiting or seq in self.running:
+            raise ValueError("prefilled sequence is already owned by this scheduler")
+        if not 0 < cached_tokens < len(seq):
+            raise ValueError("cached_tokens must cover the prompt before first decode")
+        if not self._try_reserve(seq):
+            raise RuntimeError("insufficient reserved KV capacity for handoff")
+        if not self.block_manager.can_allocate(seq):
+            self._release_reservation(seq)
+            raise RuntimeError("insufficient KV blocks for handoff")
+        self.block_manager.allocate(seq)
+        seq.num_cached_tokens = cached_tokens
+        seq.status = SequenceStatus.RUNNING
+        self.running.append(seq)
+
     def postprocess(self, output: SchedulerOutput, token_ids: list[int]):
         if len(output.scheduled_seqs) != len(token_ids):
             raise ValueError("token count does not match scheduled sequences")
