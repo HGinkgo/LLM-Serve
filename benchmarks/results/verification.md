@@ -85,3 +85,14 @@ CUDA_VISIBLE_DEVICES=0 conda run -n nano-vllm python -m unittest \
 - 9 个 shared points 均未触发 inline fallback；每个 run 最终为 `free_slots=2`、`pending_transfers=0`，无 OOM、worker timeout 或 Graph capture failure。
 - 18 个公开 run 删除重复的 request records 和 per-batch timing detail，保留 suite 聚合指标、Queue/slot samples、Graph counters 与 worker health；扫描未发现绝对路径、prompt token IDs、traceback 或凭据。
 - 合并前 CPU 回归：`274 tests, skipped=5, OK`；真实双卡 4-request smoke 的 token IDs 与 inline 基线完全一致。
+
+## Dual-GPU PD End-to-End Serving
+
+验证日期：2026-08-04。正式端到端对照对应 commit `ae740739d25f7184c04208f35dcf1b720e624f2a`，使用 Qwen3-8B BF16、双 RTX 3090、CUDA 12.8、无 EAGLE。
+
+- `pd-serving-formal/manifest.json`：48/48 points 完成，零失败；closed-loop 与 Poisson 各 24 个 point。
+- Closed-loop request throughput 的 PD/基线比为 c16/c32/c48/c64 的 `1.252x/1.489x/1.595x/1.804x`；c64 TTFT P50 为 `136 ms` 对 `1100 ms`。
+- Poisson rate 8/16/24/28 的 PD/基线 request throughput 比为 `0.999x/1.047x/1.129x/1.148x`；低负载基本持平，过载前后收益逐渐显现。
+- Prefill model forward 约 `121-123 ms`、KV export/copy 约 `3.8 ms`，handoff 仅占 Prefill roundtrip 的 `3-5%`；当前瓶颈是 batch-4 Prefill pipeline 约 `29.6 req/s`，不是 handoff 或单卡模型计算。
+- 24 个 PD closed-loop/Poisson run 的 worker 全部健康；shared slots 最终 `free_slots=2`、`pending_transfers=0`，无 inline fallback、OOM、Graph capture failure 或 request failure。
+- 48 个公开 run JSON 已扫描，无本地绝对路径、prompt token IDs、traceback、凭据或 host-specific workspace 信息。

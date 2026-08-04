@@ -85,6 +85,19 @@ The PD comparison uses Qwen3-8B BF16 on two RTX 3090 GPUs, `128 input / 64 outpu
 
 At concurrency 64, Prefill response-queue time falls from `47.4 ms` to `0.25 ms`, Decode admission from `14.5 ms` to `1.13 ms`, and Prefill roundtrip from `186.6 ms` to `134.2 ms`; model forward and KV export/copy are unchanged. The gain therefore comes from removing large cross-process Tensor serialization and handoff blocking, not faster model computation. All 18 formal points completed, with no inline fallback on the shared path and all slots reclaimed. See [`benchmarks/results/pd-kv-pipeline-formal/`](benchmarks/results/pd-kv-pipeline-formal/).
 
+### Dual-GPU PD End-to-End Serving
+
+On a fixed `128 input / 64 output` workload, the formal matrix compares the single-process collocated BF16 Decode Graph baseline with Prefill batch 4 + eager Prefill + Decode Graph + shared KV slots. It covers closed-loop concurrency `{16, 32, 48, 64}` and Poisson rates `{8, 16, 24, 28}`, with three repetitions per point:
+
+| Closed-loop concurrency | Collocated req/s | PD req/s | PD / baseline | TTFT P50 (baseline -> PD) | TPOT P50 (baseline -> PD) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 8.09 | **10.13** | **1.252x** | 379 -> 140 ms | 25.0 -> 22.9 ms |
+| 32 | 12.27 | **18.27** | **1.489x** | 631 -> 132 ms | 31.0 -> 25.4 ms |
+| 48 | 13.60 | **21.69** | **1.595x** | 854 -> 133 ms | 41.6 -> 33.4 ms |
+| 64 | 16.00 | **28.87** | **1.804x** | 1100 -> 136 ms | 45.4 -> 33.0 ms |
+
+The throughput gain grows with sustained concurrency and reaches `+80.4%` at c64. Under Poisson arrival, the low-load point is effectively tied; rates 16/24/28 reach `1.047x/1.129x/1.148x` of the collocated throughput. This is not a faster single-GPU model computation: both paths keep Prefill model forward around `121-123 ms` and KV export/copy around `3.8 ms`. The gain comes from role separation, dual-GPU capacity, and Prefill/Decode pipeline overlap. The current ceiling is the batch-4 Prefill pipeline at about `29.6 req/s`. All 48 points completed successfully; see [`benchmarks/results/pd-serving-formal/`](benchmarks/results/pd-serving-formal/).
+
 ### EAGLE
 
 The decode-heavy profile is `256 input / 256 output`:
@@ -135,7 +148,7 @@ With LLM-Serve's custom CUDA backend, runtime model memory falls from `15.276 Gi
 
 The same checkpoint completes 24/24 control points with vLLM 0.11 AWQ-Marlin. AWQ/BF16 output-throughput ratios at concurrency 1/4/8/16 are `1.390x/1.316x/1.322x/1.316x`. This validates checkpoint compatibility with a mature W4A16 backend; the speedup belongs to vLLM Marlin, not to LLM-Serve's custom CUDA kernel.
 
-The existing serving line contains 72 sanitized run JSON files; Stage 8 adds 18 Graph comparison runs, and the dual-GPU PD comparison adds 18 reduced sanitized runs. Per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
+The existing serving line contains 72 sanitized run JSON files; Stage 8 adds 18 Graph comparison runs, the dual-GPU KV transport comparison adds 18 reduced runs, and the PD end-to-end matrix adds 48 runs. Per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
 
 ## Metric Semantics
 

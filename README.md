@@ -87,6 +87,19 @@ PD 对照基于 Qwen3-8B BF16、双 RTX 3090、`128 input / 64 output`、Prefill
 
 在并发 64 时，Prefill response Queue 从 `47.4 ms` 降至 `0.25 ms`，Decode admit 从 `14.5 ms` 降至 `1.13 ms`，Prefill roundtrip 从 `186.6 ms` 降至 `134.2 ms`；模型 forward 和 KV export/copy 基本不变。因此收益来自消除跨进程大 Tensor 序列化与 handoff 阻塞，而不是模型计算变快。18/18 个正式 point 全部完成，shared 路径零 inline fallback，所有槽位最终回收。完整结果见 [`benchmarks/results/pd-kv-pipeline-formal/`](benchmarks/results/pd-kv-pipeline-formal/)。
 
+### 双卡 PD 端到端 Serving
+
+在固定 `128 input / 64 output` workload 上，使用 Prefill batch 4、Prefill eager、Decode CUDA Graph 和 shared KV slots，对比单进程 collocated BF16 Decode Graph。正式矩阵包含 closed-loop 并发 `{16, 32, 48, 64}` 与 Poisson 到达率 `{8, 16, 24, 28}`，每个点重复三次：
+
+| Closed-loop 并发 | Collocated req/s | PD req/s | PD/基线 | TTFT P50（基线 -> PD） | TPOT P50（基线 -> PD） |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 8.09 | **10.13** | **1.252x** | 379 -> 140 ms | 25.0 -> 22.9 ms |
+| 32 | 12.27 | **18.27** | **1.489x** | 631 -> 132 ms | 31.0 -> 25.4 ms |
+| 48 | 13.60 | **21.69** | **1.595x** | 854 -> 133 ms | 41.6 -> 33.4 ms |
+| 64 | 16.00 | **28.87** | **1.804x** | 1100 -> 136 ms | 45.4 -> 33.0 ms |
+
+PD 的吞吐收益随持续并发放大，c64 达到 `+80.4%`；Poisson 低负载下基本持平，rate 16/24/28 的吞吐分别为基线的 `1.047x/1.129x/1.148x`。这不是单卡模型计算加速：两条路径的 Prefill model forward 约 `121-123 ms`、KV export/copy 约 `3.8 ms`，收益来自 Prefill/Decode 角色分离、双卡容量和流水线重叠。当前上限由 batch-4 Prefill pipeline 约 `29.6 req/s` 决定。48/48 个正式 point 全部完成，结果见 [`benchmarks/results/pd-serving-formal/`](benchmarks/results/pd-serving-formal/)。
+
 ### EAGLE
 
 decode-heavy workload 为 `256 input / 256 output`。closed-loop 中 EAGLE 明显提高饱和吞吐，但并发 4/8 的 request E2E P99 同时变差：
@@ -137,7 +150,7 @@ LLM-Serve 自研 CUDA backend 的 runtime model memory 从 `15.276 GiB` 降至 `
 
 同一个自制 checkpoint 在 vLLM 0.11 AWQ-Marlin 上完成 24/24 个对照点，concurrency 1/4/8/16 的 AWQ/BF16 output throughput 为 `1.390x/1.316x/1.322x/1.316x`。这证明 checkpoint 格式与成熟 W4A16 backend 兼容；该吞吐收益属于 vLLM Marlin，不是 LLM-Serve 自研 CUDA kernel 的成绩。
 
-已有 serving 主线的 72 份脱敏 run JSON、Stage 8 的 18 份 Graph 对照，以及双卡 PD KV Pipeline 的 18 份精简脱敏 run、逐运行 CSV、三轮均值/标准差和 manifest，均位于 [`benchmarks/results/`](benchmarks/results/)。
+已有 serving 主线的 72 份脱敏 run JSON、Stage 8 的 18 份 Graph 对照、双卡 PD KV Pipeline 的 18 份精简脱敏 run，以及 PD 端到端矩阵的 48 份 run，逐运行 CSV、三轮均值/标准差和 manifest 均位于 [`benchmarks/results/`](benchmarks/results/)。
 
 ## 指标口径
 

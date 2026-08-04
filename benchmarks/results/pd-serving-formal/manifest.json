@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "suite": "pd-serving-formal",
+  "complete": true,
+  "git_commit": "ae740739d25f7184c04208f35dcf1b720e624f2a",
+  "metadata": {
+    "generated_at_utc": "2026-08-04T02:02:19.966539+00:00",
+    "git_commit": "ae740739d25f7184c04208f35dcf1b720e624f2a",
+    "git_dirty": false,
+    "python_version": "3.10.20",
+    "torch_version": "2.7.1+cu128",
+    "cuda_runtime": "12.8",
+    "cuda_available": true,
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "gpu_memory_bytes": 25296044032
+  },
+  "model": "Qwen3-8B",
+  "model_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "speculative_model": null,
+  "speculative_model_revision": null,
+  "distributed_init_method": "tcp://localhost:2342",
+  "total_points": 48,
+  "completed_points": 48,
+  "failed_points": 0
+}
