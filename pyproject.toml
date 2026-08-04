@@ -15,11 +15,15 @@ dependencies = [
     "torch>=2.4.0",
     "ninja",
     "triton>=3.0.0",
-    "transformers>=4.51.0",
+    "transformers>=4.51.0,<5.0.0",
     "accelerate>=1.0.0",
     "flash-attn",
+    "packaging>=20.0",
     "xxhash",
 ]
+
+[project.scripts]
+llmserve = "llmserve.cli:main"
 
 [project.urls]
 Homepage="https://github.com/HGinkgo/LLM-Serve"

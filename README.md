@@ -2,7 +2,7 @@
 
 # LLM-Serve
 
-面向学习与系统研究的单机 LLM 推理 Runtime
+面向学习与系统研究的 LLM 推理 Runtime
 
 <p>
   <a href="README.en.md">English</a> |
@@ -20,77 +20,73 @@
 
 </div>
 
-LLM-Serve 是一个以 Qwen3-8B 为主要目标、面向单机 GPU 推理系统学习的 Runtime。项目从单卡推理出发，逐步实现 Paged KV Cache、continuous batching、chunked prefill、EAGLE 风格投机解码、AWQ W4A16 和双卡 Prefill/Decode 分离。
-
-项目早期参考了 [PagedAttention 论文](https://arxiv.org/abs/2309.06180) 与 [`nano-vllm`](https://github.com/Geeeone/nano-vllm) 的教学骨架；scheduler、serving benchmark、投机解码、量化校准和 PD serving 由本仓库独立演进。
+LLM-Serve 是一个以 Qwen3-8B 为主要目标、面向单机 GPU 推理系统学习的 Runtime。项目参考 [`nano-vllm`](https://github.com/Geeeone/nano-vllm) 的教学骨架，并围绕调度、KV Cache、投机解码、量化和 Prefill/Decode 分离持续演进。
 
 ## 核心能力
 
-- **Runtime**：Paged KV Cache、block table、prefix cache、iteration-level continuous batching 和显式 `SchedulerOutput`。
-- **调度**：decode-first chunked prefill，支持 mixed prefill/decode batch 和长 prompt 隔离。
-- **投机解码**：EAGLE 风格 batched draft、packed target verification、per-request draft KV、greedy accept/reject，以及 target verify CUDA Graph。
-- **量化**：Qwen3 activation-aware AWQ W4A16 校准、标准 AutoAWQ GEMM checkpoint 导出、reference/Triton/CUDA Linear backend 和 KV capacity admission。
-- **双卡 Serving**：独立 Prefill/Decode Worker、logical KV handoff、pinned shared-memory slots、ACK/backpressure 和 Decode CUDA Graph。
-- **可复现实验**：Poisson request-rate 与 closed-loop concurrency runner，记录 throughput、goodput、TTFT、TPOT、E2E、队列和阶段耗时。
-
-## 项目结构
-
-```text
-llmserve/
-├── engine/        scheduler、KV block 管理、target 执行与 speculative 编排
-├── models/        Qwen3 与 EAGLE3 模型定义
-├── speculative/   draft、verification、sampling 与 target CUDA Graph
-├── quantization/  AWQ 校准、checkpoint 导出与质量评估
-├── pd/            Prefill/Decode 协议、KV handoff、共享槽位与 worker 生命周期
-└── layers/        attention、linear、sampling 等基础组件
-benchmarks/        workload、arrival、指标、suite runner 与公开结果
-tests/             CPU 单元测试、checkpoint 集成测试与 CUDA 测试
-```
+- Paged KV Cache、Prefix Cache 与 iteration-level Continuous Batching。
+- Decode-first Chunked Prefill 与结构化 `SchedulerOutput`。
+- EAGLE 风格批量草稿生成、打包验证和 Target Verify CUDA Graph。
+- Qwen3 AWQ W4A16 校准、标准 checkpoint 导出和多种 Linear backend。
+- 双卡 Prefill/Decode Worker、共享内存 KV handoff 与背压控制。
+- Poisson 和 closed-loop Serving Benchmark，覆盖吞吐、TTFT、TPOT、E2E 与队列指标。
 
 ## 快速开始
 
+要求 Linux、Python 3.10-3.12 和 NVIDIA CUDA GPU。项目验证环境为 CUDA 12.8、PyTorch 2.7.1、Triton 3.3.1 与 FlashAttention 2.8.3。
+
 ```bash
+conda create -n LLM-Serve python=3.10 pip -y
+conda activate LLM-Serve
+
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+pip install ninja packaging wheel
+pip install flash-attn==2.8.3 --no-build-isolation
 pip install -e .
 
-export MODEL_PATH=/path/to/Qwen3-8B
-python example.py
+llmserve check
 ```
 
-运行 CPU 回归：
+FlashAttention 的预编译 wheel 来自 GitHub Releases；受限网络需要提前准备匹配 `cu12 / torch2.7 / Python 3.10` 的 wheel。源码编译必须使用 CUDA Toolkit 12.8，不能混用系统 CUDA 13。
+
+准备一个本地 Qwen3-8B Hugging Face checkpoint，然后运行：
 
 ```bash
-CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
+llmserve generate \
+  --model /path/to/Qwen3-8B \
+  --prompt "用通俗的语言解释 PagedAttention" \
+  --max-tokens 128
 ```
 
-运行 GPU smoke：
+也可以直接使用 Python API：
 
-```bash
-export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
+```python
+from llmserve import LLM, SamplingParams
 
-python -m benchmarks.run_suite \
-  --suite benchmarks/suites/smoke.json \
-  --output-dir /tmp/llmserve-smoke \
-  --model "$MODEL_PATH" \
-  --speculative-model "$SPECULATIVE_MODEL" \
-  --allow-dirty
+llm = LLM("/path/to/Qwen3-8B")
+try:
+    outputs = llm.generate(
+        ["Explain continuous batching in one paragraph."],
+        SamplingParams(temperature=0.6, max_tokens=128),
+    )
+    print(outputs[0]["text"])
+finally:
+    llm.exit()
 ```
 
-## 实验与文档
+## 文档
 
-- [Benchmark 使用说明](benchmarks/README.md)：suite、workload、指标口径和复现实验命令。
-- [公开 Benchmark 数据](benchmarks/results/)：manifest、CSV、脱敏 run JSON 和各阶段说明。
-- [PD 端到端结果](benchmarks/results/pd-serving-formal/)：单进程 collocated 与双卡 Prefill/Decode 对照。
-- [AWQ 结果](benchmarks/results/awq-w4a16/)：质量、容量和 vLLM Marlin 控制实验。
-- [完整测试证据](benchmarks/results/verification.md)：CPU 回归、CUDA smoke 和公开数据校验记录。
+- [基础 Python 示例](example.py)
+- [Prefill/Decode 示例](examples/)
+- [Benchmark 使用与结果索引](benchmarks/README.md)
 
-实验结果不在根 README 中重复维护，具体数字和原始脱敏数据以 `benchmarks/results/` 下对应目录为准。
+根 README 不重复维护性能数字；实验配置、指标口径和公开结果以 Benchmark 文档为准。
 
 ## 当前边界
 
-- 主目标是 Qwen3-8B、单卡 TP=1 和 RTX 3090 24GB；双卡路径用于 Prefill/Decode 分离，不作为无 NVLink Tensor Parallel 平台。
-- speculative CUDA Graph 只支持线性 EAGLE、greedy acceptance 和显式 opt-in；不支持的 shape 会回退 eager。
-- AWQ Runtime 固定为 Qwen3、AutoAWQ GEMM、group-128 W4A16、BF16 activation/scales 和 TP=1；vLLM Marlin 结果属于外部执行后端控制实验。
-- 项目聚焦 Runtime、调度和 serving 机制，不包含 OpenAI-compatible HTTP API 层。
+- 主要支持 Qwen3-8B、单卡 TP=1；双卡用于 Prefill/Decode 分离，不用于 Tensor Parallel。
+- EAGLE、Chunked Prefill、KV 容量准入和 Speculative CUDA Graph 均为显式可选能力。
+- AWQ 路径由 checkpoint 元数据启用；当前不提供 OpenAI-compatible HTTP API。
 
 ## License
 

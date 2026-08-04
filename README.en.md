@@ -2,7 +2,7 @@
 
 # LLM-Serve
 
-An educational LLM inference runtime for single- and dual-GPU serving
+An educational runtime for studying LLM inference systems
 
 <p>
   English |
@@ -20,77 +20,73 @@ An educational LLM inference runtime for single- and dual-GPU serving
 
 </div>
 
-LLM-Serve is an educational inference runtime centered on Qwen3-8B. It starts from a single-GPU engine and develops the core mechanisms behind LLM serving: paged KV cache management, continuous batching, chunked prefill, EAGLE-style speculative decoding, AWQ W4A16, and dual-GPU Prefill/Decode disaggregation.
-
-The early project was informed by the [PagedAttention paper](https://arxiv.org/abs/2309.06180) and the [`nano-vllm`](https://github.com/Geeeone/nano-vllm) teaching skeleton. The scheduler, serving benchmark system, speculative runtime, quantization calibration path, and PD serving path have been developed independently in this repository.
+LLM-Serve is an educational inference runtime centered on Qwen3-8B and single-host GPU serving. It started from the [`nano-vllm`](https://github.com/Geeeone/nano-vllm) teaching skeleton and has evolved around scheduling, KV cache management, speculative decoding, quantization, and Prefill/Decode disaggregation.
 
 ## Capabilities
 
-- **Runtime**: paged KV cache, block tables, prefix cache, iteration-level continuous batching, and an explicit `SchedulerOutput` contract.
-- **Scheduling**: decode-first chunked prefill for mixed prefill/decode batches and long-prompt isolation.
-- **Speculative decoding**: EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy accept/reject, and target-verify CUDA Graphs.
-- **Quantization**: Qwen3 activation-aware AWQ W4A16 calibration, standard AutoAWQ GEMM checkpoint export, reference/Triton/CUDA Linear backends, and KV capacity admission.
-- **Dual-GPU serving**: independent Prefill/Decode workers, logical KV handoff, pinned shared-memory slots, ACK/backpressure, and Decode CUDA Graphs.
-- **Reproducible experiments**: Poisson request-rate and closed-loop concurrency runners with throughput, goodput, TTFT, TPOT, E2E, queue, and stage-timing metrics.
-
-## Repository Layout
-
-```text
-llmserve/
-├── engine/        scheduling, KV blocks, target execution, speculative orchestration
-├── models/        Qwen3 and EAGLE3 model definitions
-├── speculative/   draft, verification, sampling, and target CUDA Graphs
-├── quantization/  AWQ calibration, checkpoint export, and quality evaluation
-├── pd/            Prefill/Decode protocols, KV handoff, slots, and workers
-└── layers/        attention, linear, sampling, and model building blocks
-benchmarks/        workloads, arrivals, metrics, suite runners, and public data
-tests/             CPU, checkpoint integration, and CUDA tests
-```
+- Paged KV cache, prefix cache, and iteration-level continuous batching.
+- Decode-first chunked prefill with an explicit `SchedulerOutput` contract.
+- EAGLE-style batched draft proposal, packed verification, and target-verify CUDA Graphs.
+- Qwen3 AWQ W4A16 calibration, standard checkpoint export, and multiple Linear backends.
+- Dual-GPU Prefill/Decode workers, shared-memory KV handoff, and backpressure.
+- Poisson and closed-loop serving benchmarks with throughput, TTFT, TPOT, E2E, and queue metrics.
 
 ## Quick Start
 
+LLM-Serve requires Linux, Python 3.10-3.12, and an NVIDIA CUDA GPU. The verified environment uses CUDA 12.8, PyTorch 2.7.1, Triton 3.3.1, and FlashAttention 2.8.3.
+
 ```bash
+conda create -n LLM-Serve python=3.10 pip -y
+conda activate LLM-Serve
+
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+pip install ninja packaging wheel
+pip install flash-attn==2.8.3 --no-build-isolation
 pip install -e .
 
-export MODEL_PATH=/path/to/Qwen3-8B
-python example.py
+llmserve check
 ```
 
-Run the CPU regression suite:
+FlashAttention wheels are fetched from GitHub Releases. On restricted networks, provide a matching `cu12 / torch2.7 / Python 3.10` wheel in advance. Source builds require CUDA Toolkit 12.8 and must not use a system CUDA 13 toolchain.
+
+Prepare a local Qwen3-8B Hugging Face checkpoint, then run:
 
 ```bash
-CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
+llmserve generate \
+  --model /path/to/Qwen3-8B \
+  --prompt "Explain PagedAttention in plain language." \
+  --max-tokens 128
 ```
 
-Run the GPU smoke suite:
+The Python API remains available:
 
-```bash
-export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
+```python
+from llmserve import LLM, SamplingParams
 
-python -m benchmarks.run_suite \
-  --suite benchmarks/suites/smoke.json \
-  --output-dir /tmp/llmserve-smoke \
-  --model "$MODEL_PATH" \
-  --speculative-model "$SPECULATIVE_MODEL" \
-  --allow-dirty
+llm = LLM("/path/to/Qwen3-8B")
+try:
+    outputs = llm.generate(
+        ["Explain continuous batching in one paragraph."],
+        SamplingParams(temperature=0.6, max_tokens=128),
+    )
+    print(outputs[0]["text"])
+finally:
+    llm.exit()
 ```
 
-## Experiments and Documentation
+## Documentation
 
-- [Benchmark guide](benchmarks/README.md): suites, workloads, metric semantics, and reproduction commands.
-- [Public benchmark data](benchmarks/results/): manifests, CSV files, sanitized run JSON, and stage reports.
-- [PD end-to-end results](benchmarks/results/pd-serving-formal/): collocated versus dual-GPU Prefill/Decode serving.
-- [AWQ results](benchmarks/results/awq-w4a16/): quality, capacity, and vLLM Marlin control experiments.
-- [Verification evidence](benchmarks/results/verification.md): CPU regression, CUDA smoke, and public-data checks.
+- [Basic Python example](example.py)
+- [Prefill/Decode examples](examples/)
+- [Benchmark guide and result index](benchmarks/README.md)
 
-Benchmark numbers are intentionally not duplicated in this README. Use the corresponding directory under `benchmarks/results/` as the source of truth for detailed measurements and sanitized raw data.
+Performance numbers are intentionally kept out of the root README. Benchmark configurations, metric semantics, and public results live in the benchmark documentation.
 
-## Scope and Limitations
+## Scope
 
-- The primary target is Qwen3-8B, single-GPU TP=1, and an RTX 3090 24GB. The dual-GPU path is Prefill/Decode disaggregation, not a Tensor Parallel performance platform for non-NVLink GPUs.
-- Speculative CUDA Graphs support linear EAGLE, greedy acceptance, and explicit opt-in only. Unsupported shapes fall back to eager.
-- The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, and TP=1. vLLM Marlin measurements are external-backend control experiments.
-- The project focuses on runtime, scheduling, and serving mechanisms and intentionally does not provide an OpenAI-compatible HTTP API layer.
+- The primary target is Qwen3-8B with single-GPU TP=1. The dual-GPU path is for Prefill/Decode disaggregation, not Tensor Parallelism.
+- EAGLE, chunked prefill, KV capacity admission, and speculative CUDA Graphs are explicit opt-in features.
+- AWQ is selected from checkpoint metadata. An OpenAI-compatible HTTP API is intentionally out of scope.
 
 ## License
 
