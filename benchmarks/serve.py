@@ -204,7 +204,6 @@ def run_point(
         ),
         "speculative_model": active_speculative_model,
         "speculative_gamma": runtime.get("speculative_gamma", 3),
-        "speculative_tree_nodes": runtime.get("speculative_tree_nodes", 0),
         "speculative_accept_mode": runtime.get(
             "speculative_accept_mode", "greedy"
         ),

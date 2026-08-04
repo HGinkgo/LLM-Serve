@@ -125,22 +125,6 @@ class FakeMixedModelRunner(FakeNormalModelRunner):
         raise AssertionError(method_name)
 
 
-class FakeTreeModelRunner(FakeModelRunner):
-    speculative_tree_nodes = 6
-
-    def call(self, method_name, *args):
-        self.calls.append((method_name, args))
-        if method_name == "run_speculative_tree_single":
-            return SpeculativeDecodeOutput(
-                token_ids=[10, 11, 12],
-                num_draft_tokens=6,
-                num_accepted=2,
-                accepted_all=False,
-                emitted_tokens=3,
-            )
-        raise AssertionError(method_name)
-
-
 class FakeBatchModelRunner(FakeModelRunner):
 
     def call(self, method_name, *args):
@@ -341,20 +325,6 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
                 }
             ],
         )
-
-    def test_step_uses_tree_branch_for_single_request_when_enabled(self):
-        seq = Sequence([1, 2, 3])
-        seq.status = SequenceStatus.RUNNING
-        seq.num_cached_tokens = len(seq)
-        engine = LLMEngine.__new__(LLMEngine)
-        engine.scheduler = FakeScheduler(seq)
-        engine.model_runner = FakeTreeModelRunner()
-        engine.request_metrics = {seq.seq_id: self.make_metric(seq)}
-
-        LLMEngine.step(engine)
-
-        self.assertEqual(engine.model_runner.calls[0][0], "run_speculative_tree_single")
-        self.assertEqual(engine.scheduler.block_manager.calls, [(seq.seq_id, 5)])
 
     def test_step_falls_back_to_normal_decode_without_draft_model(self):
         seq = Sequence([1, 2, 3])

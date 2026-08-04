@@ -39,7 +39,7 @@ The early project was informed by the [PagedAttention paper](https://arxiv.org/a
 llmserve/
 ├── engine/        scheduling, KV blocks, target execution, speculative orchestration
 ├── models/        Qwen3 and EAGLE3 model definitions
-├── speculative/   draft, verification, fixed trees, and Tree KV management
+├── speculative/   draft, verification, sampling, and target CUDA Graphs
 ├── quantization/  AWQ calibration, checkpoint export, and quality evaluation
 ├── pd/            Prefill/Decode protocols, KV handoff, slots, and workers
 └── layers/        attention, linear, sampling, and model building blocks
@@ -88,7 +88,7 @@ Benchmark numbers are intentionally not duplicated in this README. Use the corre
 ## Scope and Limitations
 
 - The primary target is Qwen3-8B, single-GPU TP=1, and an RTX 3090 24GB. The dual-GPU path is Prefill/Decode disaggregation, not a Tensor Parallel performance platform for non-NVLink GPUs.
-- Speculative CUDA Graphs support linear EAGLE, greedy acceptance, and explicit opt-in only. Unsupported shapes fall back to eager; fixed-tree speculation is disabled by default.
+- Speculative CUDA Graphs support linear EAGLE, greedy acceptance, and explicit opt-in only. Unsupported shapes fall back to eager.
 - The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, and TP=1. vLLM Marlin measurements are external-backend control experiments.
 - The project focuses on runtime, scheduling, and serving mechanisms and intentionally does not provide an OpenAI-compatible HTTP API layer.
 

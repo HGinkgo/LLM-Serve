@@ -26,17 +26,9 @@ class ConfigSpeculativeTest(unittest.TestCase):
 
         self.assertFalse(config.enable_speculative_cuda_graph)
 
-    def test_speculative_cuda_graph_requires_linear_speculation(self):
-        with tempfile.TemporaryDirectory() as model_dir, tempfile.TemporaryDirectory() as draft_dir, patch(
-            "llmserve.config.AutoConfig.from_pretrained",
-            return_value=SimpleNamespace(max_position_embeddings=4096),
-        ), self.assertRaisesRegex(ValueError, "linear speculative"):
-            Config(
-                model_dir,
-                speculative_model=draft_dir,
-                speculative_tree_nodes=6,
-                enable_speculative_cuda_graph=True,
-            )
+    def test_tree_speculation_is_not_a_runtime_option(self):
+        with self.assertRaises(TypeError):
+            self.make_config(speculative_tree_nodes=6)
 
     def test_speculative_cuda_graph_requires_greedy_acceptance(self):
         with tempfile.TemporaryDirectory() as model_dir, tempfile.TemporaryDirectory() as draft_dir, patch(

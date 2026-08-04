@@ -225,13 +225,8 @@ class LLMEngine:
                 slots_ready = block_manager.ensure_slots_batch(seqs, num_reserved_tokens)
             if slots_ready:
                 if len(seqs) == 1:
-                    method_name = (
-                        "run_speculative_tree_single"
-                        if getattr(self.model_runner, "speculative_tree_nodes", 0)
-                        else "run_speculative_single"
-                    )
                     speculative_outputs = [
-                        self.model_runner.call(method_name, seqs[0])
+                        self.model_runner.call("run_speculative_single", seqs[0])
                     ]
                 else:
                     speculative_outputs = self.model_runner.call("run_speculative_batch", seqs)

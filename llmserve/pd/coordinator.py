@@ -68,7 +68,6 @@ class PDConfig:
                 else self.decode_enforce_eager
             ),
             speculative_model=None,
-            speculative_tree_nodes=0,
             enable_speculative_cuda_graph=False,
             distributed_init_method=(
                 self.prefill_init_method

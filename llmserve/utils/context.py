@@ -12,8 +12,6 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    tree_prefix_slots: torch.Tensor | None = None
-    tree_attention_mask: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -29,8 +27,6 @@ def set_context(
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
-    tree_prefix_slots=None,
-    tree_attention_mask=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -42,8 +38,6 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
-        tree_prefix_slots,
-        tree_attention_mask,
     )
 
 def reset_context():

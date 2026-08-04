@@ -13,11 +13,6 @@ from llmserve.speculative.sampling import (
 )
 from llmserve.speculative.types import Eagle3TargetVerifyOutput
 from llmserve.speculative.types import SpeculativeDecodeOutput, TargetDecodeAuxOutput
-from llmserve.speculative.tree import (
-    build_fixed_tree_topology,
-    generate_eagle3_draft_tree,
-    select_greedy_tree_path,
-)
 from llmserve.utils.context import set_context, reset_context
 from llmserve.utils.stage_profiler import StageProfiler
 
@@ -306,53 +301,6 @@ class SpeculativeExecutor:
             "verify_lengths": verify_lengths,
         }
 
-    def _build_target_tree_verify_metadata(
-        self,
-        seq: Sequence,
-        *,
-        start_token_id: int,
-        draft_token_ids: list[int],
-        topology,
-        base_offset: int = 0,
-    ) -> dict:
-        if len(draft_token_ids) != topology.num_draft_nodes:
-            raise ValueError("draft token count does not match tree topology")
-        base_pos = len(seq) + base_offset
-        if base_pos < 0:
-            raise ValueError(f"invalid tree verify base_pos: {base_pos}")
-        prefix_slots = []
-        for absolute_pos in range(base_pos):
-            block_idx = absolute_pos // self.block_size
-            offset = absolute_pos % self.block_size
-            prefix_slots.append(seq.block_table[block_idx] * self.block_size + offset)
-        return {
-            "input_ids": [int(start_token_id)] + [int(token_id) for token_id in draft_token_ids],
-            "positions": [base_pos + depth for depth in topology.depths],
-            "prefix_slots": prefix_slots,
-            "attention_mask": topology.attention_mask(),
-            "base_pos": base_pos,
-        }
-
-    def _commit_target_tree_kv(
-        self,
-        seq: Sequence,
-        *,
-        base_pos: int,
-        node_indices: list[int],
-    ):
-        slot_mapping = []
-        for relative_pos in range(len(node_indices)):
-            absolute_pos = base_pos + relative_pos
-            block_idx = absolute_pos // self.block_size
-            offset = absolute_pos % self.block_size
-            slot_mapping.append(seq.block_table[block_idx] * self.block_size + offset)
-        slot_mapping_tensor = torch.tensor(
-            slot_mapping,
-            dtype=torch.int32,
-            device=self.tree_kv_cache_manager.device,
-        )
-        self.tree_kv_cache_manager.commit(node_indices, slot_mapping_tensor)
-
     @torch.inference_mode()
     def run_target_verify_batch_with_eagle3_aux(
         self,
@@ -426,142 +374,6 @@ class SpeculativeExecutor:
             [draft_token_ids],
             [base_offset],
         )[0]
-
-    @torch.inference_mode()
-    def run_target_verify_tree_with_eagle3_aux(
-        self,
-        seq: Sequence,
-        start_token_id: int,
-        draft_tree,
-        base_offset: int = 0,
-    ):
-        metadata = self._build_target_tree_verify_metadata(
-            seq,
-            start_token_id=start_token_id,
-            draft_token_ids=draft_tree.draft_token_ids,
-            topology=draft_tree.topology,
-            base_offset=base_offset,
-        )
-        input_ids = torch.tensor(metadata["input_ids"], dtype=torch.long, device="cuda")
-        positions = torch.tensor(metadata["positions"], dtype=torch.long, device="cuda")
-        prefix_slots = torch.tensor(metadata["prefix_slots"], dtype=torch.long, device="cuda")
-        attention_mask = metadata["attention_mask"].to(device="cuda")
-        set_context(
-            True,
-            tree_prefix_slots=prefix_slots,
-            tree_attention_mask=attention_mask,
-        )
-        try:
-            hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
-            logits = self.model.compute_logits(hidden_states, all_tokens=True)
-        finally:
-            reset_context()
-        return Eagle3TargetVerifyOutput(logits, aux_hidden), metadata["base_pos"]
-
-    @torch.inference_mode()
-    def run_speculative_tree_single(self, seq: Sequence) -> SpeculativeDecodeOutput:
-        assert self.draft_model is not None
-        assert self.speculative_tree_nodes in {6, 10}
-        assert self.speculative_accept_mode == "greedy"
-        total_start = perf_counter()
-        target_decode_time = 0.0
-        prev_correction = getattr(self, "_prev_correction", {})
-        merged = seq.seq_id in prev_correction
-        if merged:
-            start_token_id, start_aux_hidden = prev_correction[seq.seq_id]
-            start_aux_hidden = start_aux_hidden.view(1, 1, -1)
-        else:
-            stage_start = perf_counter()
-            target_decode = self.run_target_decode_with_eagle3_aux([seq])
-            reset_context()
-            target_decode_time = perf_counter() - stage_start
-            start_token_id = target_decode.token_ids[0]
-            start_aux_hidden = target_decode.aux_hidden.view(1, 1, -1)
-
-        draft_past_kv = self._get_single_draft_kv(seq)
-        if draft_past_kv is not None:
-            draft_kv_len = draft_past_kv[0].shape[2]
-        elif merged:
-            draft_kv_len = len(seq)
-        else:
-            draft_kv_len = int(target_decode.positions[-1].item()) + 1
-        topology = build_fixed_tree_topology(self.speculative_tree_nodes)
-        stage_start = perf_counter()
-        draft_tree = generate_eagle3_draft_tree(
-            self.draft_model,
-            topology=topology,
-            start_token_id=start_token_id,
-            start_aux_hidden=start_aux_hidden,
-            start_position=draft_kv_len,
-            temperature=seq.temperature,
-            past_kv=draft_past_kv,
-        )
-        draft_proposal_time = perf_counter() - stage_start
-
-        stage_start = perf_counter()
-        verify_output, base_pos = self.run_target_verify_tree_with_eagle3_aux(
-            seq,
-            start_token_id,
-            draft_tree,
-            base_offset=-1 if merged else 0,
-        )
-        target_verify_time = perf_counter() - stage_start
-
-        stage_start = perf_counter()
-        sample_result = select_greedy_tree_path(
-            topology,
-            draft_tree.draft_token_ids,
-            verify_output.target_logits,
-        )
-        token_ids = ([] if merged else [start_token_id]) + sample_result.token_ids
-        correction_aux = verify_output.target_aux_hidden[sample_result.final_node_index]
-        self._prev_correction[seq.seq_id] = (
-            sample_result.final_token_id,
-            correction_aux.detach(),
-        )
-        accept_time = perf_counter() - stage_start
-
-        stage_start = perf_counter()
-        self._commit_target_tree_kv(
-            seq,
-            base_pos=base_pos,
-            node_indices=sample_result.commit_node_indices,
-        )
-        target_tree_kv_commit_time = perf_counter() - stage_start
-        stage_start = perf_counter()
-        selected_draft_past = draft_tree.past_kv_for_path(
-            sample_result.accepted_node_indices
-        )
-        self._update_single_draft_kv(
-            seq,
-            selected_draft_past,
-            draft_kv_len,
-            token_ids,
-            verify_output.target_aux_hidden,
-            sample_result.num_accepted,
-            self.speculative_gamma,
-        )
-        draft_kv_update_time = perf_counter() - stage_start
-        kv_update_time = target_tree_kv_commit_time + draft_kv_update_time
-        timing = {
-            "target_decode_time": target_decode_time,
-            "draft_proposal_time": draft_proposal_time,
-            "target_verify_time": target_verify_time,
-            "accept_time": accept_time,
-            "kv_update_time": kv_update_time,
-            "target_tree_kv_commit_time": target_tree_kv_commit_time,
-            "draft_kv_update_time": draft_kv_update_time,
-            "trace_time": 0.0,
-            "total_time": perf_counter() - total_start,
-        }
-        return SpeculativeDecodeOutput(
-            token_ids=token_ids,
-            num_draft_tokens=topology.num_draft_nodes,
-            num_accepted=sample_result.num_accepted,
-            accepted_all=sample_result.accepted_all,
-            emitted_tokens=len(token_ids),
-            timing=timing,
-        )
 
     @torch.inference_mode()
     def run_speculative_single(self, seq: Sequence) -> SpeculativeDecodeOutput:

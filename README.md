@@ -39,7 +39,7 @@ LLM-Serve 是一个以 Qwen3-8B 为主要目标、面向单机 GPU 推理系统�
 llmserve/
 ├── engine/        scheduler、KV block 管理、target 执行与 speculative 编排
 ├── models/        Qwen3 与 EAGLE3 模型定义
-├── speculative/   draft、verification、固定树与 Tree KV 管理
+├── speculative/   draft、verification、sampling 与 target CUDA Graph
 ├── quantization/  AWQ 校准、checkpoint 导出与质量评估
 ├── pd/            Prefill/Decode 协议、KV handoff、共享槽位与 worker 生命周期
 └── layers/        attention、linear、sampling 等基础组件
@@ -88,7 +88,7 @@ python -m benchmarks.run_suite \
 ## 当前边界
 
 - 主目标是 Qwen3-8B、单卡 TP=1 和 RTX 3090 24GB；双卡路径用于 Prefill/Decode 分离，不作为无 NVLink Tensor Parallel 平台。
-- speculative CUDA Graph 只支持线性 EAGLE、greedy acceptance 和显式 opt-in；不支持的 shape 会回退 eager，固定候选树默认关闭。
+- speculative CUDA Graph 只支持线性 EAGLE、greedy acceptance 和显式 opt-in；不支持的 shape 会回退 eager。
 - AWQ Runtime 固定为 Qwen3、AutoAWQ GEMM、group-128 W4A16、BF16 activation/scales 和 TP=1；vLLM Marlin 结果属于外部执行后端控制实验。
 - 项目聚焦 Runtime、调度和 serving 机制，不包含 OpenAI-compatible HTTP API 层。
 

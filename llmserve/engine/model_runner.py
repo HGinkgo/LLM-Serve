@@ -8,7 +8,6 @@ from llmserve.config import Config
 from llmserve.engine.sequence import Sequence
 from llmserve.engine.scheduler import SchedulerOutput
 from llmserve.engine.speculative_executor import SpeculativeExecutor
-from llmserve.speculative.tree_kv import TreeKVCacheManager
 from llmserve.speculative.target_graph import TargetVerifyGraphBackend
 from llmserve.speculative.types import SpeculativeDecodeOutput
 from llmserve.models.qwen3 import Qwen3ForCausalLM
@@ -50,7 +49,6 @@ class ModelRunner:
         self.speculative_executor = SpeculativeExecutor(self)
         self.draft_model = self.load_draft_model()
         self.speculative_gamma = config.speculative_gamma
-        self.speculative_tree_nodes = config.speculative_tree_nodes
         self.speculative_accept_mode = config.speculative_accept_mode
         self.speculative_trace = config.speculative_trace
         self._target_verify_graph_backend = None
@@ -171,23 +169,11 @@ class ModelRunner:
     def _build_target_verify_batch_metadata(self, *args, **kwargs):
         return self._speculative()._build_target_verify_batch_metadata(*args, **kwargs)
 
-    def _build_target_tree_verify_metadata(self, *args, **kwargs):
-        return self._speculative()._build_target_tree_verify_metadata(*args, **kwargs)
-
-    def _commit_target_tree_kv(self, *args, **kwargs):
-        return self._speculative()._commit_target_tree_kv(*args, **kwargs)
-
     def run_target_verify_batch_with_eagle3_aux(self, *args, **kwargs):
         return self._speculative().run_target_verify_batch_with_eagle3_aux(*args, **kwargs)
 
     def run_target_verify_with_eagle3_aux(self, *args, **kwargs):
         return self._speculative().run_target_verify_with_eagle3_aux(*args, **kwargs)
-
-    def run_target_verify_tree_with_eagle3_aux(self, *args, **kwargs):
-        return self._speculative().run_target_verify_tree_with_eagle3_aux(*args, **kwargs)
-
-    def run_speculative_tree_single(self, *args, **kwargs):
-        return self._speculative().run_speculative_tree_single(*args, **kwargs)
 
     def run_speculative_single(self, *args, **kwargs):
         return self._speculative().run_speculative_single(*args, **kwargs)
@@ -246,12 +232,6 @@ class ModelRunner:
         for layer_id, module in enumerate(attention_layers):
             module.k_cache = self.kv_cache[0, layer_id]
             module.v_cache = self.kv_cache[1, layer_id]
-        if self.speculative_tree_nodes:
-            self.tree_kv_cache_manager = TreeKVCacheManager(
-                attention_layers,
-                k_cache=self.kv_cache[0],
-                v_cache=self.kv_cache[1],
-            )
 
     def get_memory_metrics(self):
         seen_storages = set()

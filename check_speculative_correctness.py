@@ -64,7 +64,6 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--speculative-gamma", type=int, default=3)
-    parser.add_argument("--speculative-tree-nodes", type=int, choices=[0, 6, 10], default=0)
     parser.add_argument("--speculative-accept-mode", choices=["greedy", "rejection"], default="greedy")
     parser.add_argument("--speculative-trace", action="store_true")
     parser.add_argument("--enable-speculative-cuda-graph", action="store_true")
@@ -101,7 +100,6 @@ def run_single_request(
     seed: int,
     speculative_model: str | None,
     speculative_gamma: int,
-    speculative_tree_nodes: int,
     speculative_accept_mode: str,
     speculative_trace: bool,
     argmax_sampler: bool,
@@ -121,7 +119,6 @@ def run_single_request(
             max_num_batched_tokens=max_num_batched_tokens,
             speculative_model=speculative_model,
             speculative_gamma=speculative_gamma,
-            speculative_tree_nodes=speculative_tree_nodes,
             speculative_accept_mode=speculative_accept_mode,
             speculative_trace=speculative_trace,
             enable_speculative_cuda_graph=enable_speculative_cuda_graph,
@@ -388,7 +385,6 @@ def run_batch_consistency(args) -> dict:
 def run_comparison(args) -> dict:
     model = os.path.expanduser(args.model)
     speculative_model = os.path.expanduser(args.speculative_model) if args.speculative_model else None
-    speculative_tree_nodes = getattr(args, "speculative_tree_nodes", 0)
     if speculative_model is None:
         raise ValueError("--speculative-model or SPECULATIVE_MODEL is required")
     prompt = args.prompt if args.prompt is not None else args.prompt_token_ids
@@ -403,7 +399,6 @@ def run_comparison(args) -> dict:
         seed=args.seed,
         speculative_model=None,
         speculative_gamma=args.speculative_gamma,
-        speculative_tree_nodes=0,
         speculative_accept_mode=args.speculative_accept_mode,
         speculative_trace=args.speculative_trace,
         argmax_sampler=args.argmax_sampler,
@@ -420,7 +415,6 @@ def run_comparison(args) -> dict:
         seed=args.seed,
         speculative_model=speculative_model,
         speculative_gamma=args.speculative_gamma,
-        speculative_tree_nodes=speculative_tree_nodes,
         speculative_accept_mode=args.speculative_accept_mode,
         speculative_trace=args.speculative_trace,
         argmax_sampler=args.argmax_sampler,
@@ -440,7 +434,6 @@ def run_comparison(args) -> dict:
             "temperature": args.temperature,
             "seed": args.seed,
             "speculative_gamma": args.speculative_gamma,
-            "speculative_tree_nodes": speculative_tree_nodes,
             "speculative_accept_mode": args.speculative_accept_mode,
             "speculative_trace": args.speculative_trace,
             "enable_speculative_cuda_graph": args.enable_speculative_cuda_graph,
