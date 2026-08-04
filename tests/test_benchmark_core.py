@@ -162,6 +162,31 @@ class BenchmarkMetricTests(unittest.TestCase):
         self.assertIsNone(result["latency"]["overall"]["ttft"]["p50"])
         self.assertIsNone(result["goodput"])
 
+    def test_serving_summary_reports_cancellation_separately_from_failure(self):
+        from benchmarks.metrics import summarize_serving_run
+
+        requests = [
+            {
+                "request_class": "short",
+                "prompt_tokens": 10,
+                "output_tokens": 0,
+                "success": False,
+                "cancelled": True,
+                "status": "cancelled",
+                "arrival_time": 0.0,
+                "first_token_time": None,
+                "token_times": [],
+                "finish_time": 1.0,
+            }
+        ]
+
+        result = summarize_serving_run(requests, duration=2.0)
+
+        self.assertEqual(result["completed"], 0)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertIsNone(result["latency"]["overall"]["e2e"]["p50"])
+
     def test_speculative_summary_aggregates_request_counters_and_timing(self):
         from benchmarks.metrics import summarize_speculative_requests
 

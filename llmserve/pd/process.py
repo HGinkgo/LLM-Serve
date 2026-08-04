@@ -146,6 +146,13 @@ def worker_main(
                     worker_received_at=worker_received_at,
                 )
                 continue
+            if role == "decode" and command_type == "abort_request":
+                _reply(
+                    response_queue,
+                    result=runtime.abort_request(command["seq_id"]),
+                    worker_received_at=worker_received_at,
+                )
+                continue
             if role == "decode" and command_type == "metrics":
                 _reply(
                     response_queue,

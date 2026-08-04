@@ -15,6 +15,7 @@ class FakePDCoordinator:
         self.explicit_release_calls = []
         self.admit_calls = []
         self.decode_calls = 0
+        self.abort_calls = []
         self.decode_called = Event()
         self.second_prefill_started = Event()
         self.allow_second_prefill = Event()
@@ -102,6 +103,10 @@ class FakePDCoordinator:
                 "running_queue_size": 1,
             },
         }
+
+    def abort_decode_request(self, seq_id):
+        self.abort_calls.append(seq_id)
+        return True
 
     def decode_metrics(self):
         return {
@@ -270,6 +275,89 @@ class TestPDServingEngine(unittest.TestCase):
             coordinator.explicit_release_calls,
             [["transfer-1", "transfer-2"]],
         )
+
+    def test_abort_pending_request_is_idempotent_and_reported(self):
+        coordinator = FakePDCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        request_id = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+
+        self.assertTrue(engine.abort_request(request_id))
+        self.assertFalse(engine.abort_request(request_id))
+        self.assertFalse(engine.abort_request(request_id + 1000))
+        self.assertTrue(engine.is_finished())
+
+        metrics = engine.get_metrics()
+        request = metrics["requests"][0]
+        self.assertEqual(request["status"], "cancelled")
+        self.assertTrue(request["cancelled"])
+        self.assertEqual(metrics["summary"]["num_cancelled"], 1)
+        self.assertEqual(metrics["summary"]["num_failed"], 0)
+
+    def test_abort_active_decode_request_propagates_to_decode_worker(self):
+        class ActiveCoordinator(FakePDCoordinator):
+            def decode_step(self):
+                self.decode_calls += 1
+                return {
+                    "outputs": [],
+                    "num_tokens": 1,
+                    "last_step_events": {
+                        "scheduled_seq_ids": [100],
+                        "waiting_queue_size": 0,
+                        "running_queue_size": 1,
+                    },
+                }
+
+        coordinator = ActiveCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        request_id = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        engine.step()
+
+        self.assertTrue(engine.abort_request(request_id))
+        self.assertEqual(coordinator.abort_calls, [100])
+        self.assertEqual(engine._active_by_decode_seq, {})
+        self.assertTrue(engine.is_finished())
+
+    def test_abort_inflight_prefill_discards_handoff_and_releases_slot(self):
+        class BlockingSharedCoordinator(FakePDCoordinator):
+            def __init__(self):
+                super().__init__()
+                self.prefill_started = Event()
+                self.allow_prefill = Event()
+
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                self.prefill_calls.append(list(envelopes))
+                self.prefill_release_calls.append(list(release_transfer_ids))
+                self.prefill_started.set()
+                if not self.allow_prefill.wait(timeout=2):
+                    raise AssertionError("prefill was not released")
+                return [
+                    SimpleNamespace(
+                        request_id=envelope.request_id,
+                        descriptor=SimpleNamespace(
+                            transport="shared_slot",
+                            transfer_id=f"transfer-{envelope.request_id}",
+                            slot_id=0,
+                            slot_generation=1,
+                        ),
+                        prefill_timing_ms={},
+                    )
+                    for envelope in envelopes
+                ]
+
+        coordinator = BlockingSharedCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        request_id = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        engine._start_prefill()
+        self.assertTrue(coordinator.prefill_started.wait(timeout=2))
+
+        self.assertTrue(engine.abort_request(request_id))
+        coordinator.allow_prefill.set()
+        engine._prefill_future.result(timeout=2)
+        engine._collect_prefill()
+
+        self.assertEqual(coordinator.admit_calls, [])
+        self.assertEqual(coordinator.explicit_release_calls, [["transfer-0"]])
+        self.assertTrue(engine.is_finished())
 
 
 if __name__ == "__main__":

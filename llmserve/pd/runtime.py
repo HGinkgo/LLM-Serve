@@ -320,6 +320,9 @@ class DecodeWorkerRuntime:
             raise RuntimeError("Decode Worker shared KV slots are already attached")
         self.slot_reader = SharedKVSlotReader(handle)
 
+    def abort_request(self, seq_id: int) -> bool:
+        return self.engine.abort_request(seq_id)
+
     def admit_batch(self, handoffs: list[PrefillHandoff]) -> list[dict]:
         handoffs = list(handoffs)
         if not handoffs:

@@ -203,6 +203,8 @@ class BenchmarkSchemaTests(unittest.TestCase):
 
         self.assertEqual(compact["seq_id"], 7)
         self.assertEqual(compact["request_class"], "short")
+        self.assertFalse(compact["cancelled"])
+        self.assertEqual(compact["status"], "completed")
         self.assertEqual(compact["ttft_ms"], 1000.0)
         self.assertEqual(compact["tpot_ms"], 1000.0)
         self.assertEqual(compact["e2e_ms"], 3000.0)

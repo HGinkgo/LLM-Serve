@@ -7,7 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from time import perf_counter
 
-from llmserve.pd.protocol import RequestEnvelope
+from llmserve.pd.protocol import RequestEnvelope, RequestLifecycle, RequestState
 
 
 class PDServingEngine:
@@ -59,16 +59,50 @@ class PDServingEngine:
         self._requests[request_id] = {
             "request_id": request_id,
             "arrival_time": perf_counter(),
+            "prompt_tokens": len(token_ids),
             "decode_seq_id": None,
+            "finish_time": None,
+            "lifecycle": RequestLifecycle(request_id),
         }
         return request_id
+
+    def abort_request(self, request_id: int) -> bool:
+        """Cancel a PD request at a boundary between serving steps."""
+        request = self._requests.get(request_id)
+        if request is None:
+            return False
+        lifecycle = request["lifecycle"]
+        if lifecycle.is_terminal:
+            return False
+
+        if lifecycle.state == RequestState.QUEUED:
+            self._pending = deque(
+                envelope
+                for envelope in self._pending
+                if envelope.request_id != request_id
+            )
+        elif lifecycle.state == RequestState.DECODING:
+            decode_seq_id = request.get("decode_seq_id")
+            if decode_seq_id is None:
+                return False
+            if not self.coordinator.abort_decode_request(decode_seq_id):
+                return False
+            self._active_by_decode_seq.pop(decode_seq_id, None)
+
+        lifecycle.cancel()
+        request["finish_time"] = perf_counter()
+        return True
 
     def _start_prefill(self):
         if self._prefill_future is not None or not self._pending:
             return
         batch = []
         while self._pending and len(batch) < self.prefill_batch_size:
-            batch.append(self._pending.popleft())
+            envelope = self._pending.popleft()
+            self._requests[envelope.request_id]["lifecycle"].transition(
+                RequestState.PREFILLING
+            )
+            batch.append(envelope)
         submitted_at = perf_counter()
         release_transfer_ids = self._pending_transfer_acks
         self._pending_transfer_acks = []
@@ -110,16 +144,41 @@ class PDServingEngine:
         self._prefill_future = None
         self._prefill_future_meta = None
         self._start_prefill()
+        admitted_handoffs = []
+        for handoff in handoffs:
+            request = self._requests.get(handoff.request_id)
+            if request is None:
+                raise RuntimeError("Prefill Worker returned an unknown request")
+            lifecycle = request["lifecycle"]
+            if lifecycle.state == RequestState.CANCELLED:
+                descriptor = getattr(handoff, "descriptor", None)
+                if getattr(descriptor, "transport", "inline") == "shared_slot":
+                    self._pending_transfer_acks.append(descriptor.transfer_id)
+                continue
+            lifecycle.transition(RequestState.HANDOFF)
+            admitted_handoffs.append(handoff)
+
         admit_started_at = perf_counter()
-        admissions = list(self.coordinator.admit_batch(handoffs))
+        admissions = (
+            list(self.coordinator.admit_batch(admitted_handoffs))
+            if admitted_handoffs
+            else []
+        )
         admit_finished_at = perf_counter()
-        decode_rpc_timing = self.coordinator.last_rpc_timing("decode")
-        if len(admissions) != len(handoffs):
+        decode_rpc_timing = (
+            self.coordinator.last_rpc_timing("decode")
+            if admitted_handoffs
+            else {}
+        )
+        if len(admissions) != len(admitted_handoffs):
             raise RuntimeError("Decode Worker returned an incomplete admission batch")
-        for handoff, admission in zip(handoffs, admissions):
+        for handoff, admission in zip(admitted_handoffs, admissions):
             request_id = handoff.request_id
             if request_id not in self._requests:
                 raise RuntimeError("Decode Worker admitted an unknown request")
+            request = self._requests[request_id]
+            lifecycle = request["lifecycle"]
+            lifecycle.transition(RequestState.DECODING)
             descriptor = getattr(handoff, "descriptor", None)
             if getattr(descriptor, "transport", "inline") == "shared_slot":
                 transfer_id = admission.get("transfer_id")
@@ -127,15 +186,17 @@ class PDServingEngine:
                     raise RuntimeError("Decode Worker returned an invalid transfer ACK")
                 self._pending_transfer_acks.append(transfer_id)
             if admission.get("finished"):
-                self._requests[request_id]["finished_without_step"] = list(
+                request["finished_without_step"] = list(
                     admission.get("output_token_ids") or ()
                 )
+                request["finish_time"] = admit_finished_at
+                lifecycle.transition(RequestState.FINISHED)
                 continue
             decode_seq_id = admission.get("seq_id")
             if decode_seq_id in self._active_by_decode_seq:
                 raise RuntimeError("Decode Worker returned duplicate sequence ids")
             self._active_by_decode_seq[decode_seq_id] = request_id
-            self._requests[request_id]["decode_seq_id"] = decode_seq_id
+            request["decode_seq_id"] = decode_seq_id
         prefill_timing = getattr(handoffs[0], "prefill_timing_ms", {}) if handoffs else {}
         worker_total_ms = prefill_timing.get("worker_total_ms")
         self._prefill_batches.append(
@@ -249,6 +310,9 @@ class PDServingEngine:
             request_id = self._active_by_decode_seq.pop(decode_seq_id, None)
             if request_id is None:
                 raise RuntimeError("Decode Worker returned an unknown sequence id")
+            request = self._requests[request_id]
+            request["finish_time"] = perf_counter()
+            request["lifecycle"].transition(RequestState.FINISHED)
             outputs.append((request_id, list(token_ids)))
         events = deepcopy(result.get("last_step_events") or {})
         scheduled_ids = events.get("scheduled_seq_ids", ())
@@ -293,34 +357,57 @@ class PDServingEngine:
             if request.get("decode_seq_id") is not None
         }
         requests = []
+        included_request_ids = set()
         for worker_request in worker_requests:
             request = dict(worker_request)
             request_id = seq_to_request_id.get(request.get("seq_id"))
             if request_id is None:
                 continue
             request["seq_id"] = request_id
-            request["arrival_time"] = self._requests[request_id]["arrival_time"]
+            local_request = self._requests[request_id]
+            request["arrival_time"] = local_request["arrival_time"]
+            request["status"] = local_request["lifecycle"].state.value
+            request["cancelled"] = (
+                local_request["lifecycle"].state == RequestState.CANCELLED
+            )
             requests.append(request)
+            included_request_ids.add(request_id)
         for request_id, request in self._requests.items():
-            if request.get("finished_without_step") is not None and not any(
-                item["seq_id"] == request_id for item in requests
-            ):
-                now = perf_counter()
+            if request_id not in included_request_ids:
+                lifecycle = request["lifecycle"]
+                now = request.get("finish_time") or perf_counter()
+                output_token_ids = request.get("finished_without_step") or ()
+                success = lifecycle.state == RequestState.FINISHED
+                cancelled = lifecycle.state == RequestState.CANCELLED
                 requests.append(
                     {
                         "seq_id": request_id,
-                        "prompt_tokens": 0,
-                        "output_tokens": len(request["finished_without_step"]),
-                        "success": True,
+                        "prompt_tokens": request["prompt_tokens"],
+                        "output_tokens": len(output_token_ids),
+                        "success": success,
+                        "cancelled": cancelled,
+                        "status": lifecycle.state.value,
                         "failure_reason": None,
                         "arrival_time": request["arrival_time"],
-                        "first_token_time": now,
-                        "token_times": [now],
-                        "output_event_times": [now],
-                        "finish_time": now,
+                        "first_token_time": now if output_token_ids else None,
+                        "token_times": [now] if output_token_ids else [],
+                        "output_event_times": [now] if output_token_ids else [],
+                        "finish_time": request.get("finish_time"),
                     }
                 )
         summary = deepcopy(worker_metrics.get("summary", {}))
+        summary["num_requests"] = len(requests)
+        summary["num_finished"] = sum(
+            1 for request in requests if request.get("success")
+        )
+        summary["num_cancelled"] = sum(
+            1 for request in requests if request.get("cancelled")
+        )
+        summary["num_failed"] = (
+            summary["num_requests"]
+            - summary["num_finished"]
+            - summary["num_cancelled"]
+        )
         timing_fields = {
             "roundtrip_ms": "prefill_roundtrip_ms",
             "admit_ms": "admit_roundtrip_ms",

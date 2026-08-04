@@ -268,6 +268,23 @@ class Scheduler:
         self._release_reservation(seq)
         seq.num_scheduled_tokens = 0
 
+    def abort_request(self, seq_id: int) -> Sequence | None:
+        """Cancel an owned request and release its scheduler resources."""
+        seq = next(
+            (
+                candidate
+                for queue in (self.waiting, self.running)
+                for candidate in queue
+                if candidate.seq_id == seq_id
+            ),
+            None,
+        )
+        if seq is None:
+            return None
+        self.remove_sequence(seq)
+        seq.status = SequenceStatus.CANCELLED
+        return seq
+
     def admit_prefilled(self, seq: Sequence, cached_tokens: int):
         """Admit a sequence whose prompt KV arrived from another worker."""
         if seq.block_table or seq in self.waiting or seq in self.running:

@@ -52,6 +52,11 @@ def compact_request_record(request: dict):
         "prompt_tokens": request["prompt_tokens"],
         "output_tokens": output_tokens,
         "success": request["success"],
+        "cancelled": request.get("cancelled", False),
+        "status": request.get(
+            "status",
+            "completed" if request["success"] else "failed",
+        ),
         "failure_reason": request.get("failure_reason"),
         "ttft_ms": ttft_ms,
         "tpot_ms": tpot_ms,

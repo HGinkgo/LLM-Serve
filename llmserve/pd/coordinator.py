@@ -268,6 +268,14 @@ class PDCoordinator:
     def decode_step(self):
         return self._call("decode", {"type": "step"})
 
+    def abort_decode_request(self, seq_id: int) -> bool:
+        return bool(
+            self._call(
+                "decode",
+                {"type": "abort_request", "seq_id": seq_id},
+            )
+        )
+
     def decode_metrics(self):
         return self._call("decode", {"type": "metrics"})
 

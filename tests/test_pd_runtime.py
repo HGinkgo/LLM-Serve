@@ -62,6 +62,10 @@ class FakeDecodeEngine:
         self.calls.append((args, kwargs))
         return 123
 
+    def abort_request(self, seq_id):
+        self.calls.append(("abort_request", seq_id))
+        return True
+
 
 class FakeBatchPrefillScheduler:
 
@@ -384,6 +388,13 @@ class TestPDRuntime(unittest.TestCase):
 
         self.assertEqual(len(admissions), 2)
         self.assertEqual([admission["seq_id"] for admission in admissions], [123, 123])
+
+    def test_decode_runtime_aborts_engine_request(self):
+        engine = FakeDecodeEngine()
+        runtime = DecodeWorkerRuntime(engine)
+
+        self.assertTrue(runtime.abort_request(123))
+        self.assertEqual(engine.calls, [("abort_request", 123)])
 
 
 if __name__ == "__main__":

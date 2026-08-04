@@ -166,6 +166,12 @@ def summarize_serving_run(
     if duration <= 0:
         raise ValueError("duration must be positive")
     successful = [request for request in requests if request["success"]]
+    cancelled = [request for request in requests if request.get("cancelled", False)]
+    failed = [
+        request
+        for request in requests
+        if not request["success"] and not request.get("cancelled", False)
+    ]
     groups = {"overall": successful}
     for request in successful:
         groups.setdefault(request["request_class"], []).append(request)
@@ -174,7 +180,8 @@ def summarize_serving_run(
     output_tokens = sum(request["output_tokens"] for request in successful)
     return {
         "completed": len(successful),
-        "failed": len(requests) - len(successful),
+        "cancelled": len(cancelled),
+        "failed": len(failed),
         "duration": duration,
         "throughput": {
             "requests_per_second": len(successful) / duration,

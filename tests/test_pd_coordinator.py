@@ -164,6 +164,21 @@ class TestPDConfig(unittest.TestCase):
         self.assertEqual(result[0]["transfer_id"], "transfer-7")
         self.assertEqual(queue.commands[0]["type"], "admit_batch")
 
+    def test_abort_decode_request_sends_worker_command(self):
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        queue = FakeQueue(responses=[{"ok": True, "result": True}])
+        coordinator._workers = {
+            "decode": {"commands": queue, "responses": queue},
+        }
+
+        self.assertTrue(coordinator.abort_decode_request(9))
+        self.assertEqual(queue.commands[0]["type"], "abort_request")
+        self.assertEqual(queue.commands[0]["seq_id"], 9)
+
     def test_worker_rpc_surfaces_remote_error(self):
         config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
         coordinator = PDCoordinator.__new__(PDCoordinator)

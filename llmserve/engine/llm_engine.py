@@ -109,6 +109,7 @@ class LLMEngine:
             "prompt_tokens": seq.num_prompt_tokens,
             "output_tokens": 0,
             "success": False,
+            "cancelled": False,
             "failure_reason": None,
             "speculative_steps": 0,
             "speculative_draft_tokens": 0,
@@ -128,6 +129,24 @@ class LLMEngine:
         self.request_metrics[seq.seq_id] = self._new_request_metric(seq)
         self.scheduler.add(seq)
         return seq.seq_id
+
+    def abort_request(self, seq_id: int) -> bool:
+        """Cancel a waiting or running request between engine steps."""
+        seq = self.scheduler.abort_request(seq_id)
+        if seq is None:
+            return False
+
+        if getattr(self.model_runner, "draft_model", None) is not None:
+            self.model_runner.call("clear_speculative_state", [seq_id])
+
+        metric = self.request_metrics.get(seq_id)
+        if metric is not None:
+            metric["finish_time"] = perf_counter()
+            metric["output_tokens"] = seq.num_completion_tokens
+            metric["success"] = False
+            metric["cancelled"] = True
+            metric["failure_reason"] = None
+        return True
 
     def add_prefilled_request(
         self,
@@ -456,6 +475,7 @@ class LLMEngine:
             finish_time = metric["finish_time"]
             output_tokens = metric["output_tokens"]
             success = metric["success"]
+            cancelled = metric.get("cancelled", False)
             failure_reason = metric["failure_reason"]
             speculative_steps = metric.get("speculative_steps", 0)
             speculative_draft_tokens = metric.get("speculative_draft_tokens", 0)
@@ -502,21 +522,33 @@ class LLMEngine:
             latency = None
             if finish_time is not None:
                 latency = finish_time - arrival_time
-                request_latencies.append(latency)
-                if output_tokens > 1 and first_token_time is not None:
-                    tpot = (finish_time - first_token_time) / (output_tokens - 1)
-                    tpots.append(tpot)
-                elif output_tokens == 1:
-                    tpots.append(0.0)
-            elif not success:
+                if success:
+                    request_latencies.append(latency)
+                    if output_tokens > 1 and first_token_time is not None:
+                        tpot = (finish_time - first_token_time) / (output_tokens - 1)
+                        tpots.append(tpot)
+                    elif output_tokens == 1:
+                        tpots.append(0.0)
+            elif not success and not cancelled:
                 failure_reason = failure_reason or "unfinished"
+
+            if cancelled:
+                status = "cancelled"
+            elif success:
+                status = "completed"
+            elif finish_time is not None:
+                status = "failed"
+            else:
+                status = "active"
 
             requests.append({
                 "seq_id": metric["seq_id"],
                 "prompt_tokens": metric["prompt_tokens"],
                 "output_tokens": output_tokens,
                 "success": success,
-                "failure_reason": None if success else failure_reason,
+                "cancelled": cancelled,
+                "status": status,
+                "failure_reason": None if success or cancelled else failure_reason,
                 "arrival_time": arrival_time,
                 "first_token_time": first_token_time,
                 "token_times": token_times,
@@ -546,11 +578,13 @@ class LLMEngine:
 
         num_requests = len(requests)
         num_finished = sum(1 for request in requests if request["success"])
+        num_cancelled = sum(1 for request in requests if request["cancelled"])
         return {
             "summary": {
                 "num_requests": num_requests,
                 "num_finished": num_finished,
-                "num_failed": num_requests - num_finished,
+                "num_cancelled": num_cancelled,
+                "num_failed": num_requests - num_finished - num_cancelled,
                 "total_output_tokens": total_output_tokens,
                 "wall_time": wall_time,
                 "throughput": total_output_tokens / wall_time if wall_time > 0 else 0.0,
