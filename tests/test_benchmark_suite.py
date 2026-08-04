@@ -70,18 +70,11 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "awq-capacity-confirm.json",
                 "formal-closed-loop.json",
                 "formal-poisson.json",
-                "pilot.json",
-                "pd-capacity-smoke.json",
-                "pd-capacity.json",
-                "pd-prefill-batch-sweep.json",
-                "pd-decode-graph-formal.json",
-                "pd-prefill-graph-crossover.json",
                 "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
                 "pd-serving-formal.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
-                "stage8-graph-smoke.json",
             },
         )
         for path in suite_paths:
@@ -91,11 +84,6 @@ class BenchmarkSuiteTests(unittest.TestCase):
             self.assertEqual(
                 len({point["point_id"] for point in points}), len(points)
             )
-            if path.name == "pilot.json":
-                self.assertTrue(all(
-                    experiment["measurement_seconds"] >= 30
-                    for experiment in suite["experiments"]
-                ))
             if path.name == "awq-capacity-confirm.json":
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 12)
@@ -110,83 +98,6 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 ))
                 self.assertTrue(all(
                     point["runtime"]["enable_kv_capacity_admission"]
-                    for point in points
-                ))
-            if path.name == "pd-capacity-smoke.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 6)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {4, 8, 16},
-                )
-                pd_points = [point for point in points if point["variant"] == "pd"]
-                self.assertTrue(all(
-                    point["runtime"]["pd"]
-                    and point["runtime"]["prefill_batch_size"] == 1
-                    for point in pd_points
-                ))
-            if path.name == "pd-capacity.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 24)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {16, 32, 48, 64},
-                )
-                pd_points = [point for point in points if point["variant"] == "pd"]
-                self.assertTrue(all(point["runtime"]["pd"] for point in pd_points))
-            if path.name == "pd-prefill-batch-sweep.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 45)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {32, 48, 64},
-                )
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"baseline", "pd-b1", "pd-b2", "pd-b4", "pd-b8"},
-                )
-                pd_points = [point for point in points if point["variant"].startswith("pd-")]
-                self.assertTrue(all(
-                    point["runtime"]["pd"]
-                    and point["runtime"]["max_num_batched_tokens"] == 1024
-                    for point in pd_points
-                ))
-            if path.name == "pd-decode-graph-formal.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 18)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {48, 64},
-                )
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"baseline", "pd-b2-eager", "pd-b2-graph"},
-                )
-                graph_points = [
-                    point for point in points if point["variant"] == "pd-b2-graph"
-                ]
-                self.assertTrue(all(
-                    point["runtime"]["pd"]
-                    and point["runtime"]["prefill_batch_size"] == 2
-                    and point["runtime"]["prefill_enforce_eager"]
-                    and not point["runtime"]["decode_enforce_eager"]
-                    for point in graph_points
-                ))
-            if path.name == "pd-prefill-graph-crossover.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 12)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {48, 64},
-                )
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"pd-b2-graph", "pd-b4-graph"},
-                )
-                self.assertTrue(all(
-                    point["runtime"]["pd"]
-                    and point["runtime"]["prefill_enforce_eager"]
-                    and not point["runtime"]["decode_enforce_eager"]
                     for point in points
                 ))
             if path.name == "pd-kv-pipeline-formal.json":
