@@ -78,6 +78,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-prefill-graph-crossover.json",
                 "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
+                "pd-serving-formal.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
                 "stage8-graph-smoke.json",
@@ -213,6 +214,60 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     and point["warmup_seconds"] == 30
                     and point["measurement_seconds"] == 60
                     for point in shared_points
+                ))
+            if path.name == "pd-serving-formal.json":
+                self.assertEqual(suite["runs"], 3)
+                self.assertEqual(len(points), 48)
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"collocated-bf16-graph", "pd-b4-shared-graph"},
+                )
+                closed_points = [
+                    point
+                    for point in points
+                    if point["arrival"] == "closed-loop"
+                ]
+                poisson_points = [
+                    point
+                    for point in points
+                    if point["arrival"] == "poisson"
+                ]
+                self.assertEqual(len(closed_points), 24)
+                self.assertEqual(len(poisson_points), 24)
+                self.assertEqual(
+                    {point["max_concurrency"] for point in closed_points},
+                    {16, 32, 48, 64},
+                )
+                self.assertEqual(
+                    {point["request_rate"] for point in poisson_points},
+                    {8, 16, 24, 28},
+                )
+                self.assertEqual(
+                    {point["num_requests"] for point in poisson_points},
+                    {96},
+                )
+                pd_points = [
+                    point
+                    for point in points
+                    if point["variant"] == "pd-b4-shared-graph"
+                ]
+                self.assertTrue(all(
+                    point["runtime"]["pd"]
+                    and point["runtime"]["prefill_batch_size"] == 4
+                    and point["runtime"]["prefill_enforce_eager"]
+                    and not point["runtime"]["decode_enforce_eager"]
+                    and point["runtime"]["kv_slot_count"] == 2
+                    for point in pd_points
+                ))
+                collocated_points = [
+                    point
+                    for point in points
+                    if point["variant"] == "collocated-bf16-graph"
+                ]
+                self.assertTrue(all(
+                    not point["runtime"].get("pd", False)
+                    and not point["runtime"]["enforce_eager"]
+                    for point in collocated_points
                 ))
             if path.name.startswith("formal-"):
                 self.assertEqual(suite["runs"], 3)
