@@ -11,12 +11,16 @@ class FakeQueue:
     def __init__(self, responses=()):
         self.responses = deque(responses)
         self.commands = []
+        self.closed = False
 
     def put(self, command):
         self.commands.append(command)
 
     def get(self, timeout=None):
         return self.responses.popleft()
+
+    def close(self):
+        self.closed = True
 
 
 class TestPDConfig(unittest.TestCase):
@@ -229,6 +233,95 @@ class TestPDConfig(unittest.TestCase):
             health["decode"],
             {"pid": 11, "alive": False, "exitcode": 0},
         )
+
+    def test_rpc_fails_before_enqueue_when_worker_is_dead(self):
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        queue = FakeQueue()
+        coordinator._workers = {
+            "decode": {
+                "process": SimpleNamespace(is_alive=lambda: False, exitcode=9),
+                "commands": queue,
+                "responses": queue,
+            },
+        }
+
+        with self.assertRaisesRegex(PDWorkerError, "not alive"):
+            coordinator.decode_step()
+
+        self.assertEqual(queue.commands, [])
+
+    def test_close_skips_shutdown_rpc_for_failed_worker_and_is_idempotent(self):
+        class FakeProcess:
+            pid = 10
+            exitcode = 1
+
+            def __init__(self):
+                self.join_calls = 0
+                self.terminate_calls = 0
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                self.join_calls += 1
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        coordinator._failed_roles = {"decode"}
+        process = FakeProcess()
+        commands = FakeQueue()
+        responses = FakeQueue()
+        coordinator._workers = {
+            "decode": {
+                "process": process,
+                "commands": commands,
+                "responses": responses,
+            },
+        }
+        coordinator._transport_handle = object()
+
+        coordinator.close()
+        coordinator.close()
+
+        self.assertEqual(commands.commands, [])
+        self.assertEqual(process.join_calls, 1)
+        self.assertTrue(commands.closed)
+        self.assertTrue(responses.closed)
+        self.assertFalse(coordinator._started)
+
+    def test_rpc_wraps_broken_response_channel_as_worker_error(self):
+        class BrokenResponseQueue(FakeQueue):
+            def get(self, timeout=None):
+                raise EOFError("response pipe closed")
+
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        coordinator._failed_roles = set()
+        commands = FakeQueue()
+        coordinator._workers = {
+            "decode": {
+                "commands": commands,
+                "responses": BrokenResponseQueue(),
+            },
+        }
+
+        with self.assertRaisesRegex(PDWorkerError, "response channel failed"):
+            coordinator.decode_step()
+
+        self.assertEqual(coordinator._failed_roles, {"decode"})
 
 
 if __name__ == "__main__":

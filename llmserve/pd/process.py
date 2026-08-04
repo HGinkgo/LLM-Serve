@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import os
+import signal
 from time import perf_counter
 import traceback
+
+
+def _handle_termination(signum, _frame):
+    """Convert SIGTERM into normal interpreter unwinding for worker cleanup."""
+    raise SystemExit(128 + signum)
 
 
 def _destroy_process_group(distributed=None):
@@ -53,6 +59,7 @@ def worker_main(
     CUDA_VISIBLE_DEVICES is set before importing the engine so each worker sees
     its assigned physical GPU as local device 0.
     """
+    signal.signal(signal.SIGTERM, _handle_termination)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     from llmserve import LLM
     from llmserve.pd.protocol import RequestEnvelope

@@ -8,6 +8,37 @@ from llmserve.engine.scheduler import Scheduler
 from llmserve.engine.sequence import Sequence, SequenceStatus
 
 
+def make_scheduler():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.eos = 99
+    scheduler.block_manager = BlockManager(num_blocks=8, block_size=4)
+    scheduler.max_num_seqs = 4
+    scheduler.max_num_batched_tokens = 8
+    scheduler.enable_chunked_prefill = True
+    scheduler.waiting = deque()
+    scheduler.running = deque()
+    scheduler.enable_kv_capacity_admission = True
+    scheduler.max_model_len = 4096
+    scheduler.speculative_reserve_tokens = 0
+    scheduler._reserved_blocks = {}
+    scheduler.preemption_count = 0
+    scheduler.admission_deferred_count = 0
+    scheduler.peak_reserved_blocks = 0
+    return scheduler
+
+
+def make_engine(scheduler, model_runner=None):
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.scheduler = scheduler
+    engine.model_runner = model_runner or SimpleNamespace(draft_model=None)
+    engine.request_metrics = {}
+    engine.last_step_events = {}
+    engine.speculative_batch_calls = 0
+    engine.speculative_batch_sequences = 0
+    engine.speculative_max_batch_size = 0
+    return engine
+
+
 class RequestAbortTest(unittest.TestCase):
     def setUp(self):
         self.old_block_size = Sequence.block_size
@@ -16,36 +47,8 @@ class RequestAbortTest(unittest.TestCase):
     def tearDown(self):
         Sequence.block_size = self.old_block_size
 
-    @staticmethod
-    def make_scheduler():
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.eos = 99
-        scheduler.block_manager = BlockManager(num_blocks=8, block_size=4)
-        scheduler.max_num_seqs = 4
-        scheduler.max_num_batched_tokens = 8
-        scheduler.enable_chunked_prefill = True
-        scheduler.waiting = deque()
-        scheduler.running = deque()
-        scheduler.enable_kv_capacity_admission = True
-        scheduler.max_model_len = 4096
-        scheduler.speculative_reserve_tokens = 0
-        scheduler._reserved_blocks = {}
-        scheduler.preemption_count = 0
-        scheduler.admission_deferred_count = 0
-        scheduler.peak_reserved_blocks = 0
-        return scheduler
-
-    @staticmethod
-    def make_engine(scheduler, model_runner=None):
-        engine = LLMEngine.__new__(LLMEngine)
-        engine.scheduler = scheduler
-        engine.model_runner = model_runner or SimpleNamespace(draft_model=None)
-        engine.request_metrics = {}
-        engine.last_step_events = {}
-        engine.speculative_batch_calls = 0
-        engine.speculative_batch_sequences = 0
-        engine.speculative_max_batch_size = 0
-        return engine
+    make_scheduler = staticmethod(make_scheduler)
+    make_engine = staticmethod(make_engine)
 
     def test_scheduler_aborts_waiting_sequence_and_releases_all_ownership(self):
         scheduler = self.make_scheduler()

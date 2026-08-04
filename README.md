@@ -77,6 +77,8 @@ finally:
 需要自行驱动连续批处理时，可使用 `add_request()` / `step()`，并通过
 `abort_request(request_id)` 取消请求。取消仅在两次 `step()` 之间生效，
 不会中断正在执行的 GPU step；Baseline、EAGLE 与 PD 路径采用相同语义。
+PD Worker 或 RPC 故障会终止当前 `PDServingEngine`，并将未完成请求标记为
+`failed`；继续服务需要创建新的 Engine 实例。
 
 ## 文档
 

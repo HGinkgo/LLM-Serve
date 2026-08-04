@@ -16,6 +16,7 @@ class FakePDCoordinator:
         self.admit_calls = []
         self.decode_calls = 0
         self.abort_calls = []
+        self.close_calls = 0
         self.decode_called = Event()
         self.second_prefill_started = Event()
         self.allow_second_prefill = Event()
@@ -134,7 +135,7 @@ class FakePDCoordinator:
         return self.health
 
     def close(self):
-        return None
+        self.close_calls += 1
 
 
 class TestPDServingEngine(unittest.TestCase):
@@ -358,6 +359,136 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual(coordinator.admit_calls, [])
         self.assertEqual(coordinator.explicit_release_calls, [["transfer-0"]])
         self.assertTrue(engine.is_finished())
+
+    def test_prefill_failure_marks_every_request_failed_and_closes_engine(self):
+        class FailingPrefillCoordinator(FakePDCoordinator):
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                raise RuntimeError("prefill exploded")
+
+        coordinator = FailingPrefillCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        engine.add_request([3, 4], SamplingParams(max_tokens=2))
+
+        with self.assertRaisesRegex(RuntimeError, "prefill exploded"):
+            engine.step()
+
+        self.assertTrue(engine.is_finished())
+        self.assertEqual(coordinator.close_calls, 1)
+        engine.exit()
+        self.assertEqual(coordinator.close_calls, 1)
+        metrics = engine.get_metrics()
+        self.assertEqual(metrics["summary"]["num_failed"], 2)
+        self.assertEqual(metrics["summary"]["num_cancelled"], 0)
+        self.assertTrue(
+            all(request["status"] == "failed" for request in metrics["requests"])
+        )
+        self.assertTrue(
+            all(
+                "prefill exploded" in request["failure_reason"]
+                for request in metrics["requests"]
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            engine.add_request([5, 6], SamplingParams(max_tokens=2))
+
+    def test_decode_failure_clears_active_ownership_and_records_failure(self):
+        class FailingDecodeCoordinator(FakePDCoordinator):
+            def decode_step(self):
+                raise RuntimeError("decode exploded")
+
+        coordinator = FailingDecodeCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+
+        with self.assertRaisesRegex(RuntimeError, "decode exploded"):
+            engine.step()
+
+        self.assertEqual(engine._active_by_decode_seq, {})
+        self.assertTrue(engine.is_finished())
+        request = engine.get_metrics()["requests"][0]
+        self.assertEqual(request["status"], "failed")
+        self.assertIn("decode exploded", request["failure_reason"])
+
+    def test_admission_failure_releases_unconsumed_shared_transfer(self):
+        class FailingAdmissionCoordinator(FakePDCoordinator):
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                return [
+                    SimpleNamespace(
+                        request_id=envelope.request_id,
+                        descriptor=SimpleNamespace(
+                            transport="shared_slot",
+                            transfer_id=f"transfer-{envelope.request_id}",
+                            slot_id=0,
+                            slot_generation=1,
+                        ),
+                        prefill_timing_ms={},
+                    )
+                    for envelope in envelopes
+                ]
+
+            def admit_batch(self, handoffs):
+                raise RuntimeError("admission exploded")
+
+        coordinator = FailingAdmissionCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+
+        with self.assertRaisesRegex(RuntimeError, "admission exploded"):
+            engine.step()
+
+        self.assertEqual(coordinator.explicit_release_calls, [["transfer-0"]])
+        self.assertTrue(engine.is_finished())
+
+    def test_transfer_release_failure_does_not_mask_admission_failure(self):
+        class FailingCleanupCoordinator(FakePDCoordinator):
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                return [
+                    SimpleNamespace(
+                        request_id=envelopes[0].request_id,
+                        descriptor=SimpleNamespace(
+                            transport="shared_slot",
+                            transfer_id="transfer-0",
+                            slot_id=0,
+                            slot_generation=1,
+                        ),
+                        prefill_timing_ms={},
+                    )
+                ]
+
+            def admit_batch(self, handoffs):
+                raise RuntimeError("admission exploded")
+
+            def release_prefill_transfers(self, transfer_ids):
+                raise RuntimeError("release exploded")
+
+        coordinator = FailingCleanupCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+
+        with self.assertRaisesRegex(RuntimeError, "admission exploded"):
+            engine.step()
+
+        self.assertTrue(engine.is_finished())
+
+    def test_close_failure_does_not_mask_worker_failure(self):
+        class FailingPrefillAndCloseCoordinator(FakePDCoordinator):
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                raise RuntimeError("prefill exploded")
+
+            def close(self):
+                self.close_calls += 1
+                raise RuntimeError("close exploded")
+
+        coordinator = FailingPrefillAndCloseCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+
+        with self.assertRaisesRegex(RuntimeError, "prefill exploded"):
+            engine.step()
+
+        self.assertTrue(engine.is_finished())
+        self.assertEqual(coordinator.close_calls, 1)
 
 
 if __name__ == "__main__":

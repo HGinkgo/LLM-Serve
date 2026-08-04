@@ -1,6 +1,7 @@
 import unittest
+import signal
 
-from llmserve.pd.process import _destroy_process_group
+from llmserve.pd.process import _destroy_process_group, _handle_termination
 
 
 class FakeDistributed:
@@ -18,6 +19,12 @@ class FakeDistributed:
 
 
 class TestPDProcessCleanup(unittest.TestCase):
+
+    def test_sigterm_is_converted_to_system_exit_for_finally_cleanup(self):
+        with self.assertRaises(SystemExit) as raised:
+            _handle_termination(signal.SIGTERM, None)
+
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
 
     def test_destroys_initialized_process_group(self):
         distributed = FakeDistributed(initialized=True)

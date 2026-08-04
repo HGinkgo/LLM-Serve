@@ -74,6 +74,13 @@ finally:
     llm.exit()
 ```
 
+For custom continuous-batching loops, use `add_request()` / `step()` and
+`abort_request(request_id)`. Cancellation takes effect between `step()` calls
+and does not interrupt an in-flight GPU step; Baseline, EAGLE, and PD use the
+same semantics. A PD Worker or RPC failure terminates the current
+`PDServingEngine` and marks unfinished requests as `failed`; create a new
+Engine instance before serving more requests.
+
 ## Documentation
 
 - [Basic Python example](example.py)

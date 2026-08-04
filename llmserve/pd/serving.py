@@ -34,6 +34,8 @@ class PDServingEngine:
         self._slot_release_samples: list[dict] = []
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._fatal_error: str | None = None
+        self._failure_worker_health: dict | None = None
         self.last_step_events: dict = {}
         self._prefill_batches: list[dict] = []
         self._queue_samples: list[dict] = []
@@ -41,6 +43,8 @@ class PDServingEngine:
         self.coordinator.start()
 
     def add_request(self, prompt: str | list[int], sampling_params) -> int:
+        if self._fatal_error is not None:
+            raise RuntimeError(f"PD serving engine failed: {self._fatal_error}")
         if self._closed:
             raise RuntimeError("PD serving engine is closed")
         if isinstance(prompt, str):
@@ -159,11 +163,22 @@ class PDServingEngine:
             admitted_handoffs.append(handoff)
 
         admit_started_at = perf_counter()
-        admissions = (
-            list(self.coordinator.admit_batch(admitted_handoffs))
-            if admitted_handoffs
-            else []
-        )
+        try:
+            admissions = (
+                list(self.coordinator.admit_batch(admitted_handoffs))
+                if admitted_handoffs
+                else []
+            )
+        except Exception:
+            for handoff in admitted_handoffs:
+                descriptor = getattr(handoff, "descriptor", None)
+                if getattr(descriptor, "transport", "inline") == "shared_slot":
+                    self._pending_transfer_acks.append(descriptor.transfer_id)
+            try:
+                self._flush_transfer_acks()
+            except Exception:
+                pass
+            raise
         admit_finished_at = perf_counter()
         decode_rpc_timing = (
             self.coordinator.last_rpc_timing("decode")
@@ -281,9 +296,51 @@ class PDServingEngine:
             }
         )
 
+    def _fail_all_requests(self, error: Exception):
+        reason = f"{type(error).__name__}: {error}"
+        self._fatal_error = reason
+        try:
+            self._failure_worker_health = self.coordinator.worker_health()
+        except Exception:
+            self._failure_worker_health = {}
+        now = perf_counter()
+        for request in self._requests.values():
+            lifecycle = request["lifecycle"]
+            if not lifecycle.is_terminal:
+                lifecycle.fail(reason)
+                request["finish_time"] = now
+        self._pending.clear()
+        self._active_by_decode_seq.clear()
+        self._pending_transfer_acks.clear()
+        if self._prefill_future is not None and (
+            self._prefill_future.done() or self._prefill_future.cancel()
+        ):
+            self._prefill_future = None
+            self._prefill_future_meta = None
+        self.last_step_events = {
+            "failed": True,
+            "failure_reason": reason,
+            "waiting_queue_size": 0,
+            "running_queue_size": 0,
+        }
+
     def step(self):
         if self._closed:
+            if self._fatal_error is not None:
+                raise RuntimeError(f"PD serving engine failed: {self._fatal_error}")
             raise RuntimeError("PD serving engine is closed")
+        try:
+            return self._step_once()
+        except Exception as error:
+            self._fail_all_requests(error)
+            try:
+                self.exit()
+            except Exception:
+                # Cleanup is best effort; the first Worker failure is authoritative.
+                pass
+            raise
+
+    def _step_once(self):
         self._start_prefill()
         if self._prefill_future is not None and self._prefill_future.done():
             self._collect_prefill()
@@ -331,6 +388,11 @@ class PDServingEngine:
         return outputs, int(result.get("num_tokens", 0))
 
     def is_finished(self):
+        if self._fatal_error is not None:
+            return all(
+                request["lifecycle"].is_terminal
+                for request in self._requests.values()
+            )
         return (
             not self._pending
             and self._prefill_future is None
@@ -339,6 +401,8 @@ class PDServingEngine:
         )
 
     def reset_metrics(self):
+        if self._fatal_error is not None:
+            raise RuntimeError("cannot reset metrics on a failed PD engine")
         if not self.is_finished():
             raise RuntimeError("cannot reset PD metrics while requests are active")
         self.coordinator.reset_decode_metrics()
@@ -349,7 +413,11 @@ class PDServingEngine:
         self._run_started_at = perf_counter()
 
     def get_metrics(self):
-        worker_metrics = self.coordinator.decode_metrics()
+        worker_metrics = (
+            {"requests": [], "summary": {}}
+            if self._fatal_error is not None
+            else self.coordinator.decode_metrics()
+        )
         worker_requests = worker_metrics.get("requests", [])
         seq_to_request_id = {
             request["decode_seq_id"]: request_id
@@ -387,7 +455,7 @@ class PDServingEngine:
                         "success": success,
                         "cancelled": cancelled,
                         "status": lifecycle.state.value,
-                        "failure_reason": None,
+                        "failure_reason": lifecycle.terminal_reason,
                         "arrival_time": request["arrival_time"],
                         "first_token_time": now if output_token_ids else None,
                         "token_times": [now] if output_token_ids else [],
@@ -444,7 +512,12 @@ class PDServingEngine:
             "prefill_timing": prefill_timing,
             "queue_samples": deepcopy(self._queue_samples),
             "slot_release_samples": deepcopy(self._slot_release_samples),
-            "worker_health": self.coordinator.worker_health(),
+            "worker_health": (
+                deepcopy(self._failure_worker_health)
+                if self._failure_worker_health is not None
+                else self.coordinator.worker_health()
+            ),
+            "fatal_error": self._fatal_error,
         }
         return {"requests": sorted(requests, key=lambda item: item["seq_id"]), "summary": summary}
 

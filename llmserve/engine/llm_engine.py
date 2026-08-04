@@ -148,6 +148,26 @@ class LLMEngine:
             metric["failure_reason"] = None
         return True
 
+    def fail_request(self, seq_id: int, reason: str) -> bool:
+        """Fail a waiting or running request and release its resources."""
+        if not reason:
+            raise ValueError("failure reason must not be empty")
+        seq = self.scheduler.fail_request(seq_id)
+        if seq is None:
+            return False
+
+        if getattr(self.model_runner, "draft_model", None) is not None:
+            self.model_runner.call("clear_speculative_state", [seq_id])
+
+        metric = self.request_metrics.get(seq_id)
+        if metric is not None:
+            metric["finish_time"] = perf_counter()
+            metric["output_tokens"] = seq.num_completion_tokens
+            metric["success"] = False
+            metric["cancelled"] = False
+            metric["failure_reason"] = reason
+        return True
+
     def add_prefilled_request(
         self,
         prompt_token_ids: list[int] | tuple[int, ...],

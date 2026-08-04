@@ -268,8 +268,11 @@ class Scheduler:
         self._release_reservation(seq)
         seq.num_scheduled_tokens = 0
 
-    def abort_request(self, seq_id: int) -> Sequence | None:
-        """Cancel an owned request and release its scheduler resources."""
+    def _terminate_request(
+        self,
+        seq_id: int,
+        status: SequenceStatus,
+    ) -> Sequence | None:
         seq = next(
             (
                 candidate
@@ -282,8 +285,16 @@ class Scheduler:
         if seq is None:
             return None
         self.remove_sequence(seq)
-        seq.status = SequenceStatus.CANCELLED
+        seq.status = status
         return seq
+
+    def abort_request(self, seq_id: int) -> Sequence | None:
+        """Cancel an owned request and release its scheduler resources."""
+        return self._terminate_request(seq_id, SequenceStatus.CANCELLED)
+
+    def fail_request(self, seq_id: int) -> Sequence | None:
+        """Fail an owned request and release its scheduler resources."""
+        return self._terminate_request(seq_id, SequenceStatus.FAILED)
 
     def admit_prefilled(self, seq: Sequence, cached_tokens: int):
         """Admit a sequence whose prompt KV arrived from another worker."""

@@ -88,10 +88,12 @@ class PDCoordinator:
         self._started = False
         self._transport_handle = None
         self._last_rpc_timing: dict[str, dict[str, float | None]] = {}
+        self._failed_roles: set[str] = set()
 
     def start(self):
         if self._started:
             return
+        self._failed_roles.clear()
         try:
             for role, gpu_id in (
                 ("prefill", self.config.prefill_gpu),
@@ -174,22 +176,43 @@ class PDCoordinator:
                     queue.close()
         self._workers.clear()
         self._started = False
+        self._failed_roles.clear()
+
+    def _mark_worker_failed(self, role: str):
+        failed_roles = getattr(self, "_failed_roles", None)
+        if failed_roles is None:
+            self._failed_roles = set()
+        self._failed_roles.add(role)
 
     def _call(self, role: str, command: dict):
         if not self._started:
             self.start()
         worker = self._workers[role]
+        process = worker.get("process")
+        if process is not None and not process.is_alive():
+            self._mark_worker_failed(role)
+            raise PDWorkerError(
+                f"{role} worker is not alive (exitcode={process.exitcode})"
+            )
         command = dict(command)
         parent_sent_at = perf_counter()
         command["_rpc_parent_sent_at"] = parent_sent_at
-        worker["commands"].put(command)
+        try:
+            worker["commands"].put(command)
+        except (EOFError, BrokenPipeError, OSError, ValueError) as error:
+            self._mark_worker_failed(role)
+            raise PDWorkerError(f"{role} worker command channel failed") from error
         parent_put_at = perf_counter()
         try:
             response = worker["responses"].get(
                 timeout=self.config.request_timeout_seconds
             )
         except Empty as error:
+            self._mark_worker_failed(role)
             raise PDWorkerError(f"{role} worker timed out") from error
+        except (EOFError, BrokenPipeError, OSError, ValueError) as error:
+            self._mark_worker_failed(role)
+            raise PDWorkerError(f"{role} worker response channel failed") from error
         parent_received_at = perf_counter()
         remote_timing = response.get("timing") or {}
         worker_received_at = remote_timing.get("worker_received_at")
@@ -218,6 +241,7 @@ class PDCoordinator:
             ),
         }
         if not response.get("ok"):
+            self._mark_worker_failed(role)
             error = response.get("error") or {}
             detail = (
                 error.get("traceback")
@@ -285,25 +309,33 @@ class PDCoordinator:
     def close(self):
         if not self._started:
             return
+        failed_roles = getattr(self, "_failed_roles", set())
         for role in ("decode", "prefill"):
             worker = self._workers.get(role)
             if worker is None:
+                continue
+            process = worker.get("process")
+            if role in failed_roles or (
+                process is not None and not process.is_alive()
+            ):
                 continue
             try:
                 self._call(role, {"type": "shutdown"})
             except (PDWorkerError, EOFError, BrokenPipeError):
                 pass
         for worker in self._workers.values():
-            process = worker["process"]
-            process.join(timeout=10)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
+            process = worker.get("process")
+            if process is not None:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
             worker["commands"].close()
             worker["responses"].close()
         self._workers.clear()
         self._started = False
         self._transport_handle = None
+        self._failed_roles.clear()
 
     def __enter__(self):
         self.start()
