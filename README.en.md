@@ -1,34 +1,51 @@
+<div align="center">
+
 # LLM-Serve
 
-[English](README.en.md) | [简体中文](README.md)
+An educational LLM inference runtime for single- and dual-GPU serving
 
-[![CPU tests](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml)
+<p>
+  English |
+  <a href="README.md">简体中文</a>
+</p>
 
-LLM-Serve is an educational inference runtime with a single-GPU baseline and a dual-GPU Prefill/Decode serving path. It focuses on paged KV cache management, continuous batching, chunked prefill, serving-oriented benchmarking, EAGLE-style speculative decoding, and AWQ W4A16 inference.
+<p>
+  <a href="https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml"><img src="https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg" alt="CPU tests"></a>
+  <img src="https://img.shields.io/badge/Model-Qwen3--8B-6f42c1" alt="Model: Qwen3-8B">
+  <img src="https://img.shields.io/badge/Runtime-PyTorch%20%7C%20Triton%20%7C%20CUDA-76b900" alt="Runtime: PyTorch Triton CUDA">
+  <img src="https://img.shields.io/badge/Serving-Paged%20KV%20%7C%20Continuous%20Batching-0ea5e9" alt="Serving: Paged KV and continuous batching">
+  <img src="https://img.shields.io/badge/Advanced-PD%20%7C%20EAGLE%20%7C%20AWQ-f59e0b" alt="Advanced: PD EAGLE AWQ">
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
+</p>
 
-The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vllm`. The scheduler changes, chunked prefill path, benchmark system, and speculative decoding runtime are independently designed and implemented in this repository.
+</div>
 
-## Features
+LLM-Serve is an educational inference runtime centered on Qwen3-8B. It starts from a single-GPU engine and develops the core mechanisms behind LLM serving: paged KV cache management, continuous batching, chunked prefill, EAGLE-style speculative decoding, AWQ W4A16, and dual-GPU Prefill/Decode disaggregation.
 
-- PagedAttention-style KV cache allocation, recycling, block tables, and prefix cache.
-- Iteration-level continuous batching with explicit prefill/decode groups.
-- Decode-first chunked prefill for mixed prefill/decode batches.
-- EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy verification, and timing metrics; an explicit opt-in CUDA Graph path for linear target verification.
-- Qwen3 AWQ W4A16 calibration, standard AutoAWQ GEMM checkpoint export, reference/Triton/CUDA Linear backends, and KV capacity admission.
-- Dual-GPU PD serving with independent Prefill/Decode workers, logical KV handoff, reusable pinned shared-memory slots, ACK/backpressure pipelining, and role-specific Decode CUDA Graphs.
-- Reproducible Poisson request-rate and closed-loop concurrency suites with throughput, goodput, TTFT, TPOT, burst ITL, output-event latency, E2E, queue depth, and speculative metrics.
-- A validated single-GPU Qwen3-8B BF16 path and optional fixed-tree experiments.
+The early project was informed by the [PagedAttention paper](https://arxiv.org/abs/2309.06180) and the [`nano-vllm`](https://github.com/Geeeone/nano-vllm) teaching skeleton. The scheduler, serving benchmark system, speculative runtime, quantization calibration path, and PD serving path have been developed independently in this repository.
 
-## Layout
+## Capabilities
 
-- `llmserve/engine/`: scheduling, KV block management, target execution, and speculative orchestration.
-- `llmserve/models/`: Qwen3 and EAGLE3 definitions and checkpoint loading.
-- `llmserve/speculative/`: draft, verification sampling, fixed trees, and Tree KV management.
-- `llmserve/quantization/`: Qwen3 AWQ calibration, layer-wise quantization, checkpoint export, and quality evaluation.
-- `llmserve/pd/`: Prefill/Decode protocols, logical KV handoff, shared slots, worker lifecycle, and serving orchestration.
-- `llmserve/layers/`: attention, linear, sampling, and other model building blocks.
-- `benchmarks/`: workloads, arrivals, metrics, point/suite runners, and public results.
-- `tests/`: CPU tests plus optional checkpoint and CUDA kernel coverage.
+- **Runtime**: paged KV cache, block tables, prefix cache, iteration-level continuous batching, and an explicit `SchedulerOutput` contract.
+- **Scheduling**: decode-first chunked prefill for mixed prefill/decode batches and long-prompt isolation.
+- **Speculative decoding**: EAGLE-style batched draft proposal, packed target verification, per-request draft KV, greedy accept/reject, and target-verify CUDA Graphs.
+- **Quantization**: Qwen3 activation-aware AWQ W4A16 calibration, standard AutoAWQ GEMM checkpoint export, reference/Triton/CUDA Linear backends, and KV capacity admission.
+- **Dual-GPU serving**: independent Prefill/Decode workers, logical KV handoff, pinned shared-memory slots, ACK/backpressure, and Decode CUDA Graphs.
+- **Reproducible experiments**: Poisson request-rate and closed-loop concurrency runners with throughput, goodput, TTFT, TPOT, E2E, queue, and stage-timing metrics.
+
+## Repository Layout
+
+```text
+llmserve/
+├── engine/        scheduling, KV blocks, target execution, speculative orchestration
+├── models/        Qwen3 and EAGLE3 model definitions
+├── speculative/   draft, verification, fixed trees, and Tree KV management
+├── quantization/  AWQ calibration, checkpoint export, and quality evaluation
+├── pd/            Prefill/Decode protocols, KV handoff, slots, and workers
+└── layers/        attention, linear, sampling, and model building blocks
+benchmarks/        workloads, arrivals, metrics, suite runners, and public data
+tests/             CPU, checkpoint integration, and CUDA tests
+```
 
 ## Quick Start
 
@@ -36,14 +53,20 @@ The initial skeleton was informed by the vLLM PagedAttention paper and `nano-vll
 pip install -e .
 
 export MODEL_PATH=/path/to/Qwen3-8B
-export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
-
 python example.py
 ```
 
-Run the four-point GPU smoke suite:
+Run the CPU regression suite:
 
 ```bash
+CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
+```
+
+Run the GPU smoke suite:
+
+```bash
+export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
+
 python -m benchmarks.run_suite \
   --suite benchmarks/suites/smoke.json \
   --output-dir /tmp/llmserve-smoke \
@@ -52,132 +75,23 @@ python -m benchmarks.run_suite \
   --allow-dirty
 ```
 
-Run the formal Poisson suite on a clean commit:
+## Experiments and Documentation
 
-```bash
-python -m benchmarks.run_suite \
-  --suite benchmarks/suites/formal-poisson.json \
-  --output-dir /tmp/llmserve-formal-poisson \
-  --model "$MODEL_PATH" \
-  --speculative-model "$SPECULATIVE_MODEL" \
-  --resume
-```
+- [Benchmark guide](benchmarks/README.md): suites, workloads, metric semantics, and reproduction commands.
+- [Public benchmark data](benchmarks/results/): manifests, CSV files, sanitized run JSON, and stage reports.
+- [PD end-to-end results](benchmarks/results/pd-serving-formal/): collocated versus dual-GPU Prefill/Decode serving.
+- [AWQ results](benchmarks/results/awq-w4a16/): quality, capacity, and vLLM Marlin control experiments.
+- [Verification evidence](benchmarks/results/verification.md): CPU regression, CUDA smoke, and public-data checks.
 
-`formal-closed-loop.json` provides the fixed-concurrency complement. When running both suites concurrently on two GPUs, pass distinct distributed endpoints such as `tcp://localhost:2333` and `tcp://localhost:2334`. Each point runs in an independent subprocess. See [`benchmarks/README.md`](benchmarks/README.md) for schemas and execution details.
+Benchmark numbers are intentionally not duplicated in this README. Use the corresponding directory under `benchmarks/results/` as the source of truth for detailed measurements and sanitized raw data.
 
-Reproduce the Stage 8 target-verify CUDA Graph comparison with `benchmarks/suites/stage8-graph-formal.json` from a clean `3bb5d21` commit; it runs three repetitions at concurrency 1/4/8.
+## Scope and Limitations
 
-The dual-GPU KV transport comparison uses `benchmarks/suites/pd-kv-pipeline-formal.json`. Prefill and Decode workers use GPU 0/1 by default, and the matrix isolates inline Queue Tensor transfer versus pinned shared-memory slots.
+- The primary target is Qwen3-8B, single-GPU TP=1, and an RTX 3090 24GB. The dual-GPU path is Prefill/Decode disaggregation, not a Tensor Parallel performance platform for non-NVLink GPUs.
+- Speculative CUDA Graphs support linear EAGLE, greedy acceptance, and explicit opt-in only. Unsupported shapes fall back to eager; fixed-tree speculation is disabled by default.
+- The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, and TP=1. vLLM Marlin measurements are external-backend control experiments.
+- The project focuses on runtime, scheduling, and serving mechanisms and intentionally does not provide an OpenAI-compatible HTTP API layer.
 
-## Results
+## License
 
-The public results use commit `ad35e65`, Qwen3-8B with the RedHatAI Qwen3-8B EAGLE3 speculator, BF16 eager mode, fixed `gamma=3`, argmax sampling, and one RTX 3090 24GB per suite. Every configuration has three independent runs.
-
-### Dual-GPU PD KV Pipeline
-
-The PD comparison uses Qwen3-8B BF16 on two RTX 3090 GPUs, `128 input / 64 output`, Prefill batch 4, and Decode CUDA Graphs. The only changed variable is KV transport: the baseline sends tensors through a process Queue, while the shared path sends descriptors for two reusable pinned shared-memory slots and reclaims them through acknowledgements.
-
-| Concurrency | Inline req/s | Shared req/s | Throughput gain | TTFT P50 |
-| :--- | ---: | ---: | ---: | ---: |
-| 32 | 16.29 | **17.89** | **1.098x** | 207 -> 132 ms |
-| 48 | 18.62 | **20.71** | **1.112x** | 227 -> 138 ms |
-| 64 | 21.31 | **28.11** | **1.319x** | 639 -> 136 ms |
-
-At concurrency 64, Prefill response-queue time falls from `47.4 ms` to `0.25 ms`, Decode admission from `14.5 ms` to `1.13 ms`, and Prefill roundtrip from `186.6 ms` to `134.2 ms`; model forward and KV export/copy are unchanged. The gain therefore comes from removing large cross-process Tensor serialization and handoff blocking, not faster model computation. All 18 formal points completed, with no inline fallback on the shared path and all slots reclaimed. See [`benchmarks/results/pd-kv-pipeline-formal/`](benchmarks/results/pd-kv-pipeline-formal/).
-
-### Dual-GPU PD End-to-End Serving
-
-On a fixed `128 input / 64 output` workload, the formal matrix compares the single-process collocated BF16 Decode Graph baseline with Prefill batch 4 + eager Prefill + Decode Graph + shared KV slots. It covers closed-loop concurrency `{16, 32, 48, 64}` and Poisson rates `{8, 16, 24, 28}`, with three repetitions per point:
-
-| Closed-loop concurrency | Collocated req/s | PD req/s | PD / baseline | TTFT P50 (baseline -> PD) | TPOT P50 (baseline -> PD) |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| 16 | 8.09 | **10.13** | **1.252x** | 379 -> 140 ms | 25.0 -> 22.9 ms |
-| 32 | 12.27 | **18.27** | **1.489x** | 631 -> 132 ms | 31.0 -> 25.4 ms |
-| 48 | 13.60 | **21.69** | **1.595x** | 854 -> 133 ms | 41.6 -> 33.4 ms |
-| 64 | 16.00 | **28.87** | **1.804x** | 1100 -> 136 ms | 45.4 -> 33.0 ms |
-
-The throughput gain grows with sustained concurrency and reaches `+80.4%` at c64. Under Poisson arrival, the low-load point is effectively tied; rates 16/24/28 reach `1.047x/1.129x/1.148x` of the collocated throughput. This is not a faster single-GPU model computation: both paths keep Prefill model forward around `121-123 ms` and KV export/copy around `3.8 ms`. The gain comes from role separation, dual-GPU capacity, and Prefill/Decode pipeline overlap. The current ceiling is the batch-4 Prefill pipeline at about `29.6 req/s`. All 48 points completed successfully; see [`benchmarks/results/pd-serving-formal/`](benchmarks/results/pd-serving-formal/).
-
-### EAGLE
-
-The decode-heavy profile is `256 input / 256 output`:
-
-| Closed-loop concurrency | Baseline output tok/s | EAGLE output tok/s | Throughput ratio | E2E P99 ratio |
-| :--- | ---: | ---: | ---: | ---: |
-| 1 | 25.08 | 41.01 | **1.635x** | 0.929x |
-| 4 | 89.20 | 153.40 | **1.720x** | 1.257x |
-| 8 | 172.36 | 267.39 | **1.551x** | 1.421x |
-
-At Poisson request rates `{0.25, 0.75, 1.25}`, finite-workload output throughput improves by only `1.025x-1.042x`, while E2E P99 is `1.068x-1.220x` of baseline. The result is deliberately workload-specific: saturated capacity gains do not imply lower online request latency.
-
-### Target Verify CUDA Graph
-
-Stage 8 isolates target-verify eager versus target-verify CUDA Graph under the same EAGLE workload. Both variants use `enforce_eager=true`, so ordinary decode CUDA Graph is excluded from the comparison. The formal suite uses `128 input / 128 output`, `gamma=3`, closed-loop concurrency `{1,4,8}`, and three repetitions per point:
-
-| Concurrency | Eager output tok/s | Graph output tok/s | Throughput gain | Verify speedup | Graph hit rate |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 39.0 | **69.4** | **1.779x** | 2.17x | 98% |
-| 4 | 139.8 | **217.9** | **1.558x** | 2.00x | 93% |
-| 8 | 241.5 | **342.6** | **1.419x** | 1.79x | 84%-85% |
-
-The backend captures six graphs for `batch={1,4,8}` and `context frontier={256,1024}`. Unsupported shapes and speculative reservation overflow fall back to eager. The gain decreases with batch size, while draft proposal and target decode remain nearly unchanged; target verification is still the dominant stage. The full manifest, CSV files, and 18 sanitized run JSON files are published in [`benchmarks/results/stage8-graph-formal/`](benchmarks/results/stage8-graph-formal/).
-
-### Chunked Prefill
-
-The mixed profile combines 80% `128 input / 128 output` requests with 20% `4096 input / 128 output` requests:
-
-| Closed-loop concurrency | Output throughput ratio | TTFT P99 change | Short TTFT P99 change |
-| :--- | ---: | ---: | ---: |
-| 4 | 1.004x | **-20.1%** | **-19.7%** |
-| 8 | 1.044x | **-6.3%** | **-21.0%** |
-| 16 | 1.092x | **-20.4%** | **-17.2%** |
-
-At Poisson rates `{0.5, 1.5, 2.5}`, throughput remains effectively flat (`0.992x-1.000x`), while TPOT P99 drops by about `19%-20%` and E2E P99 by about `14%-17%`. Chunked prefill is therefore presented as a scheduling and tail-latency mechanism, not an unconditional throughput optimization.
-
-### AWQ W4A16
-
-The repository implements activation-aware Qwen3-8B calibration with layer-wise error propagation, quantizes the seven QKV/O/gate/up/down Linear projections, and exports a standard AutoAWQ GEMM checkpoint. On a fixed 2,048-token evaluation drawn from 32 WikiText-2 samples:
-
-| Model | Perplexity | Peak evaluation memory | PPL vs BF16 |
-| :--- | ---: | ---: | ---: |
-| BF16 | 27.149 | 15.45 GiB | - |
-| Official Qwen3-8B-AWQ | 29.273 | 6.52 GiB | +7.8% |
-| LLM-Serve calibrated AWQ | 30.592 | 6.52 GiB | +12.7% |
-
-With LLM-Serve's custom CUDA backend, runtime model memory falls from `15.276 GiB` to `5.857 GiB` and KV blocks increase from `152` to `419`. In the final RTX 3090 closed-loop capacity matrix, the maximum SLO-valid concurrency rises from `64` for BF16 to `128` for AWQ. AWQ's SLO-valid peak output throughput is still only `0.871x` of BF16, so this is presented as a capacity result rather than a custom-kernel speed win.
-
-The same checkpoint completes 24/24 control points with vLLM 0.11 AWQ-Marlin. AWQ/BF16 output-throughput ratios at concurrency 1/4/8/16 are `1.390x/1.316x/1.322x/1.316x`. This validates checkpoint compatibility with a mature W4A16 backend; the speedup belongs to vLLM Marlin, not to LLM-Serve's custom CUDA kernel.
-
-The existing serving line contains 72 sanitized run JSON files; Stage 8 adds 18 Graph comparison runs, the dual-GPU KV transport comparison adds 18 reduced runs, and the PD end-to-end matrix adds 48 runs. Per-run CSVs, three-run aggregates, manifests, and AWQ quality/capacity/Marlin summaries are published under [`benchmarks/results/`](benchmarks/results/).
-
-## Metric Semantics
-
-- `burst_itl`: adjacent per-token availability times; speculative bursts may include `0 ms` samples.
-- `output_event_latency`: adjacent output events, recorded once per request per emitting engine step.
-- `speculative_step_latency`: complete draft/verify/accept/KV step cost.
-- `TPOT`: request-level average time per output token.
-- Closed-loop throughput covers the measurement window. Latency and acceptance cover only requests whose arrival and finish both fall inside that window, with `latency_sample_requests` reported explicitly.
-
-## Tests
-
-```bash
-CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
-```
-
-Enable real-checkpoint tests explicitly:
-
-```bash
-export LLMSERVE_TEST_TARGET_MODEL=/path/to/Qwen3-8B
-export LLMSERVE_TEST_SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
-python -m unittest discover -s tests
-```
-
-AWQ CUDA tests, real-checkpoint generation, and capacity matrices require an RTX 3090 or another SM80+ GPU. CUDA-specific Tree KV tests run only when CUDA is available. GitHub Actions runs the remaining tests with CPU PyTorch.
-
-## Scope
-
-- The primary target is single-GPU Qwen3-8B. The dual-GPU path is Prefill/Decode disaggregation; two non-NVLink GPUs are not presented as a tensor-parallel performance platform.
-- Speculative CUDA Graph currently supports linear EAGLE, greedy acceptance, single-GPU TP=1, and explicit opt-in only; unsupported batch/context buckets fall back to eager. Fixed-tree speculation remains disabled by default.
-- The AWQ runtime is limited to Qwen3, AutoAWQ GEMM, group-128 W4A16, BF16 activations/scales, eager execution, and TP=1. The Marlin run is an external-backend control experiment.
-- The project intentionally omits an OpenAI-compatible HTTP layer; benchmarks drive the in-process runtime directly.
-- The codebase retains the original MIT license.
+[MIT](LICENSE)

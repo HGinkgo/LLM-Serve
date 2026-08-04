@@ -1,36 +1,51 @@
+<div align="center">
+
 # LLM-Serve
 
-[English](README.en.md) | [简体中文](README.md)
+面向学习与系统研究的单机 LLM 推理 Runtime
 
-[![CPU tests](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg)](https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml)
+<p>
+  <a href="README.en.md">English</a> |
+  简体中文
+</p>
 
-LLM-Serve 是一个以单机单卡为基线、扩展到单机双卡 Prefill/Decode 分离的教学型 LLM 推理引擎，重点实现并验证高吞吐 serving 背后的核心机制：Paged KV Cache、continuous batching、chunked prefill、serving benchmark、EAGLE 风格投机解码，以及 AWQ W4A16 推理。
+<p>
+  <a href="https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml"><img src="https://github.com/HGinkgo/LLM-Serve/actions/workflows/cpu-tests.yml/badge.svg" alt="CPU tests"></a>
+  <img src="https://img.shields.io/badge/Model-Qwen3--8B-6f42c1" alt="Model: Qwen3-8B">
+  <img src="https://img.shields.io/badge/Runtime-PyTorch%20%7C%20Triton%20%7C%20CUDA-76b900" alt="Runtime: PyTorch Triton CUDA">
+  <img src="https://img.shields.io/badge/Serving-Paged%20KV%20%7C%20Continuous%20Batching-0ea5e9" alt="Serving: Paged KV and continuous batching">
+  <img src="https://img.shields.io/badge/Advanced-PD%20%7C%20EAGLE%20%7C%20AWQ-f59e0b" alt="Advanced: PD EAGLE AWQ">
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
+</p>
 
-项目早期骨架参考了 vLLM PagedAttention 论文和 `nano-vllm` 教学实现。后续 scheduler 改造、chunked prefill、benchmark 系统和 speculative decoding runtime 均在本仓库中独立设计与实现。
+</div>
 
-## 功能
+LLM-Serve 是一个以 Qwen3-8B 为主要目标、面向单机 GPU 推理系统学习的 Runtime。项目从单卡推理出发，逐步实现 Paged KV Cache、continuous batching、chunked prefill、EAGLE 风格投机解码、AWQ W4A16 和双卡 Prefill/Decode 分离。
 
-- PagedAttention 风格 KV Cache：block table、KV block 分配回收和 prefix cache。
-- Continuous batching：iteration-level scheduler，显式区分 prefill/decode 序列。
-- Chunked prefill：decode-first，把剩余 token budget 分给长 prompt prefill。
-- EAGLE 风格投机解码：batched draft、packed target verification、per-request draft KV、greedy verification，以及 acceptance/timing 指标；线性 target verify CUDA Graph 为显式 opt-in 路径。
-- AWQ W4A16：Qwen3 activation-aware 校准、标准 AutoAWQ GEMM checkpoint 导出、reference/Triton/CUDA Linear backend，以及 KV 容量准入。
-- 双卡 PD Serving：独立 Prefill/Decode Worker、continuous batching、logical KV handoff、可复用 pinned shared-memory KV slot、ACK/backpressure 流水线和 role-specific Decode CUDA Graph。
-- Serving benchmark：Poisson request-rate 扫描与 closed-loop 固定并发，覆盖吞吐、goodput、TTFT、TPOT、burst ITL、output-event latency、E2E、queue depth 和 speculative timing。
-- Qwen3-8B 单卡 BF16 路径，以及可选的固定候选树实验实现。
+项目早期参考了 [PagedAttention 论文](https://arxiv.org/abs/2309.06180) 与 [`nano-vllm`](https://github.com/Geeeone/nano-vllm) 的教学骨架；scheduler、serving benchmark、投机解码、量化校准和 PD serving 由本仓库独立演进。
 
-## 代码结构
+## 核心能力
 
-- `llmserve/engine/`：scheduler、KV block 管理、target 执行与投机解码编排。
-- `llmserve/models/`：Qwen3 与 EAGLE3 网络定义和 checkpoint 加载。
-- `llmserve/speculative/`：draft、verification sampling、固定树与 Tree KV 管理。
-- `llmserve/quantization/`：Qwen3 AWQ 校准、逐层量化、checkpoint 导出和质量评估。
-- `llmserve/pd/`：双进程 Prefill/Decode 协议、KV handoff、共享槽位、Worker 生命周期和 serving 编排。
-- `llmserve/layers/`：attention、linear、sampling 等基础组件。
-- `benchmarks/`：workload、arrival、指标、单点 runner、suite runner、公开结果。
-- `tests/`：CPU 单元测试、可选真实 checkpoint 集成测试和 CUDA kernel 测试。
+- **Runtime**：Paged KV Cache、block table、prefix cache、iteration-level continuous batching 和显式 `SchedulerOutput`。
+- **调度**：decode-first chunked prefill，支持 mixed prefill/decode batch 和长 prompt 隔离。
+- **投机解码**：EAGLE 风格 batched draft、packed target verification、per-request draft KV、greedy accept/reject，以及 target verify CUDA Graph。
+- **量化**：Qwen3 activation-aware AWQ W4A16 校准、标准 AutoAWQ GEMM checkpoint 导出、reference/Triton/CUDA Linear backend 和 KV capacity admission。
+- **双卡 Serving**：独立 Prefill/Decode Worker、logical KV handoff、pinned shared-memory slots、ACK/backpressure 和 Decode CUDA Graph。
+- **可复现实验**：Poisson request-rate 与 closed-loop concurrency runner，记录 throughput、goodput、TTFT、TPOT、E2E、队列和阶段耗时。
 
-`ModelRunner` 持有 target 模型执行资源，`SpeculativeExecutor` 组合这些资源完成 EAGLE decode；与 runtime 无关的算法集中在 `llmserve/speculative/`。
+## 项目结构
+
+```text
+llmserve/
+├── engine/        scheduler、KV block 管理、target 执行与 speculative 编排
+├── models/        Qwen3 与 EAGLE3 模型定义
+├── speculative/   draft、verification、固定树与 Tree KV 管理
+├── quantization/  AWQ 校准、checkpoint 导出与质量评估
+├── pd/            Prefill/Decode 协议、KV handoff、共享槽位与 worker 生命周期
+└── layers/        attention、linear、sampling 等基础组件
+benchmarks/        workload、arrival、指标、suite runner 与公开结果
+tests/             CPU 单元测试、checkpoint 集成测试与 CUDA 测试
+```
 
 ## 快速开始
 
@@ -38,14 +53,20 @@ LLM-Serve 是一个以单机单卡为基线、扩展到单机双卡 Prefill/Deco
 pip install -e .
 
 export MODEL_PATH=/path/to/Qwen3-8B
-export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
-
 python example.py
 ```
 
-运行四点 GPU smoke，验证 baseline、EAGLE 和 chunked prefill 路径：
+运行 CPU 回归：
 
 ```bash
+CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
+```
+
+运行 GPU smoke：
+
+```bash
+export SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
+
 python -m benchmarks.run_suite \
   --suite benchmarks/suites/smoke.json \
   --output-dir /tmp/llmserve-smoke \
@@ -54,134 +75,23 @@ python -m benchmarks.run_suite \
   --allow-dirty
 ```
 
-在干净 commit 上运行正式 Poisson 主实验：
+## 实验与文档
 
-```bash
-python -m benchmarks.run_suite \
-  --suite benchmarks/suites/formal-poisson.json \
-  --output-dir /tmp/llmserve-formal-poisson \
-  --model "$MODEL_PATH" \
-  --speculative-model "$SPECULATIVE_MODEL" \
-  --resume
-```
+- [Benchmark 使用说明](benchmarks/README.md)：suite、workload、指标口径和复现实验命令。
+- [公开 Benchmark 数据](benchmarks/results/)：manifest、CSV、脱敏 run JSON 和各阶段说明。
+- [PD 端到端结果](benchmarks/results/pd-serving-formal/)：单进程 collocated 与双卡 Prefill/Decode 对照。
+- [AWQ 结果](benchmarks/results/awq-w4a16/)：质量、容量和 vLLM Marlin 控制实验。
+- [完整测试证据](benchmarks/results/verification.md)：CPU 回归、CUDA smoke 和公开数据校验记录。
 
-`formal-closed-loop.json` 是固定并发补充实验。两个 suite 并行使用两张卡时，需要分别指定不同的 `--distributed-init-method`，例如 `tcp://localhost:2333` 与 `tcp://localhost:2334`。每个点都在独立子进程中运行，失败会记录 JSON 并继续，其余细节见 [`benchmarks/README.md`](benchmarks/README.md)。
+实验结果不在根 README 中重复维护，具体数字和原始脱敏数据以 `benchmarks/results/` 下对应目录为准。
 
-Stage 8 target verify CUDA Graph 对照使用 `benchmarks/suites/stage8-graph-formal.json`，在干净的 `3bb5d21` commit 上复现 1/4/8 并发三轮矩阵。
+## 当前边界
 
-双卡 PD KV Pipeline 对照使用 `benchmarks/suites/pd-kv-pipeline-formal.json`。Prefill 和 Decode Worker 默认分别使用 GPU 0/1，正式矩阵比较 Queue inline Tensor 与 pinned shared-memory slot 两种 KV transport。
+- 主目标是 Qwen3-8B、单卡 TP=1 和 RTX 3090 24GB；双卡路径用于 Prefill/Decode 分离，不作为无 NVLink Tensor Parallel 平台。
+- speculative CUDA Graph 只支持线性 EAGLE、greedy acceptance 和显式 opt-in；不支持的 shape 会回退 eager，固定候选树默认关闭。
+- AWQ Runtime 固定为 Qwen3、AutoAWQ GEMM、group-128 W4A16、BF16 activation/scales 和 TP=1；vLLM Marlin 结果属于外部执行后端控制实验。
+- 项目聚焦 Runtime、调度和 serving 机制，不包含 OpenAI-compatible HTTP API 层。
 
-## Benchmark 结果
+## License
 
-正式结果基于 commit `ad35e65`，Qwen3-8B + RedHatAI Qwen3-8B EAGLE3 speculator，BF16 eager，固定 `gamma=3`，argmax，单张 RTX 3090 24GB。每个配置重复三次；Poisson 与 closed-loop 回答不同问题，不能混成一个 speedup。
-
-### 双卡 PD KV Pipeline
-
-PD 对照基于 Qwen3-8B BF16、双 RTX 3090、`128 input / 64 output`、Prefill batch 4 和 Decode CUDA Graph。两组只改变 KV transport：inline 基线通过进程 Queue 传递 Tensor，shared 路径通过两个可复用 pinned shared-memory slot 传递 descriptor，并用 ACK 控制回收。
-
-| 并发 | Inline req/s | Shared req/s | 吞吐提升 | TTFT P50 |
-| :--- | ---: | ---: | ---: | ---: |
-| 32 | 16.29 | **17.89** | **1.098x** | 207 -> 132 ms |
-| 48 | 18.62 | **20.71** | **1.112x** | 227 -> 138 ms |
-| 64 | 21.31 | **28.11** | **1.319x** | 639 -> 136 ms |
-
-在并发 64 时，Prefill response Queue 从 `47.4 ms` 降至 `0.25 ms`，Decode admit 从 `14.5 ms` 降至 `1.13 ms`，Prefill roundtrip 从 `186.6 ms` 降至 `134.2 ms`；模型 forward 和 KV export/copy 基本不变。因此收益来自消除跨进程大 Tensor 序列化与 handoff 阻塞，而不是模型计算变快。18/18 个正式 point 全部完成，shared 路径零 inline fallback，所有槽位最终回收。完整结果见 [`benchmarks/results/pd-kv-pipeline-formal/`](benchmarks/results/pd-kv-pipeline-formal/)。
-
-### 双卡 PD 端到端 Serving
-
-在固定 `128 input / 64 output` workload 上，使用 Prefill batch 4、Prefill eager、Decode CUDA Graph 和 shared KV slots，对比单进程 collocated BF16 Decode Graph。正式矩阵包含 closed-loop 并发 `{16, 32, 48, 64}` 与 Poisson 到达率 `{8, 16, 24, 28}`，每个点重复三次：
-
-| Closed-loop 并发 | Collocated req/s | PD req/s | PD/基线 | TTFT P50（基线 -> PD） | TPOT P50（基线 -> PD） |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| 16 | 8.09 | **10.13** | **1.252x** | 379 -> 140 ms | 25.0 -> 22.9 ms |
-| 32 | 12.27 | **18.27** | **1.489x** | 631 -> 132 ms | 31.0 -> 25.4 ms |
-| 48 | 13.60 | **21.69** | **1.595x** | 854 -> 133 ms | 41.6 -> 33.4 ms |
-| 64 | 16.00 | **28.87** | **1.804x** | 1100 -> 136 ms | 45.4 -> 33.0 ms |
-
-PD 的吞吐收益随持续并发放大，c64 达到 `+80.4%`；Poisson 低负载下基本持平，rate 16/24/28 的吞吐分别为基线的 `1.047x/1.129x/1.148x`。这不是单卡模型计算加速：两条路径的 Prefill model forward 约 `121-123 ms`、KV export/copy 约 `3.8 ms`，收益来自 Prefill/Decode 角色分离、双卡容量和流水线重叠。当前上限由 batch-4 Prefill pipeline 约 `29.6 req/s` 决定。48/48 个正式 point 全部完成，结果见 [`benchmarks/results/pd-serving-formal/`](benchmarks/results/pd-serving-formal/)。
-
-### EAGLE
-
-decode-heavy workload 为 `256 input / 256 output`。closed-loop 中 EAGLE 明显提高饱和吞吐，但并发 4/8 的 request E2E P99 同时变差：
-
-| 并发 | Baseline output tok/s | EAGLE output tok/s | 吞吐比 | E2E P99 比 |
-| :--- | ---: | ---: | ---: | ---: |
-| 1 | 25.08 | 41.01 | **1.635x** | 0.929x |
-| 4 | 89.20 | 153.40 | **1.720x** | 1.257x |
-| 8 | 172.36 | 267.39 | **1.551x** | 1.421x |
-
-Poisson request-rate `{0.25, 0.75, 1.25}` 下，有限 workload 的 output throughput 只提高 `1.025x-1.042x`，E2E P99 为 baseline 的 `1.068x-1.220x`。这说明 EAGLE 的收益高度依赖持续饱和与 batch 形态，不能用 closed-loop 峰值代替在线到达场景结论。三档 acceptance rate 均值约 `45.5%-46.8%`，acceptance length 约 `2.37-2.40 tokens/step`。
-
-### Target Verify CUDA Graph
-
-Stage 8 在同一 EAGLE workload 下隔离比较 target verify eager 与 target verify CUDA Graph；两组都使用 `enforce_eager=true`，因此不把普通 decode CUDA Graph 的收益混入结果。正式 suite 为 `128 input / 128 output`、`gamma=3`、closed-loop、并发 `1/4/8`，每点重复三次：
-
-| 并发 | Eager output tok/s | Graph output tok/s | 吞吐提升 | Verify 加速 | Graph 命中率 |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 39.0 | **69.4** | **1.779x** | 2.17x | 98% |
-| 4 | 139.8 | **217.9** | **1.558x** | 2.00x | 93% |
-| 8 | 241.5 | **342.6** | **1.419x** | 1.79x | 84%-85% |
-
-Graph 捕获 `batch={1,4,8}`、`context frontier={256,1024}` 共 6 张图；不匹配 shape 或 speculative reservation 超出 workspace 时自动回退 eager。结果显示收益随 batch 增大递减，但 draft proposal 与 target decode 基本不变，主要瓶颈仍在 target verify。完整 manifest、CSV 和 18 个脱敏 run JSON 见 [`benchmarks/results/stage8-graph-formal/`](benchmarks/results/stage8-graph-formal/)。
-
-### Chunked Prefill
-
-mixed-serving workload 为 80% `128 input / 128 output` 与 20% `4096 input / 128 output`。closed-loop 结果：
-
-| 并发 | Output throughput 比 | TTFT P99 变化 | Short TTFT P99 变化 |
-| :--- | ---: | ---: | ---: |
-| 4 | 1.004x | **-20.1%** | **-19.7%** |
-| 8 | 1.044x | **-6.3%** | **-21.0%** |
-| 16 | 1.092x | **-20.4%** | **-17.2%** |
-
-Poisson request-rate `{0.5, 1.5, 2.5}` 下，吞吐基本持平（`0.992x-1.000x`），但 TPOT P99 降低约 `19%-20%`，E2E P99 降低约 `14%-17%`。因此本项目把 chunked prefill 定位为调度与尾延迟优化，而不是无条件的吞吐优化。
-
-### AWQ W4A16
-
-本项目实现了 Qwen3-8B activation-aware 校准与逐层误差传播，量化 QKV、O、gate/up、down 七类 Linear，并导出可被通用 AWQ runtime 加载的 AutoAWQ GEMM checkpoint。32 个 WikiText-2 样本的固定 2048-token 质量对照如下：
-
-| 模型 | Perplexity | 峰值评测显存 | 相对 BF16 PPL |
-| :--- | ---: | ---: | ---: |
-| BF16 | 27.149 | 15.45 GiB | - |
-| 官方 Qwen3-8B-AWQ | 29.273 | 6.52 GiB | +7.8% |
-| 自制 Qwen3-8B AWQ | 30.592 | 6.52 GiB | +12.7% |
-
-LLM-Serve 自研 CUDA backend 的 runtime model memory 从 `15.276 GiB` 降至 `5.857 GiB`，KV blocks 从 `152` 增至 `419`。在 RTX 3090 的最终 closed-loop 容量矩阵中，满足既定 SLO 的最大并发从 BF16 的 `64` 提升到 AWQ 的 `128`；但 AWQ 的 SLO-valid 峰值 output throughput 只有 BF16 的 `0.871x`，因此该结果定位为容量优化，而不是 kernel 速度胜出。
-
-同一个自制 checkpoint 在 vLLM 0.11 AWQ-Marlin 上完成 24/24 个对照点，concurrency 1/4/8/16 的 AWQ/BF16 output throughput 为 `1.390x/1.316x/1.322x/1.316x`。这证明 checkpoint 格式与成熟 W4A16 backend 兼容；该吞吐收益属于 vLLM Marlin，不是 LLM-Serve 自研 CUDA kernel 的成绩。
-
-已有 serving 主线的 72 份脱敏 run JSON、Stage 8 的 18 份 Graph 对照、双卡 PD KV Pipeline 的 18 份精简脱敏 run，以及 PD 端到端矩阵的 48 份 run，逐运行 CSV、三轮均值/标准差和 manifest 均位于 [`benchmarks/results/`](benchmarks/results/)。
-
-## 指标口径
-
-- `burst_itl`：逐 token 可用时间间隔；speculative burst 会自然产生 `0 ms` 样本。
-- `output_event_latency`：同一请求相邻输出事件的时间间隔，每个 emitting engine step 只记录一次。
-- `speculative_step_latency`：完整一次 draft/verify/accept/KV step 成本。
-- `TPOT`：请求级平均每输出 token 时间。
-- closed-loop 吞吐只统计 measurement window；延迟与 acceptance 只统计 arrival/finish 均落在窗口内的请求，并显式报告 `latency_sample_requests`。
-
-## 测试
-
-CPU 单元测试不需要本地模型：
-
-```bash
-CUDA_VISIBLE_DEVICES="" python -m unittest discover -s tests
-```
-
-真实 EAGLE checkpoint 集成测试通过环境变量显式启用：
-
-```bash
-export LLMSERVE_TEST_TARGET_MODEL=/path/to/Qwen3-8B
-export LLMSERVE_TEST_SPECULATIVE_MODEL=/path/to/Qwen3-8B-speculator.eagle3
-python -m unittest discover -s tests
-```
-
-AWQ CUDA 测试、真实 checkpoint 生成和容量矩阵需要 RTX 3090 或其他 SM80+ GPU。Tree KV CUDA kernel 测试只在 CUDA 可用时运行；GitHub Actions 使用 CPU PyTorch 执行其余测试。
-
-## 边界
-
-- 当前主配置是单卡 Qwen3-8B；双卡用于 Prefill/Decode 分离，不把无 NVLink 环境包装成 tensor-parallel 性能平台。
-- speculative CUDA Graph 目前只支持线性 EAGLE、greedy、单卡 TP=1，并通过显式开关启用；固定 batch/context bucket 之外自动 eager fallback。固定候选树默认关闭，不作为主性能结论。
-- AWQ runtime 只支持 Qwen3、AutoAWQ GEMM、W4A16 group-128、BF16 activation/scales、eager 和 TP=1；Marlin 对照仅作为外部 backend 控制实验。
-- 项目不提供 OpenAI HTTP API 层，benchmark 直接驱动 in-process engine，聚焦 runtime 与 scheduler。
-- 代码保留原始 MIT License。
+[MIT](LICENSE)

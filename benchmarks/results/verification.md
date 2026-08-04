@@ -5,7 +5,7 @@
 ## CPU 回归
 
 ```bash
-CUDA_VISIBLE_DEVICES= conda run --no-capture-output -n nano-vllm \
+CUDA_VISIBLE_DEVICES= conda run --no-capture-output -n LLM-Serve \
   python -m unittest discover -s tests
 ```
 
@@ -21,11 +21,11 @@ OK (skipped=8)
 ## 静态与入口检查
 
 ```bash
-conda run --no-capture-output -n nano-vllm \
+conda run --no-capture-output -n LLM-Serve \
   python -m compileall -q llmserve benchmarks example.py \
   check_speculative_correctness.py
 
-conda run --no-capture-output -n nano-vllm \
+conda run --no-capture-output -n LLM-Serve \
   python -m benchmarks.run_suite --help
 
 git diff --check
@@ -47,10 +47,10 @@ Poisson 与 closed-loop suite 分别使用一张 RTX 3090；双卡只用于并�
 验证日期：2026-07-24。AWQ 容量结果对应 dirty source commit `b32ba391160fb21e020bbaa7df5f287f38705460`，公开 metadata 保留该事实。
 
 ```bash
-CUDA_VISIBLE_DEVICES="" conda run -n nano-vllm \
+CUDA_VISIBLE_DEVICES="" conda run -n LLM-Serve \
   python -m unittest discover -s tests
 
-CUDA_VISIBLE_DEVICES=0 conda run -n nano-vllm python -m unittest \
+CUDA_VISIBLE_DEVICES=0 conda run -n LLM-Serve python -m unittest \
   tests.test_awq_reference tests.test_awq_linear_backend \
   tests.test_awq_linear_profile tests.test_awq_triton tests.test_awq_cuda \
   tests.test_awq_quality tests.test_awq_quantizer \
