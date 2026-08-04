@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,7 @@ authors = [{ name = "pengfei_he", email = "pengfei_he@foxmail.com" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "A single-GPU LLM inference engine focused on serving systems, scheduling, KV cache management, and speculative decoding experiments."
+description = "A single-host LLM inference runtime focused on serving systems, scheduling, KV cache management, and inference optimization."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",

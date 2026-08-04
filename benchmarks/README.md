@@ -153,4 +153,4 @@ closed-loop output throughput 统计 measurement window 内产生的 token；req
 
 公开数据基于 commit `ad35e65`，Qwen3-8B、RedHatAI Qwen3-8B EAGLE3 speculator、BF16 eager、argmax、固定 `gamma=3` 和 RTX 3090 24GB。Poisson 与 closed-loop suite 同时在两张独立 3090 上运行，但每个 suite/engine 始终只使用单卡，不是 tensor parallel。
 
-核心结论见仓库根目录 README；serving 原始数值以 [`results/formal-poisson/aggregate.csv`](results/formal-poisson/aggregate.csv) 和 [`results/formal-closed-loop/aggregate.csv`](results/formal-closed-loop/aggregate.csv) 为准，AWQ 脱敏汇总与实验边界见 [`results/awq-w4a16/`](results/awq-w4a16/)。
+公开结果索引见 [`results/README.md`](results/README.md)；serving 原始数值以 [`results/formal-poisson/aggregate.csv`](results/formal-poisson/aggregate.csv) 和 [`results/formal-closed-loop/aggregate.csv`](results/formal-closed-loop/aggregate.csv) 为准，AWQ 脱敏汇总与实验边界见 [`results/awq-w4a16/`](results/awq-w4a16/)。
