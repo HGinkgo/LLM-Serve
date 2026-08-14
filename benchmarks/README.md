@@ -62,18 +62,6 @@ CUDA_VISIBLE_DEVICES=1 python -m benchmarks.run_suite \
   --distributed-init-method tcp://localhost:2334
 ```
 
-PD 端到端对照使用 `pd-serving-formal.json`，比较单进程 BF16 Decode Graph 与双卡 `pd-b4-shared-graph`。该 suite 包含 closed-loop concurrency `{16, 32, 48, 64}` 和 Poisson request rate `{8, 16, 24, 28}`，每点重复三次；PD 默认使用 GPU 0/1，Prefill batch 4、Prefill eager、Decode Graph 和两个 shared KV slots：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python -m benchmarks.run_suite \
-  --suite benchmarks/suites/pd-serving-formal.json \
-  --output-dir /tmp/llmserve-pd-serving-formal \
-  --model "$MODEL_PATH" \
-  --distributed-init-method tcp://localhost:2341
-```
-
-该矩阵用于回答 PD 相对 collocated baseline 的端到端吞吐、goodput、TTFT/TPOT/E2E 和队列边界；不能把双卡 PD 的结果表述为单卡模型计算加速。
-
 短 Linear profiling 用于定位 AWQ kernel 优化优先级：
 
 ```bash
