@@ -20,10 +20,16 @@ from llmserve.pd.kv_transfer import import_logical_kv
 
 class LLMEngine:
 
+    def _latency_telemetry_enabled(self):
+        return bool(getattr(
+            getattr(self, "config", None), "enable_latency_telemetry", False
+        ))
+
     def __init__(self, model, **kwargs):                # 传入模型和其他参数
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -119,6 +125,7 @@ class LLMEngine:
             "speculative_gamma_counts": {},
             "speculative_trace": [],
             "speculative_timing": {},
+            "timeline": None,
         }
 
     # 把用户请求放进系统
@@ -129,6 +136,19 @@ class LLMEngine:
         self.request_metrics[seq.seq_id] = self._new_request_metric(seq)
         self.scheduler.add(seq)
         return seq.seq_id
+
+    def record_benchmark_submit(self, seq_id: int, submitted_at: float):
+        """Store the benchmark submission boundary without changing scheduling."""
+        if not self._latency_telemetry_enabled():
+            return
+        metric = self.request_metrics.get(seq_id)
+        if metric is None:
+            raise KeyError(f"unknown sequence {seq_id}")
+        metric["arrival_time"] = submitted_at
+        metric["timeline"] = {
+            "t_submit": submitted_at,
+            "writers": {"t_submit": "benchmark_harness"},
+        }
 
     def abort_request(self, seq_id: int) -> bool:
         """Cancel a waiting or running request between engine steps."""
@@ -180,6 +200,7 @@ class LLMEngine:
         seq = Sequence(prompt_token_ids, sampling_params)
         seq.append_token(int(first_token_id))
         self.scheduler.admit_prefilled(seq, cached_tokens=len(prompt_token_ids))
+        admitted_at = perf_counter()
         try:
             import_logical_kv(
                 self.model_runner.kv_cache,
@@ -196,6 +217,15 @@ class LLMEngine:
         metric["token_times"] = [now]
         metric["output_event_times"] = [now]
         metric["output_tokens"] = 1
+        if self._latency_telemetry_enabled():
+            self.last_prefilled_admission_telemetry = {
+                "t_decode_admitted": admitted_at,
+                "t_handoff_finish": now,
+                "writers": {
+                    "t_decode_admitted": "decode_worker.scheduler",
+                    "t_handoff_finish": "decode_worker.kv_import",
+                },
+            }
         self.request_metrics[seq.seq_id] = metric
 
         eos = getattr(self.scheduler, "eos", -1)
@@ -276,6 +306,15 @@ class LLMEngine:
                 )
 
         num_tokens = scheduler_output.num_batched_tokens
+        scheduled_token_counts = {
+            seq.seq_id: seq.num_scheduled_tokens
+            for seq in scheduler_output.scheduled_seqs
+        }
+        partial_prefill_seq_ids = [
+            seq.seq_id
+            for seq in scheduler_output.prefill_seqs
+            if seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens
+        ]
         before_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         token_ids = self.model_runner.call("run", scheduler_output)
         self.scheduler.postprocess(scheduler_output, token_ids)
@@ -316,6 +355,60 @@ class LLMEngine:
             "waiting_queue_size": len(getattr(self.scheduler, "waiting", ())),
             "running_queue_size": len(getattr(self.scheduler, "running", ())),
         }
+        if self._latency_telemetry_enabled():
+            for seq in scheduler_output.prefill_seqs:
+                metric = self.request_metrics.get(seq.seq_id)
+                if metric is not None:
+                    timeline = metric.get("timeline") or {}
+                    metric["timeline"] = timeline
+                    timeline.setdefault("t_prefill_first_scheduled", step_start)
+                    timeline.setdefault("writers", {})[
+                        "t_prefill_first_scheduled"
+                    ] = "collocated_scheduler"
+            for seq_id in first_token_seq_ids:
+                metric = self.request_metrics.get(seq_id)
+                if metric is not None:
+                    timeline = metric.get("timeline") or {}
+                    metric["timeline"] = timeline
+                    timeline.update({
+                        "t_prefill_finish": step_end,
+                        "t_handoff_finish": step_end,
+                        "t_decode_admitted": step_end,
+                        "t_first_token": step_end,
+                    })
+                    timeline.setdefault("writers", {}).update({
+                        "t_prefill_finish": "collocated_model_runner",
+                        "t_handoff_finish": "collocated_no_handoff",
+                        "t_decode_admitted": "collocated_scheduler",
+                        "t_first_token": "collocated_model_runner",
+                    })
+            timing = self.model_runner.call("get_last_run_timing")
+            self.last_step_events.update({
+                "prefill_token_count": sum(
+                    scheduled_token_counts[seq.seq_id]
+                    for seq in scheduler_output.prefill_seqs
+                ),
+                "decode_token_count": sum(
+                    scheduled_token_counts[seq.seq_id]
+                    for seq in scheduler_output.decode_seqs
+                ),
+                "prefill_request_count": len(scheduler_output.prefill_seqs),
+                "decode_request_count": len(scheduler_output.decode_seqs),
+                "remaining_token_budget": (
+                    self.config.max_num_batched_tokens - num_tokens
+                ),
+                "max_num_batched_tokens": self.config.max_num_batched_tokens,
+                "max_num_seqs": self.config.max_num_seqs,
+                "chunked_prefill": self.config.enable_chunked_prefill,
+                "partial_prefill_seq_ids": partial_prefill_seq_ids,
+                "partial_prefill_chunk_count": len(partial_prefill_seq_ids),
+                "prefill_chunk_lengths": [
+                    scheduled_token_counts[seq_id]
+                    for seq_id in partial_prefill_seq_ids
+                ],
+                "model_forward_gpu_ms": timing.get("model_forward_gpu_ms"),
+                "model_forward_stage": timing.get("stage"),
+            })
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
@@ -561,6 +654,15 @@ class LLMEngine:
             else:
                 status = "active"
 
+            timeline = metric.get("timeline")
+            if self._latency_telemetry_enabled() and timeline is not None:
+                timeline = dict(timeline)
+                if finish_time is not None:
+                    timeline["t_finish"] = finish_time
+                    timeline.setdefault("writers", {})["t_finish"] = (
+                        "engine.postprocess"
+                    )
+
             requests.append({
                 "seq_id": metric["seq_id"],
                 "prompt_tokens": metric["prompt_tokens"],
@@ -590,6 +692,7 @@ class LLMEngine:
                 ),
                 "speculative_trace": speculative_trace,
                 "speculative_timing": speculative_timing,
+                "timeline": timeline,
             })
 
         wall_time = 0.0

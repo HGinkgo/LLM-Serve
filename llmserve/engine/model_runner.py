@@ -38,6 +38,9 @@ class ModelRunner:
 
         initialize_distributed(config, rank, self.world_size)
         torch.cuda.set_device(rank)
+        if config.random_seed is not None:
+            torch.manual_seed(config.random_seed)
+            torch.cuda.manual_seed_all(config.random_seed)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
@@ -60,6 +63,7 @@ class ModelRunner:
         self.cudagraph_replays_by_bs = {}
         self.cudagraph_replays_by_graph_size = {}
         self.cudagraph_fallbacks = {}
+        self.last_run_timing = {}
         self.warmup_model()
         # 真正跑一次模型，把模型执行的峰值显存测出来，计算给 KV cache 留多少空间
         self.allocate_kv_cache()
@@ -295,6 +299,9 @@ class ModelRunner:
         self.cudagraph_replays_by_graph_size.clear()
         self.cudagraph_fallbacks.clear()
 
+    def get_last_run_timing(self):
+        return dict(self.last_run_timing)
+
     def _record_cudagraph_fallback(self, reason: str):
         self.cudagraph_fallbacks[reason] = (
             self.cudagraph_fallbacks.get(reason, 0) + 1
@@ -428,16 +435,43 @@ class ModelRunner:
             else self.prepare_decode(decode_seqs)
         )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        start_event = end_event = None
+        if self.config.enable_latency_telemetry:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         if is_prefill and self.draft_model is not None:
             hidden_states, aux_hidden = self.model.forward_with_eagle3_aux(input_ids, positions)
             logits = self.model.compute_logits(hidden_states)
             self._accumulate_draft_prefill(seqs, aux_hidden, decode_seqs)
         else:
             logits = self.run_model(input_ids, positions, is_prefill)
+        if end_event is not None:
+            end_event.record()
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         if is_prefill and self.draft_model is not None:
             self._fill_prefill_sampled_tokens(seqs, aux_hidden, token_ids, decode_seqs)
         reset_context()
+        if end_event is not None:
+            end_event.synchronize()
+            self.last_run_timing = {
+                "model_forward_gpu_ms": start_event.elapsed_time(end_event),
+                "stage": (
+                    "mixed"
+                    if prefill_seqs and decode_seqs
+                    else "prefill" if prefill_seqs else "decode"
+                ),
+                "prefill_tokens": sum(
+                    seq.num_scheduled_tokens for seq in prefill_seqs
+                ),
+                "decode_tokens": sum(
+                    seq.num_scheduled_tokens for seq in decode_seqs
+                ),
+                "prefill_requests": len(prefill_seqs),
+                "decode_requests": len(decode_seqs),
+            }
+        else:
+            self.last_run_timing = {}
         return token_ids
 
     @torch.inference_mode()

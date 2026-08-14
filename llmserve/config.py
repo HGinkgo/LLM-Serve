@@ -26,6 +26,9 @@ class Config:
     speculative_accept_mode: str = "greedy"
     speculative_trace: bool = False
     enable_speculative_cuda_graph: bool = False
+    # Benchmark-only observability. Disabled for normal serving paths.
+    enable_latency_telemetry: bool = False
+    random_seed: int | None = None
     hf_config: AutoConfig | None = None
     quant_config: AWQRuntimeConfig | None = field(init=False, default=None)
     eos: int = -1

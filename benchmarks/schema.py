@@ -44,6 +44,17 @@ def compact_request_record(request: dict):
             for index in range(1, len(output_event_times))
         ]
     speculative_step_latency = request.get("speculative_step_latency", [])
+    timeline = request.get("timeline")
+    engine_ttft_ms = None
+    decode_ready_ms = None
+    if timeline is not None:
+        submit = timeline.get("t_submit")
+        first_token = timeline.get("t_first_token")
+        handoff_finish = timeline.get("t_handoff_finish")
+        if submit is not None and first_token is not None:
+            engine_ttft_ms = (first_token - submit) * 1000
+        if submit is not None and handoff_finish is not None:
+            decode_ready_ms = (handoff_finish - submit) * 1000
 
     return {
         "seq_id": request["seq_id"],
@@ -59,6 +70,8 @@ def compact_request_record(request: dict):
         ),
         "failure_reason": request.get("failure_reason"),
         "ttft_ms": ttft_ms,
+        "engine_ttft_ms": engine_ttft_ms,
+        "decode_ready_ms": decode_ready_ms,
         "tpot_ms": tpot_ms,
         "e2e_ms": e2e_ms,
         "burst_itl_ms": _milliseconds_summary(burst_itl),
@@ -84,4 +97,5 @@ def compact_request_record(request: dict):
                 )
             },
         },
+        "timeline": timeline,
     }

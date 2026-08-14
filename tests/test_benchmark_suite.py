@@ -72,6 +72,8 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "formal-poisson.json",
                 "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
+                "pd-strong-baseline-chunked-validation.json",
+                "pd-strong-baseline.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
             },

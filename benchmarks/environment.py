@@ -28,12 +28,39 @@ def build_environment_metadata():
 
     cuda_available = torch.cuda.is_available()
     if cuda_available:
+        gpus = [
+            {
+                "index": index,
+                "name": torch.cuda.get_device_name(index),
+                "memory_bytes": torch.cuda.get_device_properties(index).total_memory,
+            }
+            for index in range(torch.cuda.device_count())
+        ]
         properties = torch.cuda.get_device_properties(0)
-        gpu_name = torch.cuda.get_device_name(0)
+        gpu_name = gpus[0]["name"]
         gpu_memory_bytes = properties.total_memory
+        peer_access = {
+            f"{source}->{target}": bool(
+                torch.cuda.can_device_access_peer(source, target)
+            )
+            for source in range(torch.cuda.device_count())
+            for target in range(torch.cuda.device_count())
+            if source != target
+        }
     else:
         gpu_name = None
         gpu_memory_bytes = None
+        gpus = []
+        peer_access = {}
+    try:
+        topology = subprocess.run(
+            ["nvidia-smi", "topo", "-m"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        topology = None
     commit = git_output("rev-parse", "HEAD")
     status = git_output("status", "--porcelain")
     return {
@@ -46,6 +73,9 @@ def build_environment_metadata():
         "cuda_available": cuda_available,
         "gpu_name": gpu_name,
         "gpu_memory_bytes": gpu_memory_bytes,
+        "gpus": gpus,
+        "cuda_peer_access": peer_access,
+        "nvidia_smi_topology": topology,
     }
 
 

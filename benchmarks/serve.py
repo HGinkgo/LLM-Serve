@@ -13,6 +13,7 @@ from benchmarks.environment import (
     build_environment_metadata,
     discover_model_revision,
 )
+from benchmarks.gpu_clocks import GPUClockSampler
 from benchmarks.metrics import (
     summarize_serving_run,
     summarize_speculative_requests,
@@ -98,7 +99,49 @@ def _default_pd_engine_factory(model, **kwargs):
             engine_kwargs=kwargs,
         )
     )
-    return PDServingEngine(coordinator, prefill_batch_size=prefill_batch_size)
+    return PDServingEngine(
+        coordinator,
+        prefill_batch_size=prefill_batch_size,
+        enable_latency_telemetry=kwargs.get("enable_latency_telemetry", False),
+    )
+
+
+def _effective_runtime_config(engine):
+    """Read selected values from the constructed runtime, not only the suite."""
+    fields = (
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "max_model_len",
+        "gpu_memory_utilization",
+        "enable_chunked_prefill",
+        "enable_kv_capacity_admission",
+        "enforce_eager",
+        "enable_speculative_cuda_graph",
+        "enable_latency_telemetry",
+        "random_seed",
+    )
+    coordinator = getattr(engine, "coordinator", None)
+    if coordinator is not None:
+        config = coordinator.config
+        return {
+            "kind": "pd",
+            "prefill_gpu": config.prefill_gpu,
+            "decode_gpu": config.decode_gpu,
+            "prefill_enforce_eager": config.prefill_enforce_eager,
+            "decode_enforce_eager": config.decode_enforce_eager,
+            "kv_slot_count": config.kv_slot_count,
+            "kv_slot_capacity_tokens": config.kv_slot_capacity_tokens,
+            "prefill_batch_size": engine.prefill_batch_size,
+            "engine_kwargs": {
+                name: config.engine_kwargs.get(name) for name in fields
+            },
+        }
+    config = getattr(engine, "config", None)
+    return {
+        "kind": "collocated",
+        "visible_gpu": 0,
+        "engine_config": {name: getattr(config, name, None) for name in fields},
+    }
 
 
 def _default_sampling_params(spec):
@@ -211,6 +254,10 @@ def run_point(
         "enable_speculative_cuda_graph": runtime.get(
             "enable_speculative_cuda_graph", False
         ),
+        "enable_latency_telemetry": runtime.get(
+            "enable_latency_telemetry", False
+        ),
+        "random_seed": runtime.get("random_seed"),
     }
     if runtime.get("pd", False):
         engine_kwargs.update(
@@ -235,6 +282,13 @@ def run_point(
     if distributed_init_method is not None:
         engine_kwargs["distributed_init_method"] = distributed_init_method
     engine = engine_factory(model, **engine_kwargs)
+    effective_runtime = _effective_runtime_config(engine)
+    clock_sampler = (
+        GPUClockSampler().start()
+        if runtime.get("sample_gpu_clocks", False)
+        else None
+    )
+    clock_summary = None
     if runtime.get("argmax_sampler", False) and hasattr(engine, "model_runner"):
         engine.model_runner.sampler = ArgmaxSampler()
     classes = _workload_classes(point)
@@ -283,6 +337,8 @@ def run_point(
         else:
             raise ValueError(f"unsupported arrival: {point['arrival']}")
     finally:
+        if clock_sampler is not None:
+            clock_summary = clock_sampler.stop()
         if hasattr(engine, "exit"):
             engine.exit()
 
@@ -334,6 +390,15 @@ def run_point(
             compact_request_record(request)
             for request in observation["requests"]
         ],
+        "telemetry": {
+            "scheduler_steps": observation.get("scheduler_steps", []),
+            "gpu_clocks": clock_summary,
+            "measurement_window": {
+                "start": observation.get("measurement_start"),
+                "end": observation.get("measurement_end"),
+            },
+            "effective_runtime": effective_runtime,
+        },
     }
 
 

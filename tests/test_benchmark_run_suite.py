@@ -58,6 +58,46 @@ def successful_result(point, commit):
 
 
 class BenchmarkRunSuiteTests(unittest.TestCase):
+    def test_execute_suite_records_seeded_interleaved_execution_order(self):
+        from benchmarks.run_suite import execute_suite
+
+        suite = json.loads(json.dumps(SUITE))
+        suite["runs"] = 2
+        suite["execution_order_seed"] = 20260814
+
+        commands = []
+
+        def command_runner(command, **kwargs):
+            commands.append(command)
+            point_path = Path(command[command.index("--point-config") + 1])
+            output_path = Path(command[command.index("--output") + 1])
+            point = json.loads(point_path.read_text())
+            output_path.write_text(json.dumps(successful_result(point, "abc123")))
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            execute_suite(
+                suite,
+                Path(directory),
+                model="/models/Qwen3-8B",
+                speculative_model=None,
+                metadata={"git_commit": "abc123", "git_dirty": False},
+                command_runner=command_runner,
+            )
+            manifest = json.loads((Path(directory) / "manifest.json").read_text())
+
+        self.assertEqual(manifest["execution_order_seed"], 20260814)
+        self.assertEqual(len(manifest["execution_order"]), 4)
+        self.assertNotEqual(
+            manifest["execution_order"],
+            [
+                "poisson-baseline-rate-1p0-r1",
+                "poisson-chunked-rate-1p0-r1",
+                "poisson-baseline-rate-1p0-r2",
+                "poisson-chunked-rate-1p0-r2",
+            ],
+        )
+
     def test_execute_suite_writes_manifest_runs_and_csv_outputs(self):
         from benchmarks.run_suite import execute_suite
 

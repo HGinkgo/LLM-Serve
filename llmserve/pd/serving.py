@@ -19,11 +19,17 @@ class PDServingEngine:
     a whole request batch as one opaque timing sample.
     """
 
-    def __init__(self, coordinator, prefill_batch_size: int = 1):
+    def __init__(
+        self,
+        coordinator,
+        prefill_batch_size: int = 1,
+        enable_latency_telemetry: bool = False,
+    ):
         if not isinstance(prefill_batch_size, int) or prefill_batch_size <= 0:
             raise ValueError("prefill_batch_size must be a positive integer")
         self.coordinator = coordinator
         self.prefill_batch_size = prefill_batch_size
+        self.enable_latency_telemetry = enable_latency_telemetry
         self._next_request_id = 0
         self._pending: deque[RequestEnvelope] = deque()
         self._requests: dict[int, dict] = {}
@@ -67,8 +73,21 @@ class PDServingEngine:
             "decode_seq_id": None,
             "finish_time": None,
             "lifecycle": RequestLifecycle(request_id),
+            "timeline": None,
         }
         return request_id
+
+    def record_benchmark_submit(self, request_id: int, submitted_at: float):
+        if not self.enable_latency_telemetry:
+            return
+        request = self._requests.get(request_id)
+        if request is None:
+            raise KeyError(f"unknown request {request_id}")
+        request["arrival_time"] = submitted_at
+        request["timeline"] = {
+            "t_submit": submitted_at,
+            "writers": {"t_submit": "benchmark_harness"},
+        }
 
     def abort_request(self, request_id: int) -> bool:
         """Cancel a PD request at a boundary between serving steps."""
@@ -120,6 +139,7 @@ class PDServingEngine:
             "batch_size": len(batch),
             "submitted_at": submitted_at,
             "released_transfer_ids": list(release_transfer_ids),
+            "t_prefill_dispatch_parent": submitted_at,
         }
 
     def _flush_transfer_acks(self):
@@ -194,6 +214,31 @@ class PDServingEngine:
             request = self._requests[request_id]
             lifecycle = request["lifecycle"]
             lifecycle.transition(RequestState.DECODING)
+            if self.enable_latency_telemetry:
+                timeline = request.get("timeline") or {}
+                request["timeline"] = timeline
+                handoff_telemetry = getattr(handoff, "telemetry", {})
+                timeline.update({
+                    key: handoff_telemetry.get(key)
+                    for key in (
+                        "t_prefill_first_scheduled",
+                        "t_prefill_finish",
+                        "t_first_token",
+                        "first_token_origin",
+                    )
+                    if handoff_telemetry.get(key) is not None
+                })
+                timeline["t_prefill_dispatch_parent"] = meta.get(
+                    "t_prefill_dispatch_parent"
+                )
+                timeline.update({
+                    key: admission.get("telemetry", {}).get(key)
+                    for key in ("t_decode_admitted", "t_handoff_finish")
+                    if admission.get("telemetry", {}).get(key) is not None
+                })
+                writers = timeline.setdefault("writers", {})
+                writers.update(handoff_telemetry.get("writers", {}))
+                writers.update(admission.get("telemetry", {}).get("writers", {}))
             descriptor = getattr(handoff, "descriptor", None)
             if getattr(descriptor, "transport", "inline") == "shared_slot":
                 transfer_id = admission.get("transfer_id")
@@ -230,6 +275,9 @@ class PDServingEngine:
                 "prefill_worker_ms": worker_total_ms,
                 "prefill_model_forward_ms": prefill_timing.get(
                     "model_forward_ms"
+                ),
+                "prefill_model_forward_gpu_ms": prefill_timing.get(
+                    "model_forward_gpu_ms"
                 ),
                 "prefill_kv_export_copy_ms": prefill_timing.get(
                     "kv_export_copy_ms"
@@ -276,6 +324,16 @@ class PDServingEngine:
                     if handoffs
                     else None
                 ),
+                "transports": [
+                    getattr(getattr(handoff, "descriptor", None), "transport", None)
+                    for handoff in handoffs
+                ],
+                "slot_stats_after_ready": getattr(
+                    handoffs[0], "telemetry", {}
+                ).get("slot_stats_after_ready") if handoffs else None,
+                "slot_wait_count": getattr(
+                    handoffs[0], "telemetry", {}
+                ).get("slot_wait_count") if handoffs else None,
             }
         )
         if self._prefill_future is None and not self._pending:
@@ -369,6 +427,15 @@ class PDServingEngine:
                 raise RuntimeError("Decode Worker returned an unknown sequence id")
             request = self._requests[request_id]
             request["finish_time"] = perf_counter()
+            if self.enable_latency_telemetry:
+                timeline = request.get("timeline") or {}
+                request["timeline"] = timeline
+                timeline["t_finish"] = request[
+                    "finish_time"
+                ]
+                timeline.setdefault("writers", {})[
+                    "t_finish"
+                ] = "pd_parent.decode_result"
             request["lifecycle"].transition(RequestState.FINISHED)
             outputs.append((request_id, list(token_ids)))
         events = deepcopy(result.get("last_step_events") or {})
@@ -382,6 +449,12 @@ class PDServingEngine:
         )
         events["pd_active_decode_requests"] = len(self._active_by_decode_seq)
         events["pd_pending_prefill_requests"] = len(self._pending)
+        if self.enable_latency_telemetry:
+            events["pd_slot_state"] = (
+                deepcopy(self._prefill_batches[-1].get("slot_stats_after_ready"))
+                if self._prefill_batches else None
+            )
+            events["pd_handoff_count"] = len(self._prefill_batches)
         self.last_step_events = events
         self._record_queue_sample()
         self._start_prefill()
@@ -434,6 +507,14 @@ class PDServingEngine:
             request["seq_id"] = request_id
             local_request = self._requests[request_id]
             request["arrival_time"] = local_request["arrival_time"]
+            if self.enable_latency_telemetry:
+                timeline = deepcopy(local_request.get("timeline"))
+                if timeline is not None:
+                    timeline["t_finish"] = request.get("finish_time")
+                    timeline.setdefault("writers", {})["t_finish"] = (
+                        "decode_worker.engine"
+                    )
+                request["timeline"] = timeline
             request["status"] = local_request["lifecycle"].state.value
             request["cancelled"] = (
                 local_request["lifecycle"].state == RequestState.CANCELLED
@@ -461,6 +542,7 @@ class PDServingEngine:
                         "token_times": [now] if output_token_ids else [],
                         "output_event_times": [now] if output_token_ids else [],
                         "finish_time": request.get("finish_time"),
+                        "timeline": deepcopy(request.get("timeline")),
                     }
                 )
         summary = deepcopy(worker_metrics.get("summary", {}))
@@ -482,6 +564,7 @@ class PDServingEngine:
             "handoff_path_ms": "handoff_path_ms",
             "worker_ms": "prefill_worker_ms",
             "model_forward_ms": "prefill_model_forward_ms",
+            "model_forward_gpu_ms": "prefill_model_forward_gpu_ms",
             "kv_export_copy_ms": "prefill_kv_export_copy_ms",
             "parent_overhead_ms": "prefill_parent_overhead_ms",
             "forward_calls": "prefill_forward_calls",

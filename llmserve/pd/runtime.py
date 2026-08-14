@@ -26,6 +26,7 @@ class PrefillHandoff:
     descriptor: KVTransferDescriptor
     kv_payload: torch.Tensor | None = None
     prefill_timing_ms: dict[str, float | int] = field(default_factory=dict)
+    telemetry: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self):
         if not isinstance(self.first_token_id, int) or self.first_token_id < 0:
@@ -196,8 +197,10 @@ class PrefillWorkerRuntime:
                     token_offset += len(envelope.prompt_token_ids)
         batch_started_at = perf_counter()
         model_forward_ms = 0.0
+        model_forward_gpu_ms = 0.0
         kv_export_copy_ms = 0.0
         forward_calls = 0
+        prefill_first_scheduled_at = None
         try:
             for envelope in envelopes:
                 sampling_params = SamplingParams(
@@ -219,6 +222,8 @@ class PrefillWorkerRuntime:
                 owned_seq_ids.add(seq_id)
 
             while owned_seq_ids:
+                if prefill_first_scheduled_at is None:
+                    prefill_first_scheduled_at = perf_counter()
                 scheduler_output = self.engine.scheduler.schedule()
                 if not scheduler_output.prefill_seqs or scheduler_output.decode_seqs:
                     raise RuntimeError(
@@ -226,7 +231,19 @@ class PrefillWorkerRuntime:
                     )
                 forward_started_at = perf_counter()
                 token_ids = self.engine.model_runner.call("run", scheduler_output)
-                model_forward_ms += (perf_counter() - forward_started_at) * 1000
+                forward_finished_at = perf_counter()
+                model_forward_ms += (forward_finished_at - forward_started_at) * 1000
+                if getattr(
+                    getattr(self.engine, "config", None),
+                    "enable_latency_telemetry",
+                    False,
+                ):
+                    model_timing = self.engine.model_runner.call(
+                        "get_last_run_timing"
+                    )
+                    model_forward_gpu_ms += float(
+                        model_timing.get("model_forward_gpu_ms") or 0.0
+                    )
                 forward_calls += 1
                 if len(token_ids) != len(scheduler_output.scheduled_seqs):
                     raise RuntimeError(
@@ -261,6 +278,22 @@ class PrefillWorkerRuntime:
                             0,
                         ),
                     )
+                    if getattr(
+                        getattr(self.engine, "config", None),
+                        "enable_latency_telemetry",
+                        False,
+                    ):
+                        handoff.telemetry = {
+                            "t_prefill_first_scheduled": prefill_first_scheduled_at,
+                            "t_prefill_finish": forward_finished_at,
+                            "t_first_token": forward_finished_at,
+                            "first_token_origin": "prefill",
+                            "writers": {
+                                "t_prefill_first_scheduled": "prefill_worker.scheduler",
+                                "t_prefill_finish": "prefill_worker.model_runner",
+                                "t_first_token": "prefill_worker.model_runner",
+                            },
+                        }
                     kv_export_copy_ms += (
                         perf_counter() - export_started_at
                     ) * 1000
@@ -286,6 +319,7 @@ class PrefillWorkerRuntime:
             batch_timing = {
                 "worker_total_ms": (perf_counter() - batch_started_at) * 1000,
                 "model_forward_ms": model_forward_ms,
+                "model_forward_gpu_ms": model_forward_gpu_ms,
                 "kv_export_copy_ms": kv_export_copy_ms,
                 "forward_calls": forward_calls,
             }
@@ -299,6 +333,12 @@ class PrefillWorkerRuntime:
                         for handoff in handoffs_by_request_id.values()
                     },
                 )
+                slot_stats = self.slot_pool.stats()
+                for handoff in handoffs_by_request_id.values():
+                    handoff.telemetry.update({
+                        "slot_stats_after_ready": slot_stats,
+                        "slot_wait_count": 0,
+                    })
             return [handoffs_by_request_id[request_id] for request_id in request_ids]
         except Exception:
             for seq_id in list(owned_seq_ids):
@@ -354,6 +394,9 @@ class DecodeWorkerRuntime:
             sampling_params,
             kv_payload,
         )
+        telemetry = dict(
+            getattr(self.engine, "last_prefilled_admission_telemetry", {})
+        )
         finished = (
             handoff.envelope.max_tokens <= 1
             or (
@@ -368,4 +411,6 @@ class DecodeWorkerRuntime:
         }
         if handoff.descriptor.transport == "shared_slot":
             admission["transfer_id"] = handoff.descriptor.transfer_id
+        if telemetry:
+            admission["telemetry"] = telemetry
         return admission

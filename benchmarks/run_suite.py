@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from random import Random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -185,6 +186,9 @@ def execute_suite(
     runs_dir.mkdir(parents=True, exist_ok=True)
     points_dir.mkdir(parents=True, exist_ok=True)
     points = expand_suite(suite)
+    execution_order_seed = suite.get("execution_order_seed")
+    if execution_order_seed is not None:
+        Random(execution_order_seed).shuffle(points)
     commit = metadata.get("git_commit")
     model_revision = model_revision or discover_model_revision(model)
     speculative_model_revision = (
@@ -207,6 +211,8 @@ def execute_suite(
         "total_points": len(points),
         "completed_points": 0,
         "failed_points": 0,
+        "execution_order_seed": execution_order_seed,
+        "execution_order": [point["point_id"] for point in points],
     }
     atomic_write_json(output_dir / "manifest.json", manifest)
 

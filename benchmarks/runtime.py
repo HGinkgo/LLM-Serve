@@ -5,6 +5,37 @@ from collections.abc import Callable, Sequence
 from benchmarks.workloads import RequestSpec
 
 
+_SCHEDULER_TELEMETRY_FIELDS = (
+    "step_start", "step_end", "waiting_queue_size", "running_queue_size",
+    "pd_pending_prefill_requests", "pd_active_decode_requests",
+    "prefill_token_count", "decode_token_count", "prefill_request_count",
+    "decode_request_count", "remaining_token_budget",
+    "max_num_batched_tokens", "max_num_seqs", "chunked_prefill",
+    "partial_prefill_seq_ids", "partial_prefill_chunk_count",
+    "prefill_chunk_lengths", "model_forward_gpu_ms", "model_forward_stage",
+    "pd_slot_state", "pd_handoff_count",
+)
+
+
+def _submit_request(engine, prompt_token_ids, sampling_params, clock):
+    submitted_at = clock()
+    seq_id = engine.add_request(prompt_token_ids, sampling_params)
+    recorder = getattr(engine, "record_benchmark_submit", None)
+    if recorder is not None:
+        recorder(seq_id, submitted_at)
+    return seq_id
+
+
+def _compact_scheduler_step(events):
+    record = {
+        name: events.get(name)
+        for name in _SCHEDULER_TELEMETRY_FIELDS
+        if name in events
+    }
+    record["scheduled_request_count"] = len(events.get("scheduled_seq_ids", ()))
+    return record
+
+
 def run_poisson(
     engine,
     request_specs: Sequence[RequestSpec],
@@ -25,15 +56,18 @@ def run_poisson(
     speculative_batch_sizes = []
     waiting_queue_sizes = []
     running_queue_sizes = []
+    scheduler_steps = []
     start = clock()
 
     while pending or not engine.is_finished():
         elapsed = clock() - start
         while pending and pending[0][0] <= elapsed:
             arrival_time, spec = pending.popleft()
-            seq_id = engine.add_request(
+            seq_id = _submit_request(
+                engine,
                 list(spec.prompt_token_ids),
                 make_sampling_params(spec),
+                clock,
             )
             seq_to_spec[seq_id] = spec
             seq_to_arrival[seq_id] = start + arrival_time
@@ -46,6 +80,7 @@ def run_poisson(
             )
             waiting_queue_sizes.append(events.get("waiting_queue_size", 0))
             running_queue_sizes.append(events.get("running_queue_size", 0))
+            scheduler_steps.append(_compact_scheduler_step(events))
             if events.get("speculative"):
                 speculative_batch_sizes.append(
                     events.get("speculative_batch_size", 0)
@@ -83,6 +118,7 @@ def run_poisson(
         "speculative_batch_sizes": speculative_batch_sizes,
         "waiting_queue_sizes": waiting_queue_sizes,
         "running_queue_sizes": running_queue_sizes,
+        "scheduler_steps": scheduler_steps,
         "engine_summary": engine_metrics.get("summary", {}),
     }
 
@@ -111,9 +147,11 @@ def run_closed_loop(
         nonlocal active_requests
         while active_requests < max_concurrency:
             spec = next(request_specs)
-            seq_id = engine.add_request(
+            seq_id = _submit_request(
+                engine,
                 list(spec.prompt_token_ids),
                 make_sampling_params(spec),
+                clock,
             )
             seq_to_spec[seq_id] = spec
             active_requests += 1
@@ -125,6 +163,7 @@ def run_closed_loop(
     speculative_batch_sizes = []
     waiting_queue_sizes = []
     running_queue_sizes = []
+    scheduler_steps = []
 
     while clock() < measurement_end:
         outputs, _ = engine.step()
@@ -137,6 +176,7 @@ def run_closed_loop(
             )
             waiting_queue_sizes.append(events.get("waiting_queue_size", 0))
             running_queue_sizes.append(events.get("running_queue_size", 0))
+            scheduler_steps.append(_compact_scheduler_step(events))
             if events.get("speculative"):
                 speculative_batch_sizes.append(
                     events.get("speculative_batch_size", 0)
@@ -187,5 +227,6 @@ def run_closed_loop(
         "speculative_batch_sizes": speculative_batch_sizes,
         "waiting_queue_sizes": waiting_queue_sizes,
         "running_queue_sizes": running_queue_sizes,
+        "scheduler_steps": scheduler_steps,
         "engine_summary": engine_metrics.get("summary", {}),
     }
