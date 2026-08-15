@@ -276,6 +276,43 @@ class BenchmarkServeTests(unittest.TestCase):
         self.assertEqual(factory_calls[0]["kv_slot_count"], 2)
         self.assertEqual(factory_calls[0]["kv_slot_capacity_tokens"], 1024)
 
+    def test_run_point_passes_decode_pool_configuration(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        factory_calls = []
+        point = make_point()
+        point["runtime"].update({
+            "pd": True,
+            "prefill_gpu": 0,
+            "decode_gpu": 1,
+            "decode_gpus": [1, 2],
+            "prefill_init_method": "tcp://127.0.0.1:24531",
+            "decode_init_methods": [
+                "tcp://127.0.0.1:24532",
+                "tcp://127.0.0.1:24533",
+            ],
+        })
+
+        def engine_factory(model, **kwargs):
+            factory_calls.append(kwargs)
+            return FakeEngine(clock)
+
+        run_point(
+            point,
+            model="/models/Qwen3-8B",
+            engine_factory=engine_factory,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(factory_calls[0]["decode_gpus"], (1, 2))
+        self.assertEqual(
+            factory_calls[0]["decode_init_methods"],
+            ("tcp://127.0.0.1:24532", "tcp://127.0.0.1:24533"),
+        )
+
     def test_closed_loop_result_reports_latency_sample_request_count(self):
         from benchmarks.serve import run_point
 

@@ -52,11 +52,46 @@ def _cleanup_worker_resources(engine, runtime):
             engine.exit()
     finally:
         if runtime is not None:
-            transport = getattr(runtime, "slot_reader", None) or getattr(
-                runtime, "slot_pool", None
-            )
-            if transport is not None:
+            transports = [
+                getattr(runtime, "slot_reader", None),
+                getattr(runtime, "slot_pool", None),
+                *getattr(runtime, "slot_pools", {}).values(),
+            ]
+            closed = set()
+            for transport in transports:
+                if transport is None or id(transport) in closed:
+                    continue
                 transport.close()
+                closed.add(id(transport))
+
+
+def _create_prefill_slot_pools(
+    engine,
+    transport_config: dict,
+    *,
+    register_cuda: bool = True,
+):
+    """Create one Prefill-owned shared-memory pool per Decode Worker."""
+    if not transport_config["slot_count"]:
+        return {}
+    from llmserve.pd.shared_slots import SharedKVSlotPool
+
+    target_workers = tuple(transport_config.get("target_workers", ("decode",)))
+    if not target_workers or len(set(target_workers)) != len(target_workers):
+        raise ValueError("shared KV target workers must be unique and non-empty")
+    kv_cache = engine.model_runner.kv_cache
+    return {
+        worker_id: SharedKVSlotPool.create(
+            slot_count=transport_config["slot_count"],
+            capacity_tokens=transport_config["capacity_tokens"],
+            num_layers=kv_cache.size(1),
+            num_kv_heads=kv_cache.size(4),
+            head_dim=kv_cache.size(5),
+            dtype=kv_cache.dtype,
+            register_cuda=register_cuda,
+        )
+        for worker_id in target_workers
+    }
 
 
 def worker_main(
@@ -85,34 +120,28 @@ def worker_main(
     try:
         engine = LLM(model, **engine_kwargs)
         if role == "prefill":
-            slot_pool = None
-            if transport_config["slot_count"]:
-                from llmserve.pd.shared_slots import SharedKVSlotPool
-
-                kv_cache = engine.model_runner.kv_cache
-                slot_pool = SharedKVSlotPool.create(
-                    slot_count=transport_config["slot_count"],
-                    capacity_tokens=transport_config["capacity_tokens"],
-                    num_layers=kv_cache.size(1),
-                    num_kv_heads=kv_cache.size(4),
-                    head_dim=kv_cache.size(5),
-                    dtype=kv_cache.dtype,
-                )
-            runtime = PrefillWorkerRuntime(engine, slot_pool=slot_pool)
+            slot_pools = _create_prefill_slot_pools(engine, transport_config)
+            slot_handles = {
+                worker_id: pool.handle for worker_id, pool in slot_pools.items()
+            }
             ready_result = {
                 "ready": True,
                 "role": role,
-                "kv_slot_handle": slot_pool.handle if slot_pool is not None else None,
-                "environment": collect_process_numa_observability(
-                    shared_memory_address=(
-                        slot_pool.handle.backing.data_ptr()
-                        if slot_pool is not None
-                        else None
-                    ),
+                "kv_slot_handle": (
+                    next(iter(slot_handles.values())) if len(slot_handles) == 1 else None
                 ),
+                "kv_slot_handles": slot_handles,
+                "environment": collect_process_numa_observability(),
+                "slot_environments": {
+                    worker_id: collect_process_numa_observability(
+                        shared_memory_address=pool.handle.backing.data_ptr()
+                    )
+                    for worker_id, pool in slot_pools.items()
+                },
             }
+            runtime = PrefillWorkerRuntime(engine, slot_pools=slot_pools)
         else:
-            runtime = DecodeWorkerRuntime(engine)
+            runtime = DecodeWorkerRuntime(engine, worker_id=role)
             ready_result = {
                 "ready": True,
                 "role": role,
@@ -133,7 +162,7 @@ def worker_main(
                     worker_received_at=worker_received_at,
                 )
                 break
-            if role == "decode" and command_type == "attach_shared_slots":
+            if role.startswith("decode") and command_type == "attach_shared_slots":
                 runtime.attach_shared_slots(command["handle"])
                 _reply(
                     response_queue,
@@ -160,14 +189,14 @@ def worker_main(
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "admit_batch":
+            if role.startswith("decode") and command_type == "admit_batch":
                 _reply(
                     response_queue,
                     result=runtime.admit_batch(command["handoffs"]),
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "step":
+            if role.startswith("decode") and command_type == "step":
                 outputs, num_tokens, completed_transfers = runtime.step()
                 _reply(
                     response_queue,
@@ -181,7 +210,7 @@ def worker_main(
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "step_with_handoffs":
+            if role.startswith("decode") and command_type == "step_with_handoffs":
                 (
                     admissions,
                     outputs,
@@ -202,7 +231,7 @@ def worker_main(
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "collect_completed_transfers":
+            if role.startswith("decode") and command_type == "collect_completed_transfers":
                 _reply(
                     response_queue,
                     result=runtime.collect_completed_transfers(
@@ -211,21 +240,21 @@ def worker_main(
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "abort_request":
+            if role.startswith("decode") and command_type == "abort_request":
                 _reply(
                     response_queue,
                     result=runtime.abort_request(command["seq_id"]),
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "metrics":
+            if role.startswith("decode") and command_type == "metrics":
                 _reply(
                     response_queue,
                     result=engine.get_metrics(),
                     worker_received_at=worker_received_at,
                 )
                 continue
-            if role == "decode" and command_type == "reset_metrics":
+            if role.startswith("decode") and command_type == "reset_metrics":
                 engine.reset_metrics()
                 _reply(
                     response_queue,

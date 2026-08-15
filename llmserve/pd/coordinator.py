@@ -114,6 +114,12 @@ class PDConfig:
             "capacity_tokens": self.kv_slot_capacity_tokens,
         }
 
+    def prefill_transport_config(self) -> dict[str, Any]:
+        return {
+            **self.transport_config(),
+            "target_workers": self.decode_worker_ids,
+        }
+
     def engine_kwargs_for(self, role: str) -> dict[str, Any]:
         if role != "prefill" and role not in self.decode_worker_ids:
             raise ValueError(f"unsupported PD worker role: {role}")
@@ -148,6 +154,7 @@ class PDCoordinator:
         self._workers: dict[str, Any] = {}
         self._started = False
         self._transport_handle = None
+        self._transport_handles: dict[str, Any] = {}
         self._last_rpc_timing: dict[str, dict[str, float | None]] = {}
         self._failed_roles: set[str] = set()
 
@@ -156,10 +163,7 @@ class PDCoordinator:
             return
         self._failed_roles.clear()
         try:
-            for role, gpu_id in (
-                ("prefill", self.config.prefill_gpu),
-                ("decode", self.config.decode_gpu),
-            ):
+            for role, gpu_id, _ in self.config.worker_specs():
                 command_queue = self.context.Queue()
                 response_queue = self.context.Queue()
                 process = self.context.Process(
@@ -171,7 +175,11 @@ class PDCoordinator:
                         self.config.engine_kwargs_for(role),
                         command_queue,
                         response_queue,
-                        self.config.transport_config(),
+                        (
+                            self.config.prefill_transport_config()
+                            if role == "prefill"
+                            else self.config.transport_config()
+                        ),
                     ),
                     name=f"llmserve-{role}-worker",
                 )
@@ -182,21 +190,26 @@ class PDCoordinator:
                     "responses": response_queue,
                     "ready": False,
                 }
-            for role in ("prefill", "decode"):
+            for role, _, _ in self.config.worker_specs():
                 self._wait_worker_ready(role)
             self._started = True
             prefill_ready = self._workers["prefill"].get("ready_result") or {}
-            self._transport_handle = prefill_ready.get("kv_slot_handle")
-            if self.config.kv_slot_count and self._transport_handle is None:
+            self._transport_handles = dict(
+                prefill_ready.get("kv_slot_handles") or {}
+            )
+            if not self._transport_handles:
+                handle = prefill_ready.get("kv_slot_handle")
+                if handle is not None:
+                    self._transport_handles = {
+                        self.config.decode_worker_ids[0]: handle,
+                    }
+            self._transport_handle = self._transport_handles.get(
+                self.config.decode_worker_ids[0]
+            )
+            if self.config.kv_slot_count and not self._transport_handles:
                 raise PDWorkerError("Prefill Worker did not publish shared KV slots")
-            if self._transport_handle is not None:
-                self._call(
-                    "decode",
-                    {
-                        "type": "attach_shared_slots",
-                        "handle": self._transport_handle,
-                    },
-                )
+            if self._transport_handles:
+                self._attach_decode_slot_pools(self._transport_handles)
         except Exception:
             self._abort_startup()
             raise
@@ -238,6 +251,7 @@ class PDCoordinator:
         self._workers.clear()
         self._started = False
         self._failed_roles.clear()
+        self._transport_handles = {}
 
     def _mark_worker_failed(self, role: str):
         failed_roles = getattr(self, "_failed_roles", None)
@@ -245,7 +259,7 @@ class PDCoordinator:
             self._failed_roles = set()
         self._failed_roles.add(role)
 
-    def _call(self, role: str, command: dict):
+    def _send(self, role: str, command: dict) -> dict[str, Any]:
         if not self._started:
             self.start()
         worker = self._workers[role]
@@ -264,6 +278,13 @@ class PDCoordinator:
             self._mark_worker_failed(role)
             raise PDWorkerError(f"{role} worker command channel failed") from error
         parent_put_at = perf_counter()
+        return {
+            "parent_sent_at": parent_sent_at,
+            "parent_put_at": parent_put_at,
+        }
+
+    def _receive(self, role: str, sent: dict[str, float]):
+        worker = self._workers[role]
         try:
             response = worker["responses"].get(
                 timeout=self.config.request_timeout_seconds
@@ -275,6 +296,8 @@ class PDCoordinator:
             self._mark_worker_failed(role)
             raise PDWorkerError(f"{role} worker response channel failed") from error
         parent_received_at = perf_counter()
+        parent_sent_at = sent["parent_sent_at"]
+        parent_put_at = sent["parent_put_at"]
         remote_timing = response.get("timing") or {}
         worker_received_at = remote_timing.get("worker_received_at")
         worker_reply_enqueued_at = remote_timing.get("worker_reply_enqueued_at")
@@ -312,13 +335,52 @@ class PDCoordinator:
             raise PDWorkerError(f"{role} worker failed: {detail}")
         return response.get("result")
 
+    def _call(self, role: str, command: dict):
+        return self._receive(role, self._send(role, command))
+
+    def _call_many(self, commands: dict[str, dict]) -> dict[str, Any]:
+        """Send every Worker command before awaiting any response."""
+        sent = {
+            role: self._send(role, command)
+            for role, command in commands.items()
+        }
+        return {
+            role: self._receive(role, sent[role])
+            for role in commands
+        }
+
     def last_rpc_timing(self, role: str) -> dict[str, float | None]:
         return dict(getattr(self, "_last_rpc_timing", {}).get(role, {}))
+
+    def _decode_role(self, decode_worker_id: str | None = None) -> str:
+        role = decode_worker_id or self.config.decode_worker_ids[0]
+        if role not in self.config.decode_worker_ids:
+            raise ValueError(f"unknown Decode Worker: {role}")
+        return role
+
+    @property
+    def decode_worker_ids(self) -> tuple[str, ...]:
+        return self.config.decode_worker_ids
+
+    def _attach_decode_slot_pools(self, handles: dict[str, Any]):
+        expected = set(self.config.decode_worker_ids)
+        if set(handles) != expected:
+            raise PDWorkerError(
+                "Prefill Worker shared KV slot handles do not match Decode Workers"
+            )
+        for role in self.config.decode_worker_ids:
+            self._call(
+                role,
+                {"type": "attach_shared_slots", "handle": handles[role]},
+            )
 
     def worker_health(self) -> dict[str, dict[str, Any]]:
         """Return process-level health without sending a worker command."""
         health = {}
-        for role in ("prefill", "decode"):
+        decode_roles = tuple(
+            role for role in self._workers if role.startswith("decode")
+        )
+        for role in ("prefill", *decode_roles):
             worker = self._workers.get(role)
             process = worker.get("process") if worker else None
             item = {
@@ -342,8 +404,11 @@ class PDCoordinator:
             },
         )
 
-    def admit_batch(self, handoffs):
-        return self._call("decode", {"type": "admit_batch", "handoffs": handoffs})
+    def admit_batch(self, handoffs, *, decode_worker_id: str | None = None):
+        return self._call(
+            self._decode_role(decode_worker_id),
+            {"type": "admit_batch", "handoffs": handoffs},
+        )
 
     def release_prefill_transfers(self, transfer_ids):
         return self._call(
@@ -354,40 +419,103 @@ class PDCoordinator:
             },
         )
 
-    def decode_step(self):
-        return self._call("decode", {"type": "step"})
+    def decode_step(self, *, decode_worker_id: str | None = None):
+        return self._call(self._decode_role(decode_worker_id), {"type": "step"})
 
-    def decode_step_with_handoffs(self, handoffs):
+    def decode_step_all(
+        self,
+        decode_worker_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        worker_ids = decode_worker_ids or self.config.decode_worker_ids
+        for role in worker_ids:
+            self._decode_role(role)
+        return self._call_many({
+            role: {"type": "step"}
+            for role in worker_ids
+        })
+
+    def decode_step_with_handoffs(self, handoffs, *, decode_worker_id: str | None = None):
         return self._call(
-            "decode",
+            self._decode_role(decode_worker_id),
             {"type": "step_with_handoffs", "handoffs": list(handoffs)},
         )
 
-    def collect_completed_transfers(self, *, wait: bool = False):
+    def decode_step_with_handoffs_all(
+        self,
+        handoffs_by_worker: dict[str, list],
+        *,
+        active_worker_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        worker_ids = tuple(dict.fromkeys(
+            (*active_worker_ids, *handoffs_by_worker.keys())
+        ))
+        for role in worker_ids:
+            self._decode_role(role)
+        return self._call_many({
+            role: (
+                {
+                    "type": "step_with_handoffs",
+                    "handoffs": list(handoffs_by_worker[role]),
+                }
+                if handoffs_by_worker.get(role)
+                else {"type": "step"}
+            )
+            for role in worker_ids
+        })
+
+    def collect_completed_transfers(
+        self,
+        *,
+        wait: bool = False,
+        decode_worker_id: str | None = None,
+    ):
         return self._call(
-            "decode",
+            self._decode_role(decode_worker_id),
             {"type": "collect_completed_transfers", "wait": bool(wait)},
         )
 
-    def abort_decode_request(self, seq_id: int) -> bool:
+    def abort_decode_request(
+        self,
+        seq_id: int,
+        *,
+        decode_worker_id: str | None = None,
+    ) -> bool:
         return bool(
             self._call(
-                "decode",
+                self._decode_role(decode_worker_id),
                 {"type": "abort_request", "seq_id": seq_id},
             )
         )
 
-    def decode_metrics(self):
-        return self._call("decode", {"type": "metrics"})
+    def decode_metrics(self, *, decode_worker_id: str | None = None):
+        return self._call(
+            self._decode_role(decode_worker_id),
+            {"type": "metrics"},
+        )
 
-    def reset_decode_metrics(self):
-        return self._call("decode", {"type": "reset_metrics"})
+    def reset_decode_metrics(self, *, decode_worker_id: str | None = None):
+        return self._call(
+            self._decode_role(decode_worker_id),
+            {"type": "reset_metrics"},
+        )
+
+    def decode_metrics_all(self) -> dict[str, Any]:
+        return self._call_many({
+            role: {"type": "metrics"}
+            for role in self.config.decode_worker_ids
+        })
+
+    def reset_decode_metrics_all(self):
+        return self._call_many({
+            role: {"type": "reset_metrics"}
+            for role in self.config.decode_worker_ids
+        })
 
     def close(self):
         if not self._started:
             return
         failed_roles = getattr(self, "_failed_roles", set())
-        for role in ("decode", "prefill"):
+        for role in (*self.config.decode_worker_ids, "prefill"):
             worker = self._workers.get(role)
             if worker is None:
                 continue
@@ -412,6 +540,7 @@ class PDCoordinator:
         self._workers.clear()
         self._started = False
         self._transport_handle = None
+        self._transport_handles = {}
         self._failed_roles.clear()
 
     def __enter__(self):

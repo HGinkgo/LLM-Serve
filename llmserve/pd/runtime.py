@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from time import perf_counter
 from uuid import uuid4
+from typing import Mapping
 
 import torch
 
@@ -102,9 +103,30 @@ def _to_host_payload(
 class PrefillWorkerRuntime:
     """Run prompt prefill and detach its prompt KV from the local engine."""
 
-    def __init__(self, engine, slot_pool: SharedKVSlotPool | None = None):
+    def __init__(
+        self,
+        engine,
+        slot_pool: SharedKVSlotPool | None = None,
+        slot_pools: Mapping[str, SharedKVSlotPool] | None = None,
+    ):
+        if slot_pool is not None and slot_pools is not None:
+            raise ValueError("provide either slot_pool or slot_pools, not both")
         self.engine = engine
-        self.slot_pool = slot_pool
+        self.slot_pools = dict(slot_pools or {})
+        if slot_pool is not None:
+            self.slot_pools = {"decode": slot_pool}
+        # Keep the legacy attribute for the single-Decode runtime path.
+        self.slot_pool = self.slot_pools.get("decode")
+
+    def _slot_pool_for(self, target_worker: str) -> SharedKVSlotPool | None:
+        if not self.slot_pools:
+            return None
+        try:
+            return self.slot_pools[target_worker]
+        except KeyError as error:
+            raise ValueError(
+                f"Prefill Worker has no shared KV slot pool for {target_worker}"
+            ) from error
 
     def prefill(self, envelope: RequestEnvelope) -> PrefillHandoff:
         return self.prefill_batch([envelope])[0]
@@ -114,6 +136,7 @@ class PrefillWorkerRuntime:
         envelope: RequestEnvelope,
         seq,
         first_token_id: int,
+        slot_pool: SharedKVSlotPool | None = None,
         slot_lease: KVSlotLease | None = None,
         token_offset: int = 0,
         transport_telemetry: dict | None = None,
@@ -126,7 +149,9 @@ class PrefillWorkerRuntime:
         )
         transfer_id = f"{envelope.request_id}-{uuid4().hex}"
         if slot_lease is not None:
-            destination = self.slot_pool.writable_view(
+            if slot_pool is None:
+                raise RuntimeError("shared KV handoff requires a slot pool")
+            destination = slot_pool.writable_view(
                 slot_lease,
                 token_offset=token_offset,
                 num_tokens=logical_tokens,
@@ -147,6 +172,7 @@ class PrefillWorkerRuntime:
             dtype=str(payload.dtype).replace("torch.", ""),
             block_size=self.engine.model_runner.block_size,
             payload_nbytes=payload.numel() * payload.element_size(),
+            target_worker=envelope.target_worker,
             transport=transport,
             slot_id=slot_lease.slot_id if slot_lease is not None else None,
             slot_generation=(
@@ -165,17 +191,52 @@ class PrefillWorkerRuntime:
         return handoff
 
     def release_transfers(self, transfer_ids: list[str]) -> dict[str, int]:
-        if self.slot_pool is None:
+        if not self.slot_pools:
             if transfer_ids:
                 raise ValueError("inline Prefill Worker has no shared transfers")
             return {}
         transfer_ids = list(transfer_ids)
-        if transfer_ids:
-            self.slot_pool.mark_consuming(set(transfer_ids))
-            for transfer_id in transfer_ids:
-                self.slot_pool.ack(transfer_id)
-        stats = self.slot_pool.stats()
-        stats["observability"] = self.slot_pool.observability()
+        transfer_ids_by_worker = {
+            worker_id: set() for worker_id in self.slot_pools
+        }
+        for transfer_id in transfer_ids:
+            for worker_id, pool in self.slot_pools.items():
+                if pool.has_transfer(transfer_id):
+                    transfer_ids_by_worker[worker_id].add(transfer_id)
+                    break
+            else:
+                raise ValueError("unknown shared KV transfer")
+        for worker_id, owned_transfer_ids in transfer_ids_by_worker.items():
+            if not owned_transfer_ids:
+                continue
+            pool = self.slot_pools[worker_id]
+            pool.mark_consuming(owned_transfer_ids)
+            for transfer_id in owned_transfer_ids:
+                pool.ack(transfer_id)
+        if len(self.slot_pools) == 1:
+            pool = next(iter(self.slot_pools.values()))
+            stats = pool.stats()
+            stats["observability"] = pool.observability()
+            return stats
+        per_worker = {
+            worker_id: {
+                **pool.stats(),
+                "observability": pool.observability(),
+            }
+            for worker_id, pool in self.slot_pools.items()
+        }
+        stats = {
+            name: sum(values[name] for values in per_worker.values())
+            for name in (
+                "slot_count",
+                "free_slots",
+                "filling_slots",
+                "ready_slots",
+                "consuming_slots",
+                "pending_transfers",
+            )
+        }
+        stats["slot_pools"] = per_worker
         return stats
 
     def prefill_batch(
@@ -199,16 +260,24 @@ class PrefillWorkerRuntime:
         envelope_by_seq_id = {}
         owned_seq_ids = set()
         handoffs_by_request_id = {}
-        slot_lease = None
-        slot_acquired_at = None
+        slot_leases: dict[str, KVSlotLease] = {}
+        slot_acquired_at: dict[str, float] = {}
         token_offsets = {}
-        if self.slot_pool is not None:
-            total_tokens = sum(len(envelope.prompt_token_ids) for envelope in envelopes)
-            if total_tokens <= self.slot_pool.handle.capacity_tokens:
-                slot_lease = self.slot_pool.acquire(total_tokens)
-                slot_acquired_at = perf_counter()
+        envelopes_by_target: dict[str, list[RequestEnvelope]] = {}
+        for envelope in envelopes:
+            envelopes_by_target.setdefault(envelope.target_worker, []).append(envelope)
+        for target_worker, target_envelopes in envelopes_by_target.items():
+            pool = self._slot_pool_for(target_worker)
+            if pool is None:
+                continue
+            total_tokens = sum(
+                len(envelope.prompt_token_ids) for envelope in target_envelopes
+            )
+            if total_tokens <= pool.handle.capacity_tokens:
+                slot_leases[target_worker] = pool.acquire(total_tokens)
+                slot_acquired_at[target_worker] = perf_counter()
                 token_offset = 0
-                for envelope in envelopes:
+                for envelope in target_envelopes:
                     token_offsets[envelope.request_id] = token_offset
                     token_offset += len(envelope.prompt_token_ids)
         batch_started_at = perf_counter()
@@ -295,7 +364,12 @@ class PrefillWorkerRuntime:
                         envelope_by_seq_id[seq.seq_id],
                         seq,
                         token_id,
-                        slot_lease=slot_lease,
+                        slot_pool=self._slot_pool_for(
+                            envelope_by_seq_id[seq.seq_id].target_worker
+                        ),
+                        slot_lease=slot_leases.get(
+                            envelope_by_seq_id[seq.seq_id].target_worker
+                        ),
                         token_offset=token_offsets.get(
                             envelope_by_seq_id[seq.seq_id].request_id,
                             0,
@@ -349,42 +423,53 @@ class PrefillWorkerRuntime:
             }
             for handoff in handoffs_by_request_id.values():
                 handoff.prefill_timing_ms = dict(batch_timing)
-            if slot_lease is not None:
-                self.slot_pool.mark_ready(
+            for target_worker, slot_lease in slot_leases.items():
+                pool = self.slot_pools[target_worker]
+                target_handoffs = [
+                    handoff
+                    for handoff in handoffs_by_request_id.values()
+                    if handoff.descriptor.target_worker == target_worker
+                ]
+                pool.mark_ready(
                     slot_lease,
-                    {
-                        handoff.descriptor.transfer_id
-                        for handoff in handoffs_by_request_id.values()
-                    },
+                    {handoff.descriptor.transfer_id for handoff in target_handoffs},
                 )
-                slot_stats = self.slot_pool.stats()
-                slot_observability = self.slot_pool.observability()
+                slot_stats = pool.stats()
+                slot_observability = pool.observability()
                 slot_ready_at = perf_counter()
-                for handoff in handoffs_by_request_id.values():
+                for handoff in target_handoffs:
                     handoff.telemetry.update({
                         "slot_stats_after_ready": slot_stats,
                         "slot_observability": slot_observability,
                         "slot_wait_count": slot_observability[
                             "acquire_exhaustions"
                         ],
-                        "t_slot_acquired": slot_acquired_at,
+                        "t_slot_acquired": slot_acquired_at[target_worker],
                         "t_slot_ready": slot_ready_at,
                     })
             return [handoffs_by_request_id[request_id] for request_id in request_ids]
         except Exception:
             for seq_id in list(owned_seq_ids):
                 self.engine.scheduler.remove_sequence(seq_by_id[seq_id])
-            if slot_lease is not None:
-                self.slot_pool.cancel(slot_lease)
+            for target_worker, slot_lease in slot_leases.items():
+                self.slot_pools[target_worker].cancel(slot_lease)
             raise
 
 
 class DecodeWorkerRuntime:
     """Admit a Prefill handoff into the Decode Worker engine."""
 
-    def __init__(self, engine, slot_reader: SharedKVSlotReader | None = None):
+    def __init__(
+        self,
+        engine,
+        slot_reader: SharedKVSlotReader | None = None,
+        worker_id: str = "decode",
+    ):
+        if not isinstance(worker_id, str) or not worker_id:
+            raise ValueError("Decode Worker id must be a non-empty string")
         self.engine = engine
         self.slot_reader = slot_reader
+        self.worker_id = worker_id
         self._pending_shared_transfers: dict[str, dict] = {}
         self.last_step_diagnostics: dict[str, object] = {}
         self.last_admission_timing: dict[str, float] = {}
@@ -527,6 +612,11 @@ class DecodeWorkerRuntime:
         descriptor_received_at = perf_counter() if telemetry_enabled else None
         if handoff.descriptor.request_id != handoff.envelope.request_id:
             raise ValueError("KV handoff request id does not match its envelope")
+        if handoff.descriptor.target_worker != self.worker_id:
+            raise ValueError(
+                f"KV handoff is targeted at {handoff.descriptor.target_worker}, "
+                f"not {self.worker_id}"
+            )
         if handoff.descriptor.block_size != self.engine.model_runner.block_size:
             raise ValueError("Prefill and Decode Worker block sizes do not match")
         sampling_params = SamplingParams(

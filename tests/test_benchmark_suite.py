@@ -72,6 +72,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "formal-poisson.json",
                 "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
+                "pd-decode-pool-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",
                 "pd-transport-observability.json",
@@ -141,6 +142,17 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     self.assertTrue(point["runtime"]["pd"])
                     self.assertEqual(point["max_concurrency"], 64)
                     self.assertEqual(point["runtime"]["prefill_batch_size"], 4)
+            if path.name == "pd-decode-pool-smoke.json":
+                self.assertEqual(suite["runs"], 1)
+                self.assertEqual(len(points), 1)
+                point = points[0]
+                self.assertTrue(point["runtime"]["pd"])
+                self.assertEqual(point["runtime"]["decode_gpus"], [1, 2])
+                self.assertEqual(
+                    point["runtime"]["decode_init_methods"],
+                    ["tcp://127.0.0.1:24532", "tcp://127.0.0.1:24533"],
+                )
+                self.assertTrue(point["runtime"]["enable_pd_transport_overlap"])
             if path.name.startswith("formal-"):
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 36)

@@ -416,6 +416,56 @@ class TestPDRuntime(unittest.TestCase):
         )
         self.assertEqual(pool.stats()["free_slots"], 2)
 
+    def test_targeted_shared_slot_pools_are_isolated_per_decode_worker(self):
+        prefill_engine = FakeBatchPrefillEngine()
+        prefill_engine.model_runner.kv_cache[:, :, 0] = 7.0
+        prefill_engine.model_runner.kv_cache[:, :, 1] = 8.0
+        pools = {
+            worker_id: SharedKVSlotPool.create(
+                slot_count=2,
+                capacity_tokens=8,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=2,
+                dtype=torch.float32,
+                register_cuda=False,
+            )
+            for worker_id in ("decode-0", "decode-1")
+        }
+        envelopes = [
+            RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True, "decode-0"),
+            RequestEnvelope(8, (5, 6), 4, 1.0, True, "decode-1"),
+        ]
+
+        handoffs = PrefillWorkerRuntime(
+            prefill_engine,
+            slot_pools=pools,
+        ).prefill_batch(envelopes)
+
+        self.assertEqual(
+            [handoff.descriptor.target_worker for handoff in handoffs],
+            ["decode-0", "decode-1"],
+        )
+        self.assertTrue(all(handoff.kv_payload is None for handoff in handoffs))
+        self.assertEqual(pools["decode-0"].stats()["ready_slots"], 1)
+        self.assertEqual(pools["decode-1"].stats()["ready_slots"], 1)
+
+        reader = SharedKVSlotReader(pools["decode-1"].handle, register_cuda=False)
+        wrong_worker = DecodeWorkerRuntime(
+            FakeDecodeEngine(),
+            slot_reader=reader,
+            worker_id="decode-1",
+        )
+        with self.assertRaisesRegex(ValueError, "targeted at decode-0"):
+            wrong_worker.admit(handoffs[0])
+
+        runtime = PrefillWorkerRuntime(prefill_engine, slot_pools=pools)
+        runtime.release_transfers(
+            [handoff.descriptor.transfer_id for handoff in handoffs]
+        )
+        self.assertEqual(pools["decode-0"].stats()["free_slots"], 2)
+        self.assertEqual(pools["decode-1"].stats()["free_slots"], 2)
+
     def test_shared_slot_ack_defers_default_stream_wait_until_import_completion(self):
         payload = torch.zeros(2, 1, 4, 1, 2)
         pool = SharedKVSlotPool.create(

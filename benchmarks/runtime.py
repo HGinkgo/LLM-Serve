@@ -8,6 +8,7 @@ from benchmarks.workloads import RequestSpec
 _SCHEDULER_TELEMETRY_FIELDS = (
     "step_start", "step_end", "waiting_queue_size", "running_queue_size",
     "pd_pending_prefill_requests", "pd_active_decode_requests",
+    "pd_active_decode_by_worker", "pd_pending_kv_imports_by_worker",
     "prefill_token_count", "decode_token_count", "prefill_request_count",
     "decode_request_count", "remaining_token_budget",
     "max_num_batched_tokens", "max_num_seqs", "chunked_prefill",

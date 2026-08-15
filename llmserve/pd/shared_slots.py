@@ -372,6 +372,10 @@ class SharedKVSlotPool(SharedKVSlotReader):
                 writer="prefill_worker.ack",
             )
 
+    def has_transfer(self, transfer_id: str) -> bool:
+        """Return whether this pool still owns a transfer acknowledgement."""
+        return transfer_id in self._pending_transfers
+
     def ack(self, transfer_id: str):
         lease = self._pending_transfers.get(transfer_id)
         if lease is None:

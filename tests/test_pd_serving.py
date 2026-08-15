@@ -142,6 +142,95 @@ class FakePDCoordinator:
         self.close_calls += 1
 
 
+class MultiDecodeCoordinator(FakePDCoordinator):
+
+    decode_worker_ids = ("decode-0", "decode-1")
+
+    def __init__(self):
+        super().__init__()
+        self.prefill_targets = []
+        self.admitted_by_worker = {worker_id: [] for worker_id in self.decode_worker_ids}
+        self.reset_all_calls = 0
+
+    def prefill_batch(self, envelopes, release_transfer_ids=()):
+        self.prefill_calls.append(list(envelopes))
+        self.prefill_release_calls.append(list(release_transfer_ids))
+        self.prefill_targets.extend(envelope.target_worker for envelope in envelopes)
+        return [
+            SimpleNamespace(
+                request_id=envelope.request_id,
+                envelope=envelope,
+                descriptor=SimpleNamespace(
+                    transport="inline",
+                    target_worker=envelope.target_worker,
+                ),
+                prefill_timing_ms={
+                    "worker_total_ms": 12.0,
+                    "model_forward_ms": 8.0,
+                    "kv_export_copy_ms": 2.0,
+                    "forward_calls": 1,
+                },
+            )
+            for envelope in envelopes
+        ]
+
+    def admit_batch(self, handoffs, *, decode_worker_id=None):
+        self.admit_calls.append(list(handoffs))
+        self.admitted_by_worker[decode_worker_id].extend(
+            handoff.request_id for handoff in handoffs
+        )
+        return [
+            {"seq_id": 0, "finished": False, "output_token_ids": None}
+            for _ in handoffs
+        ]
+
+    def decode_step_all(self, decode_worker_ids=None):
+        worker_ids = decode_worker_ids or self.decode_worker_ids
+        results = {}
+        for index, worker_id in enumerate(worker_ids):
+            results[worker_id] = {
+                "outputs": [(0, [200 + index])],
+                "num_tokens": 1,
+                "last_step_events": {
+                    "scheduled_seq_ids": [0],
+                    "waiting_queue_size": 0,
+                    "running_queue_size": 1,
+                },
+                "completed_transfers": [],
+                "step_diagnostics": {},
+            }
+        return results
+
+    def collect_completed_transfers(self, *, wait=False, decode_worker_id=None):
+        return []
+
+    def decode_metrics_all(self):
+        return {
+            worker_id: {
+                "requests": [
+                    {
+                        "seq_id": 0,
+                        "prompt_tokens": 2,
+                        "output_tokens": 1,
+                        "success": True,
+                        "failure_reason": None,
+                        "arrival_time": 1.0,
+                        "first_token_time": 2.0,
+                        "token_times": [2.0],
+                        "output_event_times": [2.0],
+                        "finish_time": 2.0,
+                    }
+                ],
+                "summary": {"kv_cache": {"total_blocks": 12}},
+            }
+            for worker_id in self.decode_worker_ids
+        }
+
+    def reset_decode_metrics_all(self):
+        self.reset_all_calls += 1
+        return {worker_id: {"reset": True} for worker_id in self.decode_worker_ids}
+
+
 class CombinedStepCoordinator(FakePDCoordinator):
 
     def __init__(self):
@@ -197,6 +286,151 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual(len(coordinator.admit_calls), 1)
         self.assertEqual(coordinator.decode_calls, 1)
         self.assertTrue(engine.is_finished())
+
+    def test_decode_pool_routes_requests_and_scopes_duplicate_sequence_ids(self):
+        coordinator = MultiDecodeCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+        first = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        second = engine.add_request([3, 4], SamplingParams(max_tokens=2))
+
+        outputs, num_tokens = engine.step()
+
+        self.assertEqual(outputs, [(first, [200]), (second, [201])])
+        self.assertEqual(num_tokens, 2)
+        self.assertEqual(coordinator.prefill_targets, ["decode-0", "decode-1"])
+        self.assertEqual(coordinator.admitted_by_worker["decode-0"], [first])
+        self.assertEqual(coordinator.admitted_by_worker["decode-1"], [second])
+        self.assertEqual(engine._requests[first]["decode_worker_id"], "decode-0")
+        self.assertEqual(engine._requests[second]["decode_worker_id"], "decode-1")
+
+    def test_decode_pool_cancellation_targets_the_owning_worker(self):
+        class ActivePoolCoordinator(MultiDecodeCoordinator):
+            def __init__(self):
+                super().__init__()
+                self.abort_calls = []
+
+            def decode_step_all(self, decode_worker_ids=None):
+                return {
+                    worker_id: {
+                        "outputs": [],
+                        "num_tokens": 1,
+                        "last_step_events": {"scheduled_seq_ids": [0]},
+                        "completed_transfers": [],
+                        "step_diagnostics": {},
+                    }
+                    for worker_id in (decode_worker_ids or self.decode_worker_ids)
+                }
+
+            def abort_decode_request(self, seq_id, *, decode_worker_id=None):
+                self.abort_calls.append((decode_worker_id, seq_id))
+                return True
+
+        coordinator = ActivePoolCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+        first = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        second = engine.add_request([3, 4], SamplingParams(max_tokens=2))
+        engine.step()
+
+        self.assertTrue(engine.abort_request(first))
+        self.assertEqual(coordinator.abort_calls, [("decode-0", 0)])
+        self.assertIn(("decode-1", 0), engine._active_by_decode_seq)
+        self.assertNotIn(("decode-0", 0), engine._active_by_decode_seq)
+        self.assertFalse(engine._requests[second]["lifecycle"].is_terminal)
+
+    def test_decode_pool_merges_metrics_with_worker_scoped_sequence_ids(self):
+        coordinator = MultiDecodeCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+        first = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        second = engine.add_request([3, 4], SamplingParams(max_tokens=2))
+        engine.step()
+
+        metrics = engine.get_metrics()
+
+        self.assertEqual([request["seq_id"] for request in metrics["requests"]], [
+            first,
+            second,
+        ])
+        self.assertEqual(
+            set(metrics["summary"]["decode_workers"]),
+            {"decode-0", "decode-1"},
+        )
+
+    def test_decode_pool_reset_metrics_resets_every_worker(self):
+        coordinator = MultiDecodeCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+
+        engine.reset_metrics()
+
+        self.assertEqual(coordinator.reset_all_calls, 1)
+
+    def test_decode_pool_cancellation_removes_targeted_pending_handoff(self):
+        coordinator = MultiDecodeCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+        first = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        second = engine.add_request([3, 4], SamplingParams(max_tokens=2))
+        for request_id in (first, second):
+            request = engine._requests[request_id]
+            request["lifecycle"].transition(RequestState.PREFILLING)
+            request["lifecycle"].transition(RequestState.HANDOFF)
+
+        def handoff_for(request_id, worker_id):
+            return SimpleNamespace(
+                request_id=request_id,
+                descriptor=SimpleNamespace(
+                    transport="shared_slot",
+                    transfer_id=f"transfer-{request_id}",
+                    target_worker=worker_id,
+                ),
+            )
+
+        first_handoff = handoff_for(first, "decode-0")
+        second_handoff = handoff_for(second, "decode-1")
+        engine._pending_handoff_batch = {
+            "handoffs": [first_handoff, second_handoff],
+            "handoffs_by_worker": {
+                "decode-0": [first_handoff],
+                "decode-1": [second_handoff],
+            },
+            "meta": {"request_ids": [first, second], "batch_size": 2},
+            "finished_at": 0.0,
+            "prefill_rpc_timing": {},
+        }
+
+        self.assertTrue(engine.abort_request(first))
+
+        self.assertEqual(engine._pending_transfer_acks, ["transfer-0"])
+        self.assertEqual(
+            engine._pending_handoff_batch["handoffs"], [second_handoff]
+        )
+        self.assertEqual(
+            engine._pending_handoff_batch["handoffs_by_worker"],
+            {"decode-1": [second_handoff]},
+        )
+
+    def test_decode_pool_queue_samples_are_scoped_per_worker(self):
+        coordinator = MultiDecodeCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=2)
+        first = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        second = engine.add_request([3, 4], SamplingParams(max_tokens=2))
+        engine._requests[first]["decode_worker_id"] = "decode-0"
+        engine._requests[second]["decode_worker_id"] = "decode-1"
+        engine._active_by_decode_seq = {
+            ("decode-0", 0): first,
+            ("decode-1", 0): second,
+        }
+        engine._awaiting_transfer_completions = {"transfer-0": first}
+
+        engine._record_queue_sample()
+
+        sample = engine._queue_samples[-1]
+        self.assertEqual(
+            sample["active_decode_by_worker"],
+            {"decode-0": 1, "decode-1": 1},
+        )
+        self.assertEqual(
+            sample["pending_kv_imports_by_worker"],
+            {"decode-0": 1, "decode-1": 0},
+        )
 
     def test_next_prefill_overlaps_decode_step(self):
         coordinator = FakePDCoordinator()

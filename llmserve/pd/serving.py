@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
+from dataclasses import replace
 from time import perf_counter
 
 from llmserve.pd.observability import DecodeIdleReason
@@ -33,6 +34,10 @@ class PDServingEngine:
         self.prefill_batch_size = prefill_batch_size
         self.enable_latency_telemetry = enable_latency_telemetry
         self.enable_transport_overlap = enable_transport_overlap
+        worker_ids = getattr(coordinator, "decode_worker_ids", ("decode",))
+        self._decode_worker_ids = tuple(worker_ids)
+        if not self._decode_worker_ids:
+            raise ValueError("PD Serving requires at least one Decode Worker")
         self._next_request_id = 0
         self._pending: deque[RequestEnvelope] = deque()
         self._requests: dict[int, dict] = {}
@@ -77,6 +82,7 @@ class PDServingEngine:
             "arrival_time": perf_counter(),
             "prompt_tokens": len(token_ids),
             "decode_seq_id": None,
+            "decode_worker_id": None,
             "finish_time": None,
             "lifecycle": RequestLifecycle(request_id),
             "timeline": None,
@@ -114,9 +120,23 @@ class PDServingEngine:
             decode_seq_id = request.get("decode_seq_id")
             if decode_seq_id is None:
                 return False
-            if not self.coordinator.abort_decode_request(decode_seq_id):
+            decode_worker_id = request.get("decode_worker_id")
+            aborted = (
+                self.coordinator.abort_decode_request(
+                    decode_seq_id,
+                    decode_worker_id=decode_worker_id,
+                )
+                if self._uses_decode_pool
+                else self.coordinator.abort_decode_request(decode_seq_id)
+            )
+            if not aborted:
                 return False
-            self._active_by_decode_seq.pop(decode_seq_id, None)
+            active_key = (
+                (decode_worker_id, decode_seq_id)
+                if self._uses_decode_pool
+                else decode_seq_id
+            )
+            self._active_by_decode_seq.pop(active_key, None)
         elif lifecycle.state == RequestState.HANDOFF:
             batch = self._pending_handoff_batch
             if batch is None:
@@ -135,6 +155,19 @@ class PDServingEngine:
                 return False
             if retained_handoffs:
                 batch["handoffs"] = retained_handoffs
+                if "handoffs_by_worker" in batch:
+                    batch["handoffs_by_worker"] = {
+                        worker_id: [
+                            handoff
+                            for handoff in handoffs
+                            if handoff.request_id != request_id
+                        ]
+                        for worker_id, handoffs in batch["handoffs_by_worker"].items()
+                        if any(
+                            handoff.request_id != request_id
+                            for handoff in handoffs
+                        )
+                    }
             else:
                 self._pending_handoff_batch = None
 
@@ -148,6 +181,12 @@ class PDServingEngine:
         batch = []
         while self._pending and len(batch) < self.prefill_batch_size:
             envelope = self._pending.popleft()
+            if self._uses_decode_pool:
+                target_worker = self._select_decode_worker()
+                envelope = replace(envelope, target_worker=target_worker)
+                self._requests[envelope.request_id]["decode_worker_id"] = (
+                    target_worker
+                )
             self._requests[envelope.request_id]["lifecycle"].transition(
                 RequestState.PREFILLING
             )
@@ -167,6 +206,30 @@ class PDServingEngine:
             "released_transfer_ids": list(release_transfer_ids),
             "t_prefill_dispatch_parent": submitted_at,
         }
+
+    @property
+    def _uses_decode_pool(self) -> bool:
+        return len(self._decode_worker_ids) > 1
+
+    def _select_decode_worker(self) -> str:
+        committed = {worker_id: 0 for worker_id in self._decode_worker_ids}
+        for request in self._requests.values():
+            worker_id = request.get("decode_worker_id")
+            lifecycle = request["lifecycle"]
+            if (
+                worker_id in committed
+                and lifecycle.state
+                in {
+                    RequestState.PREFILLING,
+                    RequestState.HANDOFF,
+                    RequestState.DECODING,
+                }
+            ):
+                committed[worker_id] += 1
+        return min(self._decode_worker_ids, key=lambda worker_id: (
+            committed[worker_id],
+            worker_id,
+        ))
 
     def _flush_transfer_acks(self):
         if self._prefill_future is not None or not self._pending_transfer_acks:
@@ -219,7 +282,13 @@ class PDServingEngine:
     def _collect_completed_transfer_acks(self, *, wait: bool = False):
         collector = getattr(self.coordinator, "collect_completed_transfers", None)
         if collector is not None:
-            self._record_completed_transfers(collector(wait=wait))
+            if self._uses_decode_pool:
+                for worker_id in self._decode_worker_ids:
+                    self._record_completed_transfers(
+                        collector(wait=wait, decode_worker_id=worker_id)
+                    )
+            else:
+                self._record_completed_transfers(collector(wait=wait))
 
     def _collect_prefill(self):
         future = self._prefill_future
@@ -253,8 +322,21 @@ class PDServingEngine:
             return True
         if self._pending_handoff_batch is not None:
             raise RuntimeError("PD has an unadmitted handoff batch")
+        handoffs_by_worker: dict[str, list] = {}
+        for handoff in admitted_handoffs:
+            target_worker = getattr(
+                getattr(handoff, "descriptor", None),
+                "target_worker",
+                "decode",
+            )
+            if target_worker not in self._decode_worker_ids:
+                raise RuntimeError(
+                    f"Prefill Worker returned a handoff for {target_worker}"
+                )
+            handoffs_by_worker.setdefault(target_worker, []).append(handoff)
         self._pending_handoff_batch = {
             "handoffs": admitted_handoffs,
+            "handoffs_by_worker": handoffs_by_worker,
             "meta": meta,
             "finished_at": finished_at,
             "prefill_rpc_timing": prefill_rpc_timing,
@@ -271,8 +353,14 @@ class PDServingEngine:
         decode_rpc_timing: dict,
         admission_timing: dict | None = None,
         combined_step_roundtrip_ms: float | None = None,
+        decode_worker_id: str | None = None,
+        clear_pending_batch: bool = True,
     ):
-        handoffs = batch["handoffs"]
+        handoffs = (
+            batch["handoffs_by_worker"][decode_worker_id]
+            if decode_worker_id is not None
+            else batch["handoffs"]
+        )
         meta = batch["meta"]
         finished_at = batch["finished_at"]
         prefill_rpc_timing = batch["prefill_rpc_timing"]
@@ -336,10 +424,17 @@ class PDServingEngine:
                 lifecycle.transition(RequestState.FINISHED)
                 continue
             decode_seq_id = admission.get("seq_id")
-            if decode_seq_id in self._active_by_decode_seq:
+            active_key = (
+                (decode_worker_id, decode_seq_id)
+                if self._uses_decode_pool
+                else decode_seq_id
+            )
+            if active_key in self._active_by_decode_seq:
                 raise RuntimeError("Decode Worker returned duplicate sequence ids")
-            self._active_by_decode_seq[decode_seq_id] = request_id
+            self._active_by_decode_seq[active_key] = request_id
             request["decode_seq_id"] = decode_seq_id
+            if decode_worker_id is not None:
+                request["decode_worker_id"] = decode_worker_id
         prefill_timing = getattr(handoffs[0], "prefill_timing_ms", {})
         worker_total_ms = prefill_timing.get("worker_total_ms")
         admission_timing = admission_timing or {}
@@ -351,8 +446,9 @@ class PDServingEngine:
         )
         self._prefill_batches.append(
             {
-                "request_ids": list(meta.get("request_ids", ())),
-                "batch_size": meta.get("batch_size", 0),
+                "request_ids": [handoff.request_id for handoff in handoffs],
+                "batch_size": len(handoffs),
+                "decode_worker_id": decode_worker_id or self._decode_worker_ids[0],
                 "prefill_roundtrip_ms": (
                     finished_at - meta.get("submitted_at", finished_at)
                 ) * 1000,
@@ -430,11 +526,14 @@ class PDServingEngine:
                 ).get("slot_wait_count") if handoffs else None,
             }
         )
-        self._pending_handoff_batch = None
+        if clear_pending_batch:
+            self._pending_handoff_batch = None
         if self._prefill_future is None and not self._pending:
             self._flush_transfer_acks()
 
     def _admit_pending_handoff_batch(self):
+        if self._uses_decode_pool:
+            return self._admit_pending_handoff_batch_pool()
         batch = self._pending_handoff_batch
         if batch is None:
             return False
@@ -450,7 +549,35 @@ class PDServingEngine:
         )
         return True
 
+    def _admit_pending_handoff_batch_pool(self):
+        batch = self._pending_handoff_batch
+        if batch is None:
+            return False
+        for worker_id, handoffs in batch["handoffs_by_worker"].items():
+            admit_started_at = perf_counter()
+            admissions = list(
+                self.coordinator.admit_batch(
+                    handoffs,
+                    decode_worker_id=worker_id,
+                )
+            )
+            admit_finished_at = perf_counter()
+            self._apply_handoff_admissions(
+                batch,
+                admissions,
+                admit_started_at=admit_started_at,
+                admit_finished_at=admit_finished_at,
+                decode_rpc_timing=self.coordinator.last_rpc_timing(worker_id),
+                decode_worker_id=worker_id,
+                clear_pending_batch=False,
+            )
+        self._pending_handoff_batch = None
+        return True
+
     def _record_queue_sample(self):
+        active_decode_by_worker, pending_kv_imports_by_worker = (
+            self._decode_worker_queue_state()
+        )
         self._queue_samples.append(
             {
                 "elapsed_ms": (perf_counter() - self._run_started_at) * 1000,
@@ -462,8 +589,31 @@ class PDServingEngine:
                 ),
                 "pending_transfer_acks": len(self._pending_transfer_acks),
                 "pending_kv_imports": len(self._awaiting_transfer_completions),
+                "active_decode_by_worker": active_decode_by_worker,
+                "pending_kv_imports_by_worker": pending_kv_imports_by_worker,
             }
         )
+
+    def _decode_worker_queue_state(self) -> tuple[dict[str, int], dict[str, int]]:
+        active_decode_by_worker = {
+            worker_id: 0 for worker_id in self._decode_worker_ids
+        }
+        pending_kv_imports_by_worker = {
+            worker_id: 0 for worker_id in self._decode_worker_ids
+        }
+        if self._uses_decode_pool:
+            for worker_id, _ in self._active_by_decode_seq:
+                active_decode_by_worker[worker_id] += 1
+            for request_id in self._awaiting_transfer_completions.values():
+                worker_id = self._requests[request_id].get("decode_worker_id")
+                if worker_id is not None:
+                    pending_kv_imports_by_worker[worker_id] += 1
+        else:
+            active_decode_by_worker["decode"] = len(self._active_by_decode_seq)
+            pending_kv_imports_by_worker["decode"] = len(
+                self._awaiting_transfer_completions
+            )
+        return active_decode_by_worker, pending_kv_imports_by_worker
 
     def _record_decode_idle_interval(
         self,
@@ -527,6 +677,8 @@ class PDServingEngine:
             raise
 
     def _step_once(self):
+        if self._uses_decode_pool:
+            return self._step_pool_once()
         self._start_prefill()
         if self._prefill_future is not None and self._prefill_future.done():
             self._collect_prefill()
@@ -647,6 +799,134 @@ class PDServingEngine:
         self._start_prefill()
         return outputs, int(result.get("num_tokens", 0))
 
+    def _active_decode_worker_ids(self) -> tuple[str, ...]:
+        active = {
+            worker_id
+            for worker_id, _ in self._active_by_decode_seq
+        }
+        return tuple(
+            worker_id
+            for worker_id in self._decode_worker_ids
+            if worker_id in active
+        )
+
+    def _step_pool_once(self):
+        self._start_prefill()
+        if self._prefill_future is not None and self._prefill_future.done():
+            self._collect_prefill()
+            self._start_prefill()
+
+        self._collect_completed_transfer_acks()
+        if not self._active_by_decode_seq:
+            self._admit_pending_handoff_batch_pool()
+            if not self._active_by_decode_seq and self._prefill_future is not None:
+                wait_started_at = perf_counter()
+                self._prefill_future.result()
+                wait_finished_at = perf_counter()
+                self._record_decode_idle_interval(
+                    DecodeIdleReason.WAITING_PREFILL_OUTPUT,
+                    wait_started_at,
+                    wait_finished_at,
+                )
+                self._collect_prefill()
+                self._start_prefill()
+                self._admit_pending_handoff_batch_pool()
+            if not self._active_by_decode_seq:
+                if self._awaiting_transfer_completions:
+                    self._collect_completed_transfer_acks(wait=True)
+                self._flush_transfer_acks()
+                finished = []
+                for request_id, request in self._requests.items():
+                    token_ids = request.pop("finished_without_step", None)
+                    if token_ids is not None:
+                        finished.append((request_id, token_ids))
+                self._record_queue_sample()
+                return finished, 0
+
+        active_worker_ids = self._active_decode_worker_ids()
+        handoff_batch = self._pending_handoff_batch
+        if (
+            self.enable_transport_overlap
+            and handoff_batch is not None
+            and hasattr(self.coordinator, "decode_step_with_handoffs_all")
+        ):
+            decode_started_at = perf_counter()
+            results = self.coordinator.decode_step_with_handoffs_all(
+                handoff_batch["handoffs_by_worker"],
+                active_worker_ids=active_worker_ids,
+            )
+            decode_finished_at = perf_counter()
+            for worker_id, handoffs in handoff_batch["handoffs_by_worker"].items():
+                result = results[worker_id]
+                self._apply_handoff_admissions(
+                    handoff_batch,
+                    list(result.get("admissions") or ()),
+                    admit_started_at=decode_started_at,
+                    admit_finished_at=decode_finished_at,
+                    decode_rpc_timing=self.coordinator.last_rpc_timing(worker_id),
+                    admission_timing=result.get("admission_timing"),
+                    combined_step_roundtrip_ms=(
+                        decode_finished_at - decode_started_at
+                    ) * 1000,
+                    decode_worker_id=worker_id,
+                    clear_pending_batch=False,
+                )
+            self._pending_handoff_batch = None
+            active_worker_ids = tuple(results)
+        else:
+            self._admit_pending_handoff_batch_pool()
+            active_worker_ids = self._active_decode_worker_ids()
+            results = self.coordinator.decode_step_all(active_worker_ids)
+        outputs = []
+        total_num_tokens = 0
+        pooled_events = {}
+        for worker_id in active_worker_ids:
+            result = results[worker_id]
+            total_num_tokens += int(result.get("num_tokens", 0))
+            self._record_completed_transfers(result.get("completed_transfers") or ())
+            raw_events = result.get("last_step_events") or {}
+            pooled_events[worker_id] = deepcopy(raw_events)
+            for decode_seq_id, token_ids in result.get("outputs", ()):
+                active_key = (worker_id, decode_seq_id)
+                request_id = self._active_by_decode_seq.pop(active_key, None)
+                if request_id is None:
+                    raise RuntimeError("Decode Worker returned an unknown sequence id")
+                request = self._requests[request_id]
+                request["finish_time"] = perf_counter()
+                if self.enable_latency_telemetry:
+                    timeline = request.get("timeline") or {}
+                    request["timeline"] = timeline
+                    timeline["t_finish"] = request["finish_time"]
+                    timeline.setdefault("writers", {})["t_finish"] = (
+                        "pd_parent.decode_result"
+                    )
+                request["lifecycle"].transition(RequestState.FINISHED)
+                outputs.append((request_id, list(token_ids)))
+
+        active_decode_by_worker, pending_kv_imports_by_worker = (
+            self._decode_worker_queue_state()
+        )
+        self.last_step_events = {
+            "decode_worker_events": pooled_events,
+            "scheduled_seq_ids": [
+                request_id
+                for worker_id, events in pooled_events.items()
+                for seq_id in events.get("scheduled_seq_ids", ())
+                if (request_id := self._active_by_decode_seq.get((worker_id, seq_id)))
+                is not None
+            ],
+            "waiting_queue_size": len(self._pending),
+            "running_queue_size": len(self._active_by_decode_seq),
+            "pd_active_decode_requests": len(self._active_by_decode_seq),
+            "pd_pending_prefill_requests": len(self._pending),
+            "pd_pending_kv_imports": len(self._awaiting_transfer_completions),
+            "pd_active_decode_by_worker": active_decode_by_worker,
+            "pd_pending_kv_imports_by_worker": pending_kv_imports_by_worker,
+        }
+        self._record_queue_sample()
+        self._start_prefill()
+        return outputs, total_num_tokens
+
     def is_finished(self):
         if self._fatal_error is not None:
             return all(
@@ -667,7 +947,10 @@ class PDServingEngine:
             raise RuntimeError("cannot reset metrics on a failed PD engine")
         if not self.is_finished():
             raise RuntimeError("cannot reset PD metrics while requests are active")
-        self.coordinator.reset_decode_metrics()
+        if self._uses_decode_pool:
+            self.coordinator.reset_decode_metrics_all()
+        else:
+            self.coordinator.reset_decode_metrics()
         self._requests.clear()
         self._awaiting_transfer_completions.clear()
         self._pending_handoff_batch = None
@@ -678,41 +961,50 @@ class PDServingEngine:
         self._run_started_at = perf_counter()
 
     def get_metrics(self):
-        worker_metrics = (
-            {"requests": [], "summary": {}}
-            if self._fatal_error is not None
-            else self.coordinator.decode_metrics()
-        )
-        worker_requests = worker_metrics.get("requests", [])
+        if self._fatal_error is not None:
+            worker_metrics_by_id = {}
+        elif self._uses_decode_pool:
+            worker_metrics_by_id = self.coordinator.decode_metrics_all()
+        else:
+            worker_metrics_by_id = {"decode": self.coordinator.decode_metrics()}
         seq_to_request_id = {
-            request["decode_seq_id"]: request_id
+            (
+                (request["decode_worker_id"], request["decode_seq_id"])
+                if self._uses_decode_pool
+                else request["decode_seq_id"]
+            ): request_id
             for request_id, request in self._requests.items()
             if request.get("decode_seq_id") is not None
         }
         requests = []
         included_request_ids = set()
-        for worker_request in worker_requests:
-            request = dict(worker_request)
-            request_id = seq_to_request_id.get(request.get("seq_id"))
-            if request_id is None:
-                continue
-            request["seq_id"] = request_id
-            local_request = self._requests[request_id]
-            request["arrival_time"] = local_request["arrival_time"]
-            if self.enable_latency_telemetry:
-                timeline = deepcopy(local_request.get("timeline"))
-                if timeline is not None:
-                    timeline["t_finish"] = request.get("finish_time")
-                    timeline.setdefault("writers", {})["t_finish"] = (
-                        "decode_worker.engine"
-                    )
-                request["timeline"] = timeline
-            request["status"] = local_request["lifecycle"].state.value
-            request["cancelled"] = (
-                local_request["lifecycle"].state == RequestState.CANCELLED
-            )
-            requests.append(request)
-            included_request_ids.add(request_id)
+        for worker_id, worker_metrics in worker_metrics_by_id.items():
+            for worker_request in worker_metrics.get("requests", []):
+                request = dict(worker_request)
+                request_id = seq_to_request_id.get(
+                    (worker_id, request.get("seq_id"))
+                    if self._uses_decode_pool
+                    else request.get("seq_id")
+                )
+                if request_id is None:
+                    continue
+                request["seq_id"] = request_id
+                local_request = self._requests[request_id]
+                request["arrival_time"] = local_request["arrival_time"]
+                if self.enable_latency_telemetry:
+                    timeline = deepcopy(local_request.get("timeline"))
+                    if timeline is not None:
+                        timeline["t_finish"] = request.get("finish_time")
+                        timeline.setdefault("writers", {})["t_finish"] = (
+                            "decode_worker.engine"
+                        )
+                    request["timeline"] = timeline
+                request["status"] = local_request["lifecycle"].state.value
+                request["cancelled"] = (
+                    local_request["lifecycle"].state == RequestState.CANCELLED
+                )
+                requests.append(request)
+                included_request_ids.add(request_id)
         for request_id, request in self._requests.items():
             if request_id not in included_request_ids:
                 lifecycle = request["lifecycle"]
@@ -737,7 +1029,16 @@ class PDServingEngine:
                         "timeline": deepcopy(request.get("timeline")),
                     }
                 )
-        summary = deepcopy(worker_metrics.get("summary", {}))
+        summary = (
+            {"decode_workers": {
+                worker_id: deepcopy(worker_metrics.get("summary", {}))
+                for worker_id, worker_metrics in worker_metrics_by_id.items()
+            }}
+            if self._uses_decode_pool
+            else deepcopy(
+                worker_metrics_by_id.get("decode", {}).get("summary", {})
+            )
+        )
         summary["num_requests"] = len(requests)
         summary["num_finished"] = sum(
             1 for request in requests if request.get("success")

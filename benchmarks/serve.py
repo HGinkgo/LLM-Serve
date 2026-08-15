@@ -80,6 +80,8 @@ def _default_pd_engine_factory(model, **kwargs):
         decode_init_method = _next_worker_endpoint(prefill_init_method)
     prefill_gpu = kwargs.pop("prefill_gpu", 0)
     decode_gpu = kwargs.pop("decode_gpu", 1)
+    decode_gpus = tuple(kwargs.pop("decode_gpus", ()))
+    decode_init_methods = tuple(kwargs.pop("decode_init_methods", ()))
     prefill_batch_size = kwargs.pop("prefill_batch_size", 1)
     prefill_enforce_eager = kwargs.pop("prefill_enforce_eager", True)
     decode_enforce_eager = kwargs.pop("decode_enforce_eager", True)
@@ -91,10 +93,12 @@ def _default_pd_engine_factory(model, **kwargs):
             model=model,
             prefill_gpu=prefill_gpu,
             decode_gpu=decode_gpu,
+            decode_gpus=decode_gpus,
             prefill_enforce_eager=prefill_enforce_eager,
             decode_enforce_eager=decode_enforce_eager,
             prefill_init_method=prefill_init_method,
             decode_init_method=decode_init_method,
+            decode_init_methods=decode_init_methods,
             kv_slot_count=kv_slot_count,
             kv_slot_capacity_tokens=kv_slot_capacity_tokens,
             engine_kwargs=kwargs,
@@ -129,6 +133,9 @@ def _effective_runtime_config(engine):
             "kind": "pd",
             "prefill_gpu": config.prefill_gpu,
             "decode_gpu": config.decode_gpu,
+            "decode_gpus": list(config.decode_gpus),
+            "decode_worker_ids": list(config.decode_worker_ids),
+            "decode_init_methods": list(config.decode_init_methods),
             "prefill_enforce_eager": config.prefill_enforce_eager,
             "decode_enforce_eager": config.decode_enforce_eager,
             "kv_slot_count": config.kv_slot_count,
@@ -267,6 +274,7 @@ def run_point(
             {
                 "prefill_gpu": runtime.get("prefill_gpu", 0),
                 "decode_gpu": runtime.get("decode_gpu", 1),
+                "decode_gpus": tuple(runtime.get("decode_gpus", ())),
                 "prefill_batch_size": runtime.get("prefill_batch_size", 1),
                 "prefill_enforce_eager": runtime.get(
                     "prefill_enforce_eager", True
@@ -276,6 +284,9 @@ def run_point(
                 ),
                 "prefill_init_method": runtime.get("prefill_init_method"),
                 "decode_init_method": runtime.get("decode_init_method"),
+                "decode_init_methods": tuple(
+                    runtime.get("decode_init_methods", ())
+                ),
                 "kv_slot_count": runtime.get("kv_slot_count", 2),
                 "kv_slot_capacity_tokens": runtime.get(
                     "kv_slot_capacity_tokens", 1024

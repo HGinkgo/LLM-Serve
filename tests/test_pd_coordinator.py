@@ -90,6 +90,14 @@ class TestPDConfig(unittest.TestCase):
             config.engine_kwargs_for("decode-1")["distributed_init_method"],
             "tcp://127.0.0.1:24433",
         )
+        self.assertEqual(
+            config.prefill_transport_config(),
+            {
+                "slot_count": 2,
+                "capacity_tokens": 1024,
+                "target_workers": ("decode-0", "decode-1"),
+            },
+        )
 
     def test_config_rejects_duplicate_decode_pool_gpu_or_endpoint(self):
         with self.assertRaisesRegex(ValueError, "unique"):
@@ -237,6 +245,93 @@ class TestPDConfig(unittest.TestCase):
 
         self.assertEqual(result[0]["transfer_id"], "transfer-7")
         self.assertEqual(queue.commands[0]["type"], "admit_batch")
+
+    def test_attaches_each_decode_worker_to_its_own_shared_slot_pool(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            decode_gpus=(1, 2),
+        )
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        coordinator._failed_roles = set()
+        first = FakeQueue(responses=[{"ok": True, "result": {"attached": True}}])
+        second = FakeQueue(responses=[{"ok": True, "result": {"attached": True}}])
+        coordinator._workers = {
+            "decode-0": {"commands": first, "responses": first},
+            "decode-1": {"commands": second, "responses": second},
+        }
+
+        coordinator._attach_decode_slot_pools(
+            {"decode-0": "handle-0", "decode-1": "handle-1"}
+        )
+
+        self.assertEqual(first.commands[0]["handle"], "handle-0")
+        self.assertEqual(second.commands[0]["handle"], "handle-1")
+
+    def test_decode_pool_dispatches_every_step_before_waiting_for_replies(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            decode_gpus=(1, 2),
+        )
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        coordinator._failed_roles = set()
+        first = FakeQueue(
+            responses=[{"ok": True, "result": {"outputs": [], "num_tokens": 0}}]
+        )
+        second = FakeQueue(
+            responses=[{"ok": True, "result": {"outputs": [], "num_tokens": 0}}]
+        )
+        coordinator._workers = {
+            "decode-0": {"commands": first, "responses": first},
+            "decode-1": {"commands": second, "responses": second},
+        }
+
+        results = coordinator.decode_step_all()
+
+        self.assertEqual(set(results), {"decode-0", "decode-1"})
+        self.assertEqual(first.commands[0]["type"], "step")
+        self.assertEqual(second.commands[0]["type"], "step")
+
+    def test_decode_pool_combines_targeted_handoffs_with_other_decode_steps(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            decode_gpus=(1, 2),
+        )
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        coordinator._failed_roles = set()
+        first = FakeQueue(
+            responses=[{"ok": True, "result": {"admissions": [], "outputs": []}}]
+        )
+        second = FakeQueue(
+            responses=[{"ok": True, "result": {"outputs": []}}]
+        )
+        coordinator._workers = {
+            "decode-0": {"commands": first, "responses": first},
+            "decode-1": {"commands": second, "responses": second},
+        }
+
+        coordinator.decode_step_with_handoffs_all(
+            {"decode-0": ["handoff-0"]},
+            active_worker_ids=("decode-0", "decode-1"),
+        )
+
+        self.assertEqual(first.commands[0]["type"], "step_with_handoffs")
+        self.assertEqual(first.commands[0]["handoffs"], ["handoff-0"])
+        self.assertEqual(second.commands[0]["type"], "step")
 
     def test_decode_step_with_handoffs_uses_combined_decode_worker_rpc(self):
         config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
