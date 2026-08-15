@@ -199,6 +199,7 @@ cython_debug/
 
 # Local-only project materials
 .agent/
+.worktrees/
 experiment-data/
 docs/
 roadmap.md
