@@ -74,6 +74,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-kv-pipeline-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",
+                "pd-transport-observability.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
             },

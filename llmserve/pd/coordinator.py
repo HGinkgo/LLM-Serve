@@ -260,11 +260,15 @@ class PDCoordinator:
         for role in ("prefill", "decode"):
             worker = self._workers.get(role)
             process = worker.get("process") if worker else None
-            health[role] = {
+            item = {
                 "pid": getattr(process, "pid", None),
                 "alive": bool(process is not None and process.is_alive()),
                 "exitcode": getattr(process, "exitcode", None),
             }
+            environment = worker.get("ready_result", {}).get("environment")
+            if environment is not None:
+                item["environment"] = environment
+            health[role] = item
         return health
 
     def prefill_batch(self, envelopes, release_transfer_ids=()):

@@ -1,5 +1,5 @@
 import unittest
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 
 from llmserve.pd.protocol import RequestEnvelope
@@ -168,7 +168,11 @@ class TestPDServingEngine(unittest.TestCase):
 
     def test_next_prefill_overlaps_decode_step(self):
         coordinator = FakePDCoordinator()
-        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine = PDServingEngine(
+            coordinator,
+            prefill_batch_size=1,
+            enable_latency_telemetry=True,
+        )
 
         engine.add_request([1, 2], SamplingParams(max_tokens=2))
         engine.add_request([3, 4], SamplingParams(max_tokens=2))
@@ -208,6 +212,119 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual(
             engine.get_metrics()["summary"]["pd"]["prefill_timing"]["worker_ms"],
             12.0,
+        )
+
+    def test_metrics_classify_decode_idle_while_waiting_for_prefill(self):
+        class BlockingPrefillCoordinator(FakePDCoordinator):
+            def __init__(self):
+                super().__init__()
+                self.prefill_started = Event()
+                self.allow_prefill = Event()
+
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                self.prefill_started.set()
+                if not self.allow_prefill.wait(timeout=2):
+                    raise AssertionError("prefill was not released")
+                return super().prefill_batch(
+                    envelopes,
+                    release_transfer_ids=release_transfer_ids,
+                )
+
+        coordinator = BlockingPrefillCoordinator()
+        engine = PDServingEngine(
+            coordinator,
+            prefill_batch_size=1,
+            enable_latency_telemetry=True,
+        )
+        engine.add_request([1, 2], SamplingParams(max_tokens=1))
+
+        worker = Thread(target=engine.step)
+        worker.start()
+        self.assertTrue(coordinator.prefill_started.wait(timeout=2))
+        coordinator.allow_prefill.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+
+        decode_idle = engine.get_metrics()["summary"]["pd"]["decode_idle"]
+        self.assertGreater(
+            decode_idle["counts"]["waiting_prefill_output"],
+            0,
+        )
+        self.assertGreaterEqual(
+            decode_idle["duration_ms"]["waiting_prefill_output"],
+            0.0,
+        )
+
+    def test_metrics_preserve_pd_transport_timeline_boundaries(self):
+        class TimelineCoordinator(FakePDCoordinator):
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                return [
+                    SimpleNamespace(
+                        request_id=envelope.request_id,
+                        prefill_timing_ms={},
+                        telemetry={
+                            "t_slot_acquired": 1.001,
+                            "t_kv_export_started": 1.002,
+                            "t_kv_export_finished": 1.003,
+                            "t_slot_ready": 1.004,
+                            "t_prefill_first_scheduled": 1.005,
+                            "t_prefill_finish": 1.006,
+                            "t_first_token": 1.006,
+                            "writers": {
+                                "t_slot_ready": "prefill_worker.slot_pool",
+                            },
+                        },
+                    )
+                    for envelope in envelopes
+                ]
+
+            def admit_batch(self, handoffs):
+                self.admit_calls.append(list(handoffs))
+                return [
+                    {
+                        "seq_id": 100 + handoff.request_id,
+                        "finished": False,
+                        "output_token_ids": None,
+                        "telemetry": {
+                            "t_decode_descriptor_received": 1.007,
+                            "t_slot_consuming": 1.0075,
+                            "t_decode_admission_started": 1.008,
+                            "t_decode_admitted": 1.009,
+                            "t_handoff_finish": 1.010,
+                            "t_decode_admission_returned": 1.011,
+                            "writers": {
+                                "t_decode_admitted": "decode_worker.scheduler",
+                            },
+                        },
+                    }
+                    for handoff in handoffs
+                ]
+
+        engine = PDServingEngine(
+            TimelineCoordinator(),
+            prefill_batch_size=1,
+            enable_latency_telemetry=True,
+        )
+        engine.add_request([1, 2], SamplingParams(max_tokens=1))
+        engine.step()
+
+        timeline = engine.get_metrics()["requests"][0]["timeline"]
+        for key in (
+            "t_slot_acquired",
+            "t_kv_export_started",
+            "t_kv_export_finished",
+            "t_slot_ready",
+            "t_decode_descriptor_received",
+            "t_slot_consuming",
+            "t_decode_admission_started",
+            "t_decode_admitted",
+            "t_handoff_finish",
+            "t_decode_admission_returned",
+        ):
+            self.assertIn(key, timeline)
+        self.assertEqual(
+            timeline["writers"]["t_slot_ready"],
+            "prefill_worker.slot_pool",
         )
 
     def test_metrics_split_prefill_and_admit_rpc_queue_latency(self):

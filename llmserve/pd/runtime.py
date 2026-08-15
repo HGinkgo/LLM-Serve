@@ -71,7 +71,10 @@ class PrefillHandoff:
 def _to_host_payload(
     payload: torch.Tensor,
     destination: torch.Tensor | None = None,
+    telemetry: dict | None = None,
 ) -> torch.Tensor:
+    if telemetry is not None:
+        telemetry["t_kv_export_started"] = perf_counter()
     if destination is not None:
         if tuple(destination.shape) != tuple(payload.shape):
             raise ValueError("shared KV destination shape does not match payload")
@@ -79,16 +82,21 @@ def _to_host_payload(
         destination.copy_(payload, non_blocking=non_blocking)
         if non_blocking:
             torch.cuda.current_stream(payload.device).synchronize()
+        if telemetry is not None:
+            telemetry["t_kv_export_finished"] = perf_counter()
         return destination
     if payload.device.type == "cpu":
-        return payload.contiguous()
-    host = torch.empty_like(
-        payload,
-        device="cpu",
-        pin_memory=torch.cuda.is_available(),
-    )
-    host.copy_(payload, non_blocking=False)
-    return host
+        result = payload.contiguous()
+    else:
+        result = torch.empty_like(
+            payload,
+            device="cpu",
+            pin_memory=torch.cuda.is_available(),
+        )
+        result.copy_(payload, non_blocking=False)
+    if telemetry is not None:
+        telemetry["t_kv_export_finished"] = perf_counter()
+    return result
 
 
 class PrefillWorkerRuntime:
@@ -108,6 +116,7 @@ class PrefillWorkerRuntime:
         first_token_id: int,
         slot_lease: KVSlotLease | None = None,
         token_offset: int = 0,
+        transport_telemetry: dict | None = None,
     ) -> PrefillHandoff:
         logical_tokens = seq.num_prompt_tokens
         payload = export_logical_kv(
@@ -122,11 +131,11 @@ class PrefillWorkerRuntime:
                 token_offset=token_offset,
                 num_tokens=logical_tokens,
             )
-            _to_host_payload(payload, destination)
+            _to_host_payload(payload, destination, telemetry=transport_telemetry)
             host_payload = None
             transport = "shared_slot"
         else:
-            host_payload = _to_host_payload(payload)
+            host_payload = _to_host_payload(payload, telemetry=transport_telemetry)
             transport = "inline"
         descriptor = KVTransferDescriptor(
             request_id=envelope.request_id,
@@ -145,12 +154,15 @@ class PrefillWorkerRuntime:
             ),
             token_offset=token_offset,
         )
-        return PrefillHandoff(
+        handoff = PrefillHandoff(
             envelope=envelope,
             first_token_id=int(first_token_id),
             descriptor=descriptor,
             kv_payload=host_payload,
         )
+        if transport_telemetry:
+            handoff.telemetry.update(transport_telemetry)
+        return handoff
 
     def release_transfers(self, transfer_ids: list[str]) -> dict[str, int]:
         if self.slot_pool is None:
@@ -162,7 +174,9 @@ class PrefillWorkerRuntime:
             self.slot_pool.mark_consuming(set(transfer_ids))
             for transfer_id in transfer_ids:
                 self.slot_pool.ack(transfer_id)
-        return self.slot_pool.stats()
+        stats = self.slot_pool.stats()
+        stats["observability"] = self.slot_pool.observability()
+        return stats
 
     def prefill_batch(
         self,
@@ -186,11 +200,13 @@ class PrefillWorkerRuntime:
         owned_seq_ids = set()
         handoffs_by_request_id = {}
         slot_lease = None
+        slot_acquired_at = None
         token_offsets = {}
         if self.slot_pool is not None:
             total_tokens = sum(len(envelope.prompt_token_ids) for envelope in envelopes)
             if total_tokens <= self.slot_pool.handle.capacity_tokens:
                 slot_lease = self.slot_pool.acquire(total_tokens)
+                slot_acquired_at = perf_counter()
                 token_offset = 0
                 for envelope in envelopes:
                     token_offsets[envelope.request_id] = token_offset
@@ -268,6 +284,13 @@ class PrefillWorkerRuntime:
                         partial_token_ids.append(token_id)
                         continue
                     export_started_at = perf_counter()
+                    transport_telemetry = (
+                        {} if getattr(
+                            getattr(self.engine, "config", None),
+                            "enable_latency_telemetry",
+                            False,
+                        ) else None
+                    )
                     handoff = self._build_handoff(
                         envelope_by_seq_id[seq.seq_id],
                         seq,
@@ -277,13 +300,14 @@ class PrefillWorkerRuntime:
                             envelope_by_seq_id[seq.seq_id].request_id,
                             0,
                         ),
+                        transport_telemetry=transport_telemetry,
                     )
                     if getattr(
                         getattr(self.engine, "config", None),
                         "enable_latency_telemetry",
                         False,
                     ):
-                        handoff.telemetry = {
+                        handoff.telemetry.update({
                             "t_prefill_first_scheduled": prefill_first_scheduled_at,
                             "t_prefill_finish": forward_finished_at,
                             "t_first_token": forward_finished_at,
@@ -293,7 +317,7 @@ class PrefillWorkerRuntime:
                                 "t_prefill_finish": "prefill_worker.model_runner",
                                 "t_first_token": "prefill_worker.model_runner",
                             },
-                        }
+                        })
                     kv_export_copy_ms += (
                         perf_counter() - export_started_at
                     ) * 1000
@@ -334,10 +358,17 @@ class PrefillWorkerRuntime:
                     },
                 )
                 slot_stats = self.slot_pool.stats()
+                slot_observability = self.slot_pool.observability()
+                slot_ready_at = perf_counter()
                 for handoff in handoffs_by_request_id.values():
                     handoff.telemetry.update({
                         "slot_stats_after_ready": slot_stats,
-                        "slot_wait_count": 0,
+                        "slot_observability": slot_observability,
+                        "slot_wait_count": slot_observability[
+                            "acquire_exhaustions"
+                        ],
+                        "t_slot_acquired": slot_acquired_at,
+                        "t_slot_ready": slot_ready_at,
                     })
             return [handoffs_by_request_id[request_id] for request_id in request_ids]
         except Exception:
@@ -373,6 +404,12 @@ class DecodeWorkerRuntime:
         return [self.admit(handoff) for handoff in handoffs]
 
     def admit(self, handoff: PrefillHandoff):
+        telemetry_enabled = bool(getattr(
+            getattr(self.engine, "config", None),
+            "enable_latency_telemetry",
+            False,
+        ))
+        descriptor_received_at = perf_counter() if telemetry_enabled else None
         if handoff.descriptor.request_id != handoff.envelope.request_id:
             raise ValueError("KV handoff request id does not match its envelope")
         if handoff.descriptor.block_size != self.engine.model_runner.block_size:
@@ -386,17 +423,36 @@ class DecodeWorkerRuntime:
             if self.slot_reader is None:
                 raise RuntimeError("Decode Worker has no shared KV slot reader")
             kv_payload = self.slot_reader.read_descriptor(handoff.descriptor)
+            slot_consuming_at = perf_counter() if telemetry_enabled else None
         else:
             kv_payload = handoff.kv_payload
+            slot_consuming_at = None
+        admission_started_at = perf_counter() if telemetry_enabled else None
         seq_id = self.engine.add_prefilled_request(
             list(handoff.envelope.prompt_token_ids),
             handoff.first_token_id,
             sampling_params,
             kv_payload,
         )
+        admission_returned_at = perf_counter() if telemetry_enabled else None
         telemetry = dict(
             getattr(self.engine, "last_prefilled_admission_telemetry", {})
         )
+        if telemetry_enabled:
+            telemetry.update({
+                "t_decode_descriptor_received": descriptor_received_at,
+                "t_slot_consuming": slot_consuming_at,
+                "t_decode_admission_started": admission_started_at,
+                # This host timestamp records a returned admission call, not
+                # GPU-side H2D completion. CUDA Event tracking comes in v2.
+                "t_decode_admission_returned": admission_returned_at,
+            })
+            telemetry.setdefault("writers", {}).update({
+                "t_decode_descriptor_received": "decode_worker.runtime",
+                "t_slot_consuming": "decode_worker.shared_slot_reader",
+                "t_decode_admission_started": "decode_worker.runtime",
+                "t_decode_admission_returned": "decode_worker.runtime",
+            })
         finished = (
             handoff.envelope.max_tokens <= 1
             or (

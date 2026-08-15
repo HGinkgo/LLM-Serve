@@ -233,6 +233,14 @@ class TestPDRuntime(unittest.TestCase):
 
     def test_shared_slot_handoff_carries_only_descriptors_and_decode_reads_slices(self):
         prefill_engine = FakeBatchPrefillEngine()
+        prefill_engine.config = SimpleNamespace(enable_latency_telemetry=True)
+        prefill_engine.model_runner.call = (
+            lambda method_name, output=None: (
+                {"model_forward_gpu_ms": 0.0}
+                if method_name == "get_last_run_timing"
+                else [101, 102]
+            )
+        )
         prefill_engine.model_runner.kv_cache[:, :, 0] = 7.0
         prefill_engine.model_runner.kv_cache[:, :, 1] = 8.0
         pool = SharedKVSlotPool.create(
@@ -262,8 +270,18 @@ class TestPDRuntime(unittest.TestCase):
             [handoff.descriptor.token_offset for handoff in handoffs],
             [0, 4],
         )
+        source_timeline = handoffs[0].telemetry
+        for name in (
+            "t_slot_acquired",
+            "t_kv_export_started",
+            "t_kv_export_finished",
+            "t_slot_ready",
+        ):
+            self.assertIn(name, source_timeline)
+        self.assertIn("slot_observability", source_timeline)
 
         decode_engine = FakeDecodeEngine()
+        decode_engine.config = SimpleNamespace(enable_latency_telemetry=True)
         reader = SharedKVSlotReader(pool.handle, register_cuda=False)
         admissions = DecodeWorkerRuntime(
             decode_engine,
@@ -274,6 +292,10 @@ class TestPDRuntime(unittest.TestCase):
             [admission["transfer_id"] for admission in admissions],
             [handoff.descriptor.transfer_id for handoff in handoffs],
         )
+        self.assertTrue(all(
+            admission["telemetry"]["t_slot_consuming"] is not None
+            for admission in admissions
+        ))
         self.assertEqual(
             [float(call[0][3][0, 0, 0, 0, 0]) for call in decode_engine.calls],
             [7.0, 8.0],
@@ -320,6 +342,38 @@ class TestPDRuntime(unittest.TestCase):
         self.assertEqual(args[2].max_tokens, 4)
         self.assertTrue(torch.equal(args[3], handoff.kv_payload))
         self.assertEqual(kwargs, {})
+
+    def test_decode_runtime_records_descriptor_and_import_enqueue_boundaries(self):
+        envelope = RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True)
+        payload = torch.zeros(2, 1, 4, 1, 2)
+        handoff = PrefillHandoff(
+            envelope=envelope,
+            first_token_id=77,
+            descriptor=self.make_descriptor(payload),
+            kv_payload=payload,
+        )
+        engine = FakeDecodeEngine()
+        engine.config = SimpleNamespace(enable_latency_telemetry=True)
+
+        admission = DecodeWorkerRuntime(engine).admit(handoff)
+
+        telemetry = admission["telemetry"]
+        self.assertLessEqual(
+            telemetry["t_decode_descriptor_received"],
+            telemetry["t_decode_admission_started"],
+        )
+        self.assertLessEqual(
+            telemetry["t_decode_admission_started"],
+            telemetry["t_decode_admission_returned"],
+        )
+        self.assertEqual(
+            telemetry["writers"]["t_decode_descriptor_received"],
+            "decode_worker.runtime",
+        )
+        self.assertEqual(
+            telemetry["writers"]["t_decode_admission_returned"],
+            "decode_worker.runtime",
+        )
 
     def test_handoff_rejects_payload_that_disagrees_with_descriptor(self):
         envelope = RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True)

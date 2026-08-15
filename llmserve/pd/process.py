@@ -62,6 +62,7 @@ def worker_main(
     signal.signal(signal.SIGTERM, _handle_termination)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     from llmserve import LLM
+    from llmserve.pd.observability import collect_process_numa_observability
     from llmserve.pd.protocol import RequestEnvelope
     from llmserve.pd.runtime import DecodeWorkerRuntime, PrefillWorkerRuntime
 
@@ -88,10 +89,21 @@ def worker_main(
                 "ready": True,
                 "role": role,
                 "kv_slot_handle": slot_pool.handle if slot_pool is not None else None,
+                "environment": collect_process_numa_observability(
+                    shared_memory_address=(
+                        slot_pool.handle.backing.data_ptr()
+                        if slot_pool is not None
+                        else None
+                    ),
+                ),
             }
         else:
             runtime = DecodeWorkerRuntime(engine)
-            ready_result = {"ready": True, "role": role}
+            ready_result = {
+                "ready": True,
+                "role": role,
+                "environment": collect_process_numa_observability(),
+            }
         _reply(
             response_queue,
             result=ready_result,

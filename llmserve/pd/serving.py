@@ -7,6 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from time import perf_counter
 
+from llmserve.pd.observability import DecodeIdleReason
 from llmserve.pd.protocol import RequestEnvelope, RequestLifecycle, RequestState
 
 
@@ -45,6 +46,7 @@ class PDServingEngine:
         self.last_step_events: dict = {}
         self._prefill_batches: list[dict] = []
         self._queue_samples: list[dict] = []
+        self._decode_idle_intervals: list[dict] = []
         self._run_started_at = perf_counter()
         self.coordinator.start()
 
@@ -221,6 +223,10 @@ class PDServingEngine:
                 timeline.update({
                     key: handoff_telemetry.get(key)
                     for key in (
+                        "t_slot_acquired",
+                        "t_kv_export_started",
+                        "t_kv_export_finished",
+                        "t_slot_ready",
                         "t_prefill_first_scheduled",
                         "t_prefill_finish",
                         "t_first_token",
@@ -233,7 +239,14 @@ class PDServingEngine:
                 )
                 timeline.update({
                     key: admission.get("telemetry", {}).get(key)
-                    for key in ("t_decode_admitted", "t_handoff_finish")
+                    for key in (
+                        "t_decode_descriptor_received",
+                        "t_slot_consuming",
+                        "t_decode_admission_started",
+                        "t_decode_admitted",
+                        "t_handoff_finish",
+                        "t_decode_admission_returned",
+                    )
                     if admission.get("telemetry", {}).get(key) is not None
                 })
                 writers = timeline.setdefault("writers", {})
@@ -331,6 +344,9 @@ class PDServingEngine:
                 "slot_stats_after_ready": getattr(
                     handoffs[0], "telemetry", {}
                 ).get("slot_stats_after_ready") if handoffs else None,
+                "slot_observability_after_ready": getattr(
+                    handoffs[0], "telemetry", {}
+                ).get("slot_observability") if handoffs else None,
                 "slot_wait_count": getattr(
                     handoffs[0], "telemetry", {}
                 ).get("slot_wait_count") if handoffs else None,
@@ -353,6 +369,21 @@ class PDServingEngine:
                 "pending_transfer_acks": len(self._pending_transfer_acks),
             }
         )
+
+    def _record_decode_idle_interval(
+        self,
+        reason: DecodeIdleReason,
+        started_at: float,
+        finished_at: float,
+    ):
+        if not self.enable_latency_telemetry:
+            return
+        self._decode_idle_intervals.append({
+            "reason": reason.value,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": max(0.0, (finished_at - started_at) * 1000),
+        })
 
     def _fail_all_requests(self, error: Exception):
         reason = f"{type(error).__name__}: {error}"
@@ -406,7 +437,14 @@ class PDServingEngine:
 
         if not self._active_by_decode_seq:
             if self._prefill_future is not None:
+                wait_started_at = perf_counter()
                 self._prefill_future.result()
+                wait_finished_at = perf_counter()
+                self._record_decode_idle_interval(
+                    DecodeIdleReason.WAITING_PREFILL_OUTPUT,
+                    wait_started_at,
+                    wait_finished_at,
+                )
                 self._collect_prefill()
                 self._start_prefill()
             if not self._active_by_decode_seq:
@@ -419,7 +457,20 @@ class PDServingEngine:
                 self._record_queue_sample()
                 return finished, 0
 
+        active_decode_before_step = len(self._active_by_decode_seq)
+        decode_started_at = perf_counter()
         result = self.coordinator.decode_step()
+        decode_finished_at = perf_counter()
+        raw_events = result.get("last_step_events") or {}
+        if (
+            active_decode_before_step
+            and not raw_events.get("scheduled_seq_ids")
+        ):
+            self._record_decode_idle_interval(
+                DecodeIdleReason.SCHEDULER_NOT_SCHEDULED,
+                decode_started_at,
+                decode_finished_at,
+            )
         outputs = []
         for decode_seq_id, token_ids in result.get("outputs", ()):
             request_id = self._active_by_decode_seq.pop(decode_seq_id, None)
@@ -438,7 +489,7 @@ class PDServingEngine:
                 ] = "pd_parent.decode_result"
             request["lifecycle"].transition(RequestState.FINISHED)
             outputs.append((request_id, list(token_ids)))
-        events = deepcopy(result.get("last_step_events") or {})
+        events = deepcopy(raw_events)
         scheduled_ids = events.get("scheduled_seq_ids", ())
         events["scheduled_seq_ids"] = [
             self._active_by_decode_seq.get(seq_id, seq_id)
@@ -482,6 +533,7 @@ class PDServingEngine:
         self._requests.clear()
         self._prefill_batches.clear()
         self._queue_samples.clear()
+        self._decode_idle_intervals.clear()
         self.last_step_events = {}
         self._run_started_at = perf_counter()
 
@@ -594,6 +646,25 @@ class PDServingEngine:
             "prefill_batches_detail": deepcopy(self._prefill_batches),
             "prefill_timing": prefill_timing,
             "queue_samples": deepcopy(self._queue_samples),
+            "decode_idle": {
+                "intervals": deepcopy(self._decode_idle_intervals),
+                "counts": {
+                    reason.value: sum(
+                        1
+                        for interval in self._decode_idle_intervals
+                        if interval["reason"] == reason.value
+                    )
+                    for reason in DecodeIdleReason
+                },
+                "duration_ms": {
+                    reason.value: sum(
+                        interval["duration_ms"]
+                        for interval in self._decode_idle_intervals
+                        if interval["reason"] == reason.value
+                    )
+                    for reason in DecodeIdleReason
+                },
+            },
             "slot_release_samples": deepcopy(self._slot_release_samples),
             "worker_health": (
                 deepcopy(self._failure_worker_health)

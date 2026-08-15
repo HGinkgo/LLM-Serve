@@ -118,6 +118,26 @@ class TestPDConfig(unittest.TestCase):
 
         self.assertTrue(coordinator._workers["prefill"]["ready"])
 
+    def test_worker_health_retains_worker_environment_snapshot(self):
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator._workers = {
+            "prefill": {
+                "ready_result": {
+                    "environment": {"cpu_affinity": [0, 1]},
+                },
+            },
+            "decode": {
+                "ready_result": {
+                    "environment": {"cpu_affinity": [2, 3]},
+                },
+            },
+        }
+
+        health = coordinator.worker_health()
+
+        self.assertEqual(health["prefill"]["environment"]["cpu_affinity"], [0, 1])
+        self.assertEqual(health["decode"]["environment"]["cpu_affinity"], [2, 3])
+
     def test_prefill_batch_serializes_envelopes_for_worker_rpc(self):
         config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
         coordinator = PDCoordinator.__new__(PDCoordinator)

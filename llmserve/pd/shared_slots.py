@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from time import perf_counter
+from typing import Callable
 
 import torch
+
+from llmserve.pd.observability import collect_process_numa_observability
 
 
 class KVSlotState(str, Enum):
@@ -182,6 +186,8 @@ class SharedKVSlotPool(SharedKVSlotReader):
         head_dim: int,
         dtype: torch.dtype,
         register_cuda: bool = True,
+        clock: Callable[[], float] = perf_counter,
+        environment_provider: Callable[..., dict] = collect_process_numa_observability,
     ) -> "SharedKVSlotPool":
         for name, value in (
             ("slot_count", slot_count),
@@ -216,15 +222,59 @@ class SharedKVSlotPool(SharedKVSlotReader):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
         )
-        return cls(handle, register_cuda=register_cuda)
+        environment = environment_provider(
+            shared_memory_address=backing.data_ptr(),
+        )
+        return cls(
+            handle,
+            register_cuda=register_cuda,
+            clock=clock,
+            environment=environment,
+        )
 
-    def __init__(self, handle: SharedKVSlotHandle, *, register_cuda: bool = True):
+    def __init__(
+        self,
+        handle: SharedKVSlotHandle,
+        *,
+        register_cuda: bool = True,
+        clock: Callable[[], float] = perf_counter,
+        environment: dict | None = None,
+    ):
         super().__init__(handle, register_cuda=register_cuda)
+        self._clock = clock
+        self._environment = dict(environment or {})
         self._states = [KVSlotState.FREE] * handle.slot_count
         self._generations = [0] * handle.slot_count
         self._leases: dict[int, KVSlotLease] = {}
         self._pending_transfers: dict[str, KVSlotLease] = {}
         self._consuming_transfers: set[str] = set()
+        self._events: list[dict] = []
+        self._state_started_at: dict[int, tuple[KVSlotState, float]] = {}
+        self._state_durations_seconds = {
+            state: 0.0 for state in KVSlotState
+        }
+        self._acquire_exhaustions = 0
+
+    def _record_state(
+        self,
+        lease: KVSlotLease,
+        state: KVSlotState,
+        *,
+        writer: str,
+    ):
+        now = self._clock()
+        previous = self._state_started_at.get(lease.slot_id)
+        if previous is not None:
+            previous_state, started_at = previous
+            self._state_durations_seconds[previous_state] += now - started_at
+        self._state_started_at[lease.slot_id] = (state, now)
+        self._events.append({
+            "slot_id": lease.slot_id,
+            "generation": lease.generation,
+            "state": state.value,
+            "at": now,
+            "writer": writer,
+        })
 
     def acquire(self, num_tokens: int) -> KVSlotLease:
         if not isinstance(num_tokens, int) or num_tokens <= 0:
@@ -234,6 +284,7 @@ class SharedKVSlotPool(SharedKVSlotReader):
         try:
             slot_id = self._states.index(KVSlotState.FREE)
         except ValueError as error:
+            self._acquire_exhaustions += 1
             raise KVSlotPoolExhausted("no reusable shared KV slot is available") from error
         self._generations[slot_id] += 1
         lease = KVSlotLease(slot_id, self._generations[slot_id], num_tokens)
@@ -241,6 +292,11 @@ class SharedKVSlotPool(SharedKVSlotReader):
         self.handle.states[slot_id] = _STATE_CODES[KVSlotState.FILLING]
         self.handle.generations[slot_id] = lease.generation
         self._leases[slot_id] = lease
+        self._record_state(
+            lease,
+            KVSlotState.FILLING,
+            writer="prefill_worker.slot_pool",
+        )
         return lease
 
     def _validate_lease(self, lease: KVSlotLease, state: KVSlotState):
@@ -283,6 +339,11 @@ class SharedKVSlotPool(SharedKVSlotReader):
             raise ValueError("shared KV transfer id is already active")
         self._states[lease.slot_id] = KVSlotState.READY
         self.handle.states[lease.slot_id] = _STATE_CODES[KVSlotState.READY]
+        self._record_state(
+            lease,
+            KVSlotState.READY,
+            writer="prefill_worker.slot_pool",
+        )
         for transfer_id in transfer_ids:
             self._pending_transfers[transfer_id] = lease
 
@@ -302,9 +363,14 @@ class SharedKVSlotPool(SharedKVSlotReader):
                 raise ValueError("shared KV transfer is not ready")
             leases.append(lease)
         self._consuming_transfers.update(transfer_ids)
-        for lease in leases:
+        for lease in set(leases):
             self._states[lease.slot_id] = KVSlotState.CONSUMING
             self.handle.states[lease.slot_id] = _STATE_CODES[KVSlotState.CONSUMING]
+            self._record_state(
+                lease,
+                KVSlotState.CONSUMING,
+                writer="prefill_worker.ack",
+            )
 
     def ack(self, transfer_id: str):
         lease = self._pending_transfers.get(transfer_id)
@@ -318,6 +384,11 @@ class SharedKVSlotPool(SharedKVSlotReader):
             self._states[lease.slot_id] = KVSlotState.FREE
             self.handle.states[lease.slot_id] = _STATE_CODES[KVSlotState.FREE]
             self._leases.pop(lease.slot_id, None)
+            self._record_state(
+                lease,
+                KVSlotState.FREE,
+                writer="prefill_worker.ack",
+            )
 
     def cancel(self, lease: KVSlotLease):
         active = self._leases.get(lease.slot_id)
@@ -330,6 +401,11 @@ class SharedKVSlotPool(SharedKVSlotReader):
         self._states[lease.slot_id] = KVSlotState.FREE
         self.handle.states[lease.slot_id] = _STATE_CODES[KVSlotState.FREE]
         self._leases.pop(lease.slot_id, None)
+        self._record_state(
+            lease,
+            KVSlotState.FREE,
+            writer="prefill_worker.cancel",
+        )
 
     def slot_state(self, slot_id: int) -> KVSlotState:
         if not isinstance(slot_id, int) or not 0 <= slot_id < len(self._states):
@@ -344,4 +420,17 @@ class SharedKVSlotPool(SharedKVSlotReader):
             "ready_slots": self._states.count(KVSlotState.READY),
             "consuming_slots": self._states.count(KVSlotState.CONSUMING),
             "pending_transfers": len(self._pending_transfers),
+        }
+
+    def observability(self) -> dict:
+        """Return owner-side slot transitions without changing slot ownership."""
+
+        return {
+            "environment": dict(self._environment),
+            "events": [dict(event) for event in self._events],
+            "state_durations_ms": {
+                state.value: seconds * 1000
+                for state, seconds in self._state_durations_seconds.items()
+            },
+            "acquire_exhaustions": self._acquire_exhaustions,
         }

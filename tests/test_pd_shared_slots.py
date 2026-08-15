@@ -24,6 +24,66 @@ class TestSharedKVSlotPool(unittest.TestCase):
             register_cuda=False,
         )
 
+    def test_records_slot_state_timeline_and_exhaustion(self):
+        timestamps = iter((1.0, 2.0, 3.0, 4.0, 5.0))
+        pool = SharedKVSlotPool.create(
+            slot_count=1,
+            capacity_tokens=8,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+            clock=lambda: next(timestamps),
+        )
+        lease = pool.acquire(4)
+        pool.mark_ready(lease, {"request-7"})
+        pool.mark_consuming({"request-7"})
+        pool.ack("request-7")
+
+        observation = pool.observability()
+
+        self.assertEqual(observation["acquire_exhaustions"], 0)
+        self.assertEqual(
+            [event["state"] for event in observation["events"]],
+            ["filling", "ready", "consuming", "free"],
+        )
+        self.assertEqual(
+            [event["generation"] for event in observation["events"]],
+            [1, 1, 1, 1],
+        )
+        self.assertEqual(observation["state_durations_ms"]["filling"], 1000.0)
+        self.assertEqual(observation["state_durations_ms"]["ready"], 1000.0)
+        self.assertEqual(observation["state_durations_ms"]["consuming"], 1000.0)
+
+        pool.acquire(4)
+        with self.assertRaises(KVSlotPoolExhausted):
+            pool.acquire(1)
+        self.assertEqual(pool.observability()["acquire_exhaustions"], 1)
+
+    def test_observability_keeps_slot_creator_numa_snapshot(self):
+        pool = SharedKVSlotPool.create(
+            slot_count=2,
+            capacity_tokens=8,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+            environment_provider=lambda **kwargs: {
+                "pid": 99,
+                "cpu_affinity": [4, 5],
+                "shared_memory_numa": {"page_counts": {1: 8}},
+                "address": kwargs["shared_memory_address"],
+            },
+        )
+
+        environment = pool.observability()["environment"]
+
+        self.assertEqual(environment["pid"], 99)
+        self.assertEqual(environment["cpu_affinity"], [4, 5])
+        self.assertEqual(environment["shared_memory_numa"]["page_counts"], {1: 8})
+
     def test_slot_becomes_reusable_only_after_every_transfer_is_acked(self):
         pool = self.make_pool(slot_count=1)
         lease = pool.acquire(5)
