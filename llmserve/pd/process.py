@@ -154,14 +154,24 @@ def worker_main(
                 )
                 continue
             if role == "decode" and command_type == "step":
-                outputs, num_tokens = engine.step()
+                outputs, num_tokens, completed_transfers = runtime.step()
                 _reply(
                     response_queue,
                     result={
                         "outputs": outputs,
                         "num_tokens": num_tokens,
+                        "completed_transfers": completed_transfers,
                         "last_step_events": engine.last_step_events,
                     },
+                    worker_received_at=worker_received_at,
+                )
+                continue
+            if role == "decode" and command_type == "collect_completed_transfers":
+                _reply(
+                    response_queue,
+                    result=runtime.collect_completed_transfers(
+                        wait=bool(command.get("wait", False))
+                    ),
                     worker_received_at=worker_received_at,
                 )
                 continue

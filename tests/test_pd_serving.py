@@ -61,6 +61,9 @@ class FakePDCoordinator:
         self.explicit_release_calls.append(list(transfer_ids))
         return {"free_slots": 2}
 
+    def collect_completed_transfers(self, wait=False):
+        return []
+
     def last_rpc_timing(self, role):
         if role == "prefill":
             return {
@@ -343,6 +346,10 @@ class TestPDServingEngine(unittest.TestCase):
 
     def test_shared_transfer_ack_is_piggybacked_then_tail_is_flushed(self):
         class SharedCoordinator(FakePDCoordinator):
+            def __init__(self):
+                super().__init__()
+                self.completed_transfers = []
+
             def prefill_batch(self, envelopes, release_transfer_ids=()):
                 self.prefill_calls.append(list(envelopes))
                 self.prefill_release_calls.append(list(release_transfer_ids))
@@ -367,6 +374,10 @@ class TestPDServingEngine(unittest.TestCase):
 
             def admit_batch(self, handoffs):
                 self.admit_calls.append(list(handoffs))
+                self.completed_transfers.extend(
+                    {"transfer_id": handoff.descriptor.transfer_id}
+                    for handoff in handoffs
+                )
                 return [
                     {
                         "seq_id": 100 + handoff.request_id,
@@ -376,6 +387,11 @@ class TestPDServingEngine(unittest.TestCase):
                     }
                     for handoff in handoffs
                 ]
+
+            def collect_completed_transfers(self, wait=False):
+                completed = self.completed_transfers
+                self.completed_transfers = []
+                return completed
 
         coordinator = SharedCoordinator()
         engine = PDServingEngine(coordinator, prefill_batch_size=1)
@@ -391,8 +407,65 @@ class TestPDServingEngine(unittest.TestCase):
         )
         self.assertEqual(
             coordinator.explicit_release_calls,
-            [["transfer-1", "transfer-2"]],
+            [["transfer-1"], ["transfer-2"]],
         )
+
+    def test_shared_transfer_ack_is_deferred_until_decode_reports_import_completion(self):
+        class CompletionGatedCoordinator(FakePDCoordinator):
+            def __init__(self):
+                super().__init__()
+                self.import_complete = False
+
+            def prefill_batch(self, envelopes, release_transfer_ids=()):
+                self.prefill_calls.append(list(envelopes))
+                self.prefill_release_calls.append(list(release_transfer_ids))
+                return [
+                    SimpleNamespace(
+                        request_id=envelope.request_id,
+                        descriptor=SimpleNamespace(
+                            transport="shared_slot",
+                            transfer_id=f"transfer-{envelope.request_id}",
+                            slot_id=0,
+                            slot_generation=1,
+                        ),
+                        prefill_timing_ms={},
+                    )
+                    for envelope in envelopes
+                ]
+
+            def admit_batch(self, handoffs):
+                self.admit_calls.append(list(handoffs))
+                return [
+                    {
+                        "seq_id": 100 + handoff.request_id,
+                        "finished": False,
+                        "output_token_ids": None,
+                        "transfer_id": handoff.descriptor.transfer_id,
+                    }
+                    for handoff in handoffs
+                ]
+
+            def collect_completed_transfers(self, wait=False):
+                if self.import_complete:
+                    self.import_complete = False
+                    return [{"transfer_id": "transfer-0"}]
+                return []
+
+        coordinator = CompletionGatedCoordinator()
+        engine = PDServingEngine(coordinator, prefill_batch_size=1)
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+
+        engine.step()
+        engine.step()
+
+        self.assertEqual(coordinator.explicit_release_calls, [])
+        self.assertFalse(engine.is_finished())
+
+        coordinator.import_complete = True
+        engine.step()
+
+        self.assertEqual(coordinator.explicit_release_calls, [["transfer-0"]])
+        self.assertTrue(engine.is_finished())
 
     def test_abort_pending_request_is_idempotent_and_reported(self):
         coordinator = FakePDCoordinator()
@@ -527,7 +600,7 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual(request["status"], "failed")
         self.assertIn("decode exploded", request["failure_reason"])
 
-    def test_admission_failure_releases_unconsumed_shared_transfer(self):
+    def test_admission_failure_does_not_reuse_a_possibly_inflight_shared_transfer(self):
         class FailingAdmissionCoordinator(FakePDCoordinator):
             def prefill_batch(self, envelopes, release_transfer_ids=()):
                 return [
@@ -554,7 +627,7 @@ class TestPDServingEngine(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "admission exploded"):
             engine.step()
 
-        self.assertEqual(coordinator.explicit_release_calls, [["transfer-0"]])
+        self.assertEqual(coordinator.explicit_release_calls, [])
         self.assertTrue(engine.is_finished())
 
     def test_transfer_release_failure_does_not_mask_admission_failure(self):

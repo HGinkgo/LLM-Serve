@@ -296,6 +296,12 @@ class PDCoordinator:
     def decode_step(self):
         return self._call("decode", {"type": "step"})
 
+    def collect_completed_transfers(self, *, wait: bool = False):
+        return self._call(
+            "decode",
+            {"type": "collect_completed_transfers", "wait": bool(wait)},
+        )
+
     def abort_decode_request(self, seq_id: int) -> bool:
         return bool(
             self._call(

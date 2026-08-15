@@ -67,6 +67,35 @@ class FakeDecodeEngine:
         return True
 
 
+class FakeKVImportCompletion:
+
+    def __init__(self):
+        self.ready = False
+        self.waited = False
+
+    def is_complete(self):
+        return self.ready
+
+    def wait_on_current_stream(self):
+        self.waited = True
+
+    def elapsed_ms(self):
+        if not self.ready:
+            raise RuntimeError("completion timing is unavailable before completion")
+        return 1.25
+
+
+class CompletionAwareDecodeEngine(FakeDecodeEngine):
+
+    def __init__(self):
+        super().__init__()
+        self.completion = FakeKVImportCompletion()
+
+    def get_prefilled_import_completion(self, seq_id):
+        self.calls.append(("get_prefilled_import_completion", seq_id))
+        return self.completion
+
+
 class FakeBatchPrefillScheduler:
 
     def __init__(self):
@@ -305,6 +334,61 @@ class TestPDRuntime(unittest.TestCase):
             [handoff.descriptor.transfer_id for handoff in handoffs]
         )
         self.assertEqual(pool.stats()["free_slots"], 2)
+
+    def test_shared_slot_ack_waits_for_target_import_completion(self):
+        payload = torch.zeros(2, 1, 4, 1, 2)
+        pool = SharedKVSlotPool.create(
+            slot_count=2,
+            capacity_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+        )
+        lease = pool.acquire(4)
+        descriptor = KVTransferDescriptor(
+            request_id=7,
+            transfer_id="transfer-1",
+            num_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype="float32",
+            block_size=4,
+            payload_nbytes=payload.numel() * payload.element_size(),
+            transport="shared_slot",
+            slot_id=lease.slot_id,
+            slot_generation=lease.generation,
+            token_offset=0,
+        )
+        pool.mark_ready(lease, {descriptor.transfer_id})
+        handoff = PrefillHandoff(
+            envelope=RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True),
+            first_token_id=77,
+            descriptor=descriptor,
+        )
+        decode_engine = CompletionAwareDecodeEngine()
+        runtime = DecodeWorkerRuntime(
+            decode_engine,
+            slot_reader=SharedKVSlotReader(pool.handle, register_cuda=False),
+        )
+
+        admission = runtime.admit(handoff)
+
+        self.assertEqual(admission["transfer_id"], "transfer-1")
+        self.assertEqual(runtime.collect_completed_transfers(), [])
+        self.assertTrue(decode_engine.completion.waited)
+
+        decode_engine.completion.ready = True
+        completions = runtime.collect_completed_transfers()
+
+        self.assertEqual([item["transfer_id"] for item in completions], ["transfer-1"])
+        self.assertEqual(completions[0]["kv_import_gpu_ms"], 1.25)
+        self.assertIn(
+            "t_kv_import_completion_observed",
+            completions[0]["telemetry"],
+        )
 
     def test_prefill_runtime_completes_partial_chunks_before_handoff(self):
         engine = FakeChunkedPrefillEngine()

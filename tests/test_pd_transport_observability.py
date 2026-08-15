@@ -182,6 +182,40 @@ class PDTransportObservabilityReportTests(unittest.TestCase):
                 "prefill", "decode",
             })
 
+    def test_report_distinguishes_cuda_event_duration_from_host_observation(self):
+        from benchmarks.pd_transport_observability import build_report
+
+        with tempfile.TemporaryDirectory() as directory:
+            results_dir = Path(directory)
+            runs = results_dir / "runs"
+            runs.mkdir()
+            (results_dir / "manifest.json").write_text(json.dumps({
+                "complete": True,
+                "git_commit": "abc123",
+                "completed_points": 1,
+                "total_points": 1,
+            }))
+            result = _result(1)
+            timeline = result["requests"][0]["timeline"]
+            timeline.update({
+                "t_kv_import_enqueued": 1.50,
+                "t_kv_import_completion_observed": 1.60,
+                "kv_import_gpu_ms": 2.5,
+            })
+            (runs / "run-1.json").write_text(json.dumps(result))
+
+            report = build_report(results_dir).read_text()
+
+            self.assertIn("target-side CUDA Event", report)
+            self.assertIn("does not claim copy/compute overlap", report)
+            with (results_dir / "request_transport_timeline.csv").open() as input_file:
+                row = next(csv.DictReader(input_file))
+            self.assertEqual(float(row["kv_import_gpu_ms"]), 2.5)
+            self.assertAlmostEqual(
+                float(row["kv_import_completion_observed_after_enqueue_ms"]),
+                100.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

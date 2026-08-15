@@ -75,6 +75,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",
                 "pd-transport-observability.json",
+                "pd-transport-v2-telemetry.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
             },

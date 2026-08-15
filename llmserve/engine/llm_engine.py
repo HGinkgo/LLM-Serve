@@ -15,7 +15,7 @@ from llmserve.sampling_params import SamplingParams
 from llmserve.engine.sequence import Sequence
 from llmserve.engine.scheduler import Scheduler
 from llmserve.engine.model_runner import ModelRunner
-from llmserve.pd.kv_transfer import import_logical_kv
+from llmserve.pd.kv_transfer import KVImportCompletion, import_logical_kv
 
 
 class LLMEngine:
@@ -46,6 +46,8 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         self.request_metrics = {}
         self.last_step_events = {}
+        self._prefilled_import_stream = None
+        self._prefilled_import_completions: dict[int, KVImportCompletion] = {}
         self.speculative_batch_calls = 0
         self.speculative_batch_sequences = 0
         self.speculative_max_batch_size = 0
@@ -80,6 +82,9 @@ class LLMEngine:
         if self._exited:
             return
         self._exited = True
+        for completion in self._prefilled_import_completions.values():
+            completion.synchronize()
+        self._prefilled_import_completions.clear()
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -194,6 +199,8 @@ class LLMEngine:
         first_token_id: int,
         sampling_params: SamplingParams,
         kv_payload: torch.Tensor,
+        *,
+        async_kv_import: bool = False,
     ):
         """Admit a request after another worker has computed its prompt KV."""
         prompt_token_ids = list(prompt_token_ids)
@@ -202,14 +209,23 @@ class LLMEngine:
         self.scheduler.admit_prefilled(seq, cached_tokens=len(prompt_token_ids))
         admitted_at = perf_counter()
         try:
-            import_logical_kv(
+            completion = import_logical_kv(
                 self.model_runner.kv_cache,
                 seq.block_table,
                 kv_payload,
+                stream=(
+                    self._prefilled_import_stream_for_kv_cache()
+                    if async_kv_import
+                    else None
+                ),
+                non_blocking=True if async_kv_import else None,
             )
         except Exception:
             self.scheduler.remove_sequence(seq)
             raise
+
+        if completion is not None:
+            self._prefilled_import_completions[seq.seq_id] = completion
 
         now = perf_counter()
         metric = self._new_request_metric(seq, arrival_time=now)
@@ -221,9 +237,11 @@ class LLMEngine:
             self.last_prefilled_admission_telemetry = {
                 "t_decode_admitted": admitted_at,
                 "t_handoff_finish": now,
+                "t_kv_import_enqueued": now,
                 "writers": {
                     "t_decode_admitted": "decode_worker.scheduler",
-                    "t_handoff_finish": "decode_worker.kv_import",
+                    "t_handoff_finish": "decode_worker.kv_import_enqueue",
+                    "t_kv_import_enqueued": "decode_worker.kv_import_enqueue",
                 },
             }
         self.request_metrics[seq.seq_id] = metric
@@ -237,6 +255,30 @@ class LLMEngine:
             metric["success"] = True
             self.scheduler.remove_sequence(seq)
         return seq.seq_id
+
+    def _prefilled_import_stream_for_kv_cache(self):
+        kv_cache = self.model_runner.kv_cache
+        if kv_cache.device.type != "cuda":
+            raise RuntimeError("asynchronous KV import requires a CUDA KV cache")
+        stream = self._prefilled_import_stream
+        if stream is None or stream.device != kv_cache.device:
+            stream = torch.cuda.Stream(device=kv_cache.device)
+            self._prefilled_import_stream = stream
+        return stream
+
+    def get_prefilled_import_completion(self, seq_id: int):
+        return self._prefilled_import_completions.get(seq_id)
+
+    def complete_prefilled_import(self, seq_id: int):
+        return self._prefilled_import_completions.pop(seq_id, None)
+
+    def _wait_for_prefilled_imports(self):
+        for completion in getattr(
+            self,
+            "_prefilled_import_completions",
+            {},
+        ).values():
+            completion.wait_on_current_stream()
 
     @staticmethod
     def _build_speculative_trace_entry(
@@ -282,6 +324,7 @@ class LLMEngine:
         }
 
     def step(self):
+        self._wait_for_prefilled_imports()
         step_start = perf_counter()
         scheduler_output = self.scheduler.schedule()
         seqs = scheduler_output.scheduled_seqs

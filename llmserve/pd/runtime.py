@@ -385,6 +385,7 @@ class DecodeWorkerRuntime:
     def __init__(self, engine, slot_reader: SharedKVSlotReader | None = None):
         self.engine = engine
         self.slot_reader = slot_reader
+        self._pending_shared_transfers: dict[str, dict] = {}
 
     def attach_shared_slots(self, handle):
         if self.slot_reader is not None:
@@ -393,6 +394,51 @@ class DecodeWorkerRuntime:
 
     def abort_request(self, seq_id: int) -> bool:
         return self.engine.abort_request(seq_id)
+
+    def collect_completed_transfers(self, *, wait: bool = False) -> list[dict]:
+        """Return only shared slots whose target H2D and scatter have completed."""
+        completed = []
+        for transfer_id, pending in list(self._pending_shared_transfers.items()):
+            completion = pending["completion"]
+            if completion is not None:
+                if wait:
+                    synchronize = getattr(completion, "synchronize", None)
+                    if synchronize is not None:
+                        synchronize()
+                if not completion.is_complete():
+                    continue
+                gpu_ms = completion.elapsed_ms()
+            else:
+                gpu_ms = None
+            observed_at = perf_counter()
+            telemetry = {
+                # CUDA Event establishes the true device dependency. This host
+                # timestamp only says when the worker observed it complete.
+                "t_kv_import_completion_observed": observed_at,
+                "kv_import_gpu_ms": gpu_ms,
+                "writers": {
+                    "t_kv_import_completion_observed": "decode_worker.cuda_event_query",
+                },
+            }
+            completed.append({
+                "transfer_id": transfer_id,
+                "seq_id": pending["seq_id"],
+                "telemetry": telemetry,
+                "kv_import_gpu_ms": gpu_ms,
+            })
+            complete_import = getattr(
+                self.engine,
+                "complete_prefilled_import",
+                None,
+            )
+            if complete_import is not None:
+                complete_import(pending["seq_id"])
+            del self._pending_shared_transfers[transfer_id]
+        return completed
+
+    def step(self):
+        outputs, num_tokens = self.engine.step()
+        return outputs, num_tokens, self.collect_completed_transfers()
 
     def admit_batch(self, handoffs: list[PrefillHandoff]) -> list[dict]:
         handoffs = list(handoffs)
@@ -428,11 +474,16 @@ class DecodeWorkerRuntime:
             kv_payload = handoff.kv_payload
             slot_consuming_at = None
         admission_started_at = perf_counter() if telemetry_enabled else None
+        async_kv_import = (
+            handoff.descriptor.transport == "shared_slot"
+            and hasattr(self.engine, "get_prefilled_import_completion")
+        )
         seq_id = self.engine.add_prefilled_request(
             list(handoff.envelope.prompt_token_ids),
             handoff.first_token_id,
             sampling_params,
             kv_payload,
+            **({"async_kv_import": True} if async_kv_import else {}),
         )
         admission_returned_at = perf_counter() if telemetry_enabled else None
         telemetry = dict(
@@ -467,6 +518,20 @@ class DecodeWorkerRuntime:
         }
         if handoff.descriptor.transport == "shared_slot":
             admission["transfer_id"] = handoff.descriptor.transfer_id
+            completion = None
+            get_completion = getattr(
+                self.engine,
+                "get_prefilled_import_completion",
+                None,
+            )
+            if get_completion is not None:
+                completion = get_completion(seq_id)
+                if completion is not None:
+                    completion.wait_on_current_stream()
+            self._pending_shared_transfers[handoff.descriptor.transfer_id] = {
+                "seq_id": seq_id,
+                "completion": completion,
+            }
         if telemetry:
             admission["telemetry"] = telemetry
         return admission

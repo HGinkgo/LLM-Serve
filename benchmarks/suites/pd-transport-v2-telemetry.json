@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "name": "pd-transport-v2-telemetry",
+  "runs": 3,
+  "execution_order_seed": 20260815,
+  "profiles": {
+    "decode-heavy": {
+      "classes": [
+        {
+          "name": "decode",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 64
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "pd-transport-v2-telemetry",
+      "arrival": "closed-loop",
+      "profile": "decode-heavy",
+      "max_concurrencies": [64],
+      "warmup_seconds": 30,
+      "measurement_seconds": 60,
+      "variants": [
+        {
+          "name": "pd-shared-event-ack",
+          "pd": true,
+          "prefill_gpu": 0,
+          "decode_gpu": 1,
+          "prefill_batch_size": 4,
+          "prefill_enforce_eager": true,
+          "decode_enforce_eager": false,
+          "kv_slot_count": 2,
+          "kv_slot_capacity_tokens": 1024
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "sample_gpu_clocks": true,
+        "random_seed": 20260814,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9
+      },
+      "slo_ms": {
+        "ttft": 10000,
+        "tpot": 250,
+        "e2e": 120000
+      }
+    }
+  ]
+}

@@ -38,6 +38,7 @@ class PDServingEngine:
         self._prefill_future: Future | None = None
         self._prefill_future_meta: dict | None = None
         self._pending_transfer_acks: list[str] = []
+        self._awaiting_transfer_completions: dict[str, int] = {}
         self._slot_release_samples: list[dict] = []
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
@@ -157,6 +158,39 @@ class PDServingEngine:
             }
         )
 
+    def _record_completed_transfers(self, completions):
+        for completion in completions:
+            transfer_id = completion.get("transfer_id")
+            request_id = self._awaiting_transfer_completions.pop(transfer_id, None)
+            if request_id is None:
+                raise RuntimeError("Decode Worker completed an unknown shared transfer")
+            self._pending_transfer_acks.append(transfer_id)
+            if not self.enable_latency_telemetry:
+                continue
+            request = self._requests.get(request_id)
+            if request is None:
+                raise RuntimeError("completed shared transfer has no request")
+            timeline = request.get("timeline") or {}
+            request["timeline"] = timeline
+            telemetry = completion.get("telemetry") or {}
+            timeline.update({
+                key: telemetry.get(key)
+                for key in (
+                    "t_kv_import_completion_observed",
+                )
+                if telemetry.get(key) is not None
+            })
+            if telemetry.get("kv_import_gpu_ms") is not None:
+                timeline["kv_import_gpu_ms"] = telemetry["kv_import_gpu_ms"]
+            timeline.setdefault("writers", {}).update(
+                telemetry.get("writers") or {}
+            )
+
+    def _collect_completed_transfer_acks(self, *, wait: bool = False):
+        collector = getattr(self.coordinator, "collect_completed_transfers", None)
+        if collector is not None:
+            self._record_completed_transfers(collector(wait=wait))
+
     def _collect_prefill(self):
         future = self._prefill_future
         if future is None or not future.done():
@@ -192,14 +226,9 @@ class PDServingEngine:
                 else []
             )
         except Exception:
-            for handoff in admitted_handoffs:
-                descriptor = getattr(handoff, "descriptor", None)
-                if getattr(descriptor, "transport", "inline") == "shared_slot":
-                    self._pending_transfer_acks.append(descriptor.transfer_id)
-            try:
-                self._flush_transfer_acks()
-            except Exception:
-                pass
+            # A failed admission can already own asynchronous H2D work. Its
+            # source slot must remain unavailable until Decode teardown drains
+            # the target CUDA Event.
             raise
         admit_finished_at = perf_counter()
         decode_rpc_timing = (
@@ -246,6 +275,7 @@ class PDServingEngine:
                         "t_decode_admitted",
                         "t_handoff_finish",
                         "t_decode_admission_returned",
+                        "t_kv_import_enqueued",
                     )
                     if admission.get("telemetry", {}).get(key) is not None
                 })
@@ -257,7 +287,7 @@ class PDServingEngine:
                 transfer_id = admission.get("transfer_id")
                 if transfer_id != descriptor.transfer_id:
                     raise RuntimeError("Decode Worker returned an invalid transfer ACK")
-                self._pending_transfer_acks.append(transfer_id)
+                self._awaiting_transfer_completions[transfer_id] = request_id
             if admission.get("finished"):
                 request["finished_without_step"] = list(
                     admission.get("output_token_ids") or ()
@@ -401,6 +431,7 @@ class PDServingEngine:
         self._pending.clear()
         self._active_by_decode_seq.clear()
         self._pending_transfer_acks.clear()
+        self._awaiting_transfer_completions.clear()
         if self._prefill_future is not None and (
             self._prefill_future.done() or self._prefill_future.cancel()
         ):
@@ -435,6 +466,8 @@ class PDServingEngine:
             self._collect_prefill()
             self._start_prefill()
 
+        self._collect_completed_transfer_acks()
+
         if not self._active_by_decode_seq:
             if self._prefill_future is not None:
                 wait_started_at = perf_counter()
@@ -448,6 +481,8 @@ class PDServingEngine:
                 self._collect_prefill()
                 self._start_prefill()
             if not self._active_by_decode_seq:
+                if self._awaiting_transfer_completions:
+                    self._collect_completed_transfer_acks(wait=True)
                 self._flush_transfer_acks()
                 finished = []
                 for request_id, request in self._requests.items():
@@ -462,6 +497,7 @@ class PDServingEngine:
         result = self.coordinator.decode_step()
         decode_finished_at = perf_counter()
         raw_events = result.get("last_step_events") or {}
+        self._record_completed_transfers(result.get("completed_transfers") or ())
         if (
             active_decode_before_step
             and not raw_events.get("scheduled_seq_ids")
@@ -522,6 +558,7 @@ class PDServingEngine:
             and self._prefill_future is None
             and not self._active_by_decode_seq
             and not self._pending_transfer_acks
+            and not self._awaiting_transfer_completions
         )
 
     def reset_metrics(self):
@@ -531,6 +568,7 @@ class PDServingEngine:
             raise RuntimeError("cannot reset PD metrics while requests are active")
         self.coordinator.reset_decode_metrics()
         self._requests.clear()
+        self._awaiting_transfer_completions.clear()
         self._prefill_batches.clear()
         self._queue_samples.clear()
         self._decode_idle_intervals.clear()

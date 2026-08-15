@@ -12,7 +12,7 @@ from benchmarks.metrics import summarize_values
 from llmserve.pd.observability import DecodeIdleReason
 
 
-_TIMELINE_FIELDS = (
+_REQUIRED_TIMELINE_FIELDS = (
     "t_submit",
     "t_prefill_first_scheduled",
     "t_prefill_finish",
@@ -75,7 +75,11 @@ def _measurement_requests(result: dict):
     start, end = window.get("start"), window.get("end")
     for request in result.get("requests", []):
         timeline = request.get("timeline") or {}
-        missing = [name for name in _TIMELINE_FIELDS if timeline.get(name) is None]
+        missing = [
+            name
+            for name in _REQUIRED_TIMELINE_FIELDS
+            if timeline.get(name) is None
+        ]
         if missing:
             continue
         if start is not None and timeline["t_submit"] < start:
@@ -138,13 +142,25 @@ def _timeline_rows(results: list[dict]) -> list[dict]:
                 "kv_import_enqueue_wall_ms": _ms(
                     timeline["t_decode_admitted"], timeline["t_handoff_finish"]
                 ),
+                "kv_import_completion_observed_after_enqueue_ms": _ms(
+                    timeline.get("t_kv_import_enqueued"),
+                    timeline.get("t_kv_import_completion_observed"),
+                ),
+                "kv_import_gpu_ms": timeline.get("kv_import_gpu_ms"),
                 "decode_continuation_enqueue_ready_ms": _ms(
                     timeline["t_submit"],
                     timeline["t_decode_admission_returned"],
                 ),
                 "e2e_ms": _ms(timeline["t_submit"], timeline["t_finish"]),
             }
-            row.update({name: timeline[name] for name in _TIMELINE_FIELDS})
+            row.update({
+                name: timeline[name]
+                for name in _REQUIRED_TIMELINE_FIELDS
+            })
+            row["t_kv_import_enqueued"] = timeline.get("t_kv_import_enqueued")
+            row["t_kv_import_completion_observed"] = timeline.get(
+                "t_kv_import_completion_observed"
+            )
             rows.append(row)
     return rows
 
@@ -163,6 +179,8 @@ def _timeline_summary(rows: list[dict]) -> list[dict]:
         "decode_admission_wall_ms",
         "decode_scheduler_admit_ms",
         "kv_import_enqueue_wall_ms",
+        "kv_import_completion_observed_after_enqueue_ms",
+        "kv_import_gpu_ms",
         "decode_continuation_enqueue_ready_ms",
         "e2e_ms",
     )
@@ -324,6 +342,9 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
     if not timeline_rows:
         raise ValueError("no complete measurement-window transport timelines found")
     timeline_summary = _timeline_summary(timeline_rows)
+    has_target_completion_events = any(
+        row.get("kv_import_gpu_ms") is not None for row in timeline_rows
+    )
     idle_rows = _decode_idle_rows(results)
     slot_rows = _slot_rows(results)
     environment_rows = _slot_environment_rows(results)
@@ -347,7 +368,29 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
         f"{idle_totals[reason.value]['duration_ms']:.3f} ms total"
         for reason in DecodeIdleReason
     )
-    report = f"""# PD Transport Observability Baseline
+    completion_scope = (
+        "This run uses a target-side CUDA Event after H2D and paged-KV scatter. "
+        "`kv_import_gpu_ms` is the completed GPU Event duration. "
+        "`kv_import_completion_observed_after_enqueue_ms` ends when the Decode "
+        "Worker queried that completed Event; it is not a device-to-host timestamp "
+        "and must not be called raw H2D latency."
+        if has_target_completion_events
+        else "This is an observation baseline for the existing synchronous pinned-CPU "
+        "relay. It does not claim a transport optimization or a root cause for "
+        "end-to-end latency."
+    )
+    completion_limit = (
+        "Target H2D plus scatter has a safe Event completion boundary, but the "
+        "current command loop still serializes admission before the following Decode "
+        "step. This report does not claim copy/compute overlap; that needs a separate "
+        "pipeline experiment with stream timelines and critical-path comparison."
+        if has_target_completion_events
+        else "`kv_import_enqueue_wall_ms` ends when Decode's KV import call returns. "
+        "**H2D is enqueued, not completed.** This version has no CUDA Event completion "
+        "boundary and therefore cannot claim copy/compute overlap or use this timestamp "
+        "as a safe asynchronous ACK boundary."
+    )
+    report = f"""# PD Transport Observability {'v2' if has_target_completion_events else 'Baseline'}
 
 ## Scope
 
@@ -355,8 +398,7 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
 - Complete points: `{manifest.get('completed_points')}/{manifest.get('total_points')}`
 - Raw inputs: `runs/*.json`; derived files in this directory preserve those inputs unchanged.
 
-This is an observation baseline for the existing synchronous pinned-CPU relay. It
-does not claim a transport optimization or a root cause for end-to-end latency.
+{completion_scope}
 
 ## Reproduction
 
@@ -372,7 +414,7 @@ does not claim a transport optimization or a root cause for end-to-end latency.
 `decode_continuation_enqueue_ready_ms` is a handoff diagnostic, not part of
 first-token latency.
 
-`kv_import_enqueue_wall_ms` ends when Decode's KV import call returns. **H2D is enqueued, not completed.** This version has no CUDA Event completion boundary and therefore cannot claim copy/compute overlap or use this timestamp as a safe asynchronous ACK boundary.
+{completion_limit}
 
 ## Decode Idle Reasons
 
@@ -397,12 +439,11 @@ experiment.
 
 ## Limits and Next Gate
 
-The current relay synchronizes source-side D2H export. Before changing slot
-count or adding Prefill workers, the next implementation must add stream-aware
-CUDA Events, defer slot ACK until target-side H2D and scatter are complete, and
-report copy/compute overlap plus critical-path reduction. Only then can this
-dataset decide whether Decode starvation is due to Prefill supply, KV import, or
-scheduler behavior.
+The source relay still synchronizes D2H export. Do not change slot count or add
+Prefill workers until a separate pipeline experiment reports actual
+copy/compute overlap and critical-path reduction. Only then can the data decide
+whether Decode starvation is due to Prefill supply, KV import, or scheduler
+behavior.
 """
     report_path = results_dir / "pd_transport_observability_report.md"
     report_path.write_text(report)
