@@ -82,11 +82,30 @@ def _result(variant, run, *, pd=False):
             "cuda_peer_access": {"0->1": True, "1->0": True},
             "nvidia_smi_topology": "GPU0 GPU1 PHB",
         },
-        "config": {"variant": variant, "run": run, "runtime": runtime},
+        "config": {
+            "variant": variant,
+            "run": run,
+            "runtime": runtime,
+            "workload_seed": run,
+            "workload": {
+                "classes": [{
+                    "name": "decode",
+                    "weight": 1,
+                    "input_len": 128,
+                    "output_len": 64,
+                }],
+            },
+        },
         "metrics": {
             "throughput": {
                 "requests_per_second": 4.0,
                 "output_tokens_per_second": 256.0,
+            },
+            "cuda_graph": {
+                "enabled": True,
+                "captured_graphs": 12,
+                "replays": 100 + run,
+                "fallbacks": {"prefill": 1},
             },
             "pd": pd_metrics,
         },
@@ -200,6 +219,17 @@ class StrongBaselineReportTests(unittest.TestCase):
             self.assertIn("Engine TTFT", report)
             self.assertIn("not a client-receipt timestamp", report)
             self.assertIn("complete deployment comparison", report)
+            self.assertIn(
+                "## First-token and PD continuation diagnostics",
+                report,
+            )
+            self.assertIn("Prefill queue wait P50/P99", report)
+            self.assertIn("decode_continuation_ready_ms", report)
+            self.assertNotIn("TTFT Diagnostic Breakdown", report)
+            self.assertIn("## Measurement Window and Sample Rules", report)
+            self.assertIn("## Decode-first and CUDA Graph Evidence", report)
+            self.assertIn("## Report Revision", report)
+            self.assertIn("deterministically from the same per-run seed", report)
             self.assertNotIn("Inline Queue", report)
             timeline_path = results_dir / "request_timeline.csv"
             with timeline_path.open() as input_file:
@@ -208,6 +238,14 @@ class StrongBaselineReportTests(unittest.TestCase):
             self.assertAlmostEqual(float(rows[0]["engine_ttft_ms"]), 11.0)
             self.assertTrue((results_dir / "pd_handoff.csv").exists())
             self.assertTrue((results_dir / "scheduler_steps.csv").exists())
+            trace_audit = json.loads(
+                (results_dir / "request_trace_audit.json").read_text()
+            )
+            self.assertEqual(trace_audit["generator"], "iter_request_specs")
+            self.assertEqual(trace_audit["runs"][0]["workload_seed"], 0)
+            self.assertEqual(
+                trace_audit["runs"][0]["shared_request_count"], 1
+            )
 
     def test_report_rejects_inline_or_unreleased_shared_transport(self):
         from benchmarks.pd_strong_baseline import build_report
@@ -227,6 +265,111 @@ class StrongBaselineReportTests(unittest.TestCase):
                 (runs / f"shared-{run}.json").write_text(json.dumps(result))
             with self.assertRaisesRegex(ValueError, "inline"):
                 build_report(results_dir)
+
+    def test_report_distinguishes_enabled_from_actual_main_chunks(self):
+        from benchmarks.pd_strong_baseline import build_report
+
+        with tempfile.TemporaryDirectory() as directory:
+            results_dir = Path(directory) / "results"
+            runs = results_dir / "runs"
+            runs.mkdir(parents=True)
+            (results_dir / "manifest.json").write_text(json.dumps({
+                "complete": True,
+                "git_commit": "abc123",
+                "model": "Qwen3-8B",
+                "model_revision": "revision",
+                "execution_order": [],
+            }))
+            for variant, pd in (("strong-collocated", False), ("pd-shared", True)):
+                for run in range(3):
+                    result = _result(variant, run, pd=pd)
+                    (runs / f"{result['point_id']}.json").write_text(
+                        json.dumps(result)
+                    )
+
+            validation_dir = Path(directory) / "chunked-validation"
+            validation_runs = validation_dir / "runs"
+            validation_runs.mkdir(parents=True)
+            validation = _result("strong-collocated", 0)
+            validation["config"]["workload"]["classes"] = [
+                {"name": "short", "weight": 0.8, "input_len": 128, "output_len": 64},
+                {"name": "long", "weight": 0.2, "input_len": 2048, "output_len": 64},
+            ]
+            validation["config"]["runtime"]["max_model_len"] = 2304
+            validation["telemetry"]["effective_runtime"] = {
+                "kind": "collocated",
+                "engine_config": dict(validation["config"]["runtime"]),
+            }
+            validation["metrics"]["kv_cache"] = {
+                "total_blocks": 146,
+                "peak_reserved_blocks": 64,
+            }
+            validation["requests"][0]["request_class"] = "short"
+            validation["requests"][0]["engine_ttft_ms"] = 11.0
+            validation["telemetry"]["scheduler_steps"][0].update({
+                "prefill_chunk_lengths": [768],
+                "partial_prefill_chunk_count": 1,
+            })
+            warmup_request = json.loads(json.dumps(validation["requests"][0]))
+            warmup_request["engine_ttft_ms"] = 999.0
+            warmup_request["timeline"].update({
+                "t_submit": 1.0,
+                "t_prefill_first_scheduled": 1.001,
+                "t_prefill_finish": 1.011,
+                "t_first_token": 1.011,
+                "t_handoff_finish": 1.011,
+                "t_decode_admitted": 1.011,
+                "t_finish": 1.050,
+            })
+            validation["requests"].append(warmup_request)
+            (validation_runs / "validation.json").write_text(json.dumps(validation))
+
+            report = build_report(
+                results_dir,
+                chunked_results_dir=validation_dir,
+            ).read_text()
+
+            self.assertIn(
+                "A recorded actual partial chunks per run: **[0, 0, 0]**",
+                report,
+            )
+            self.assertIn("partial chunks: **1**", report)
+            self.assertIn("Mixed prefill/decode rounds: **1**", report)
+            self.assertIn(
+                "Short requests: Engine TTFT P50/P99 = 11.00/11.00 ms",
+                report,
+            )
+
+    def test_report_formats_multiple_reproduction_commands_as_a_code_block(self):
+        from benchmarks.pd_strong_baseline import build_report
+
+        with tempfile.TemporaryDirectory() as directory:
+            results_dir = Path(directory) / "results"
+            runs = results_dir / "runs"
+            runs.mkdir(parents=True)
+            (results_dir / "manifest.json").write_text(json.dumps({
+                "complete": True,
+                "git_commit": "abc123",
+                "model": "Qwen3-8B",
+                "model_revision": "revision",
+                "execution_order": [],
+            }))
+            for variant, pd in (("strong-collocated", False), ("pd-shared", True)):
+                for run in range(3):
+                    result = _result(variant, run, pd=pd)
+                    (runs / f"{result['point_id']}.json").write_text(
+                        json.dumps(result)
+                    )
+
+            report = build_report(
+                results_dir,
+                reproduction_command="first-command\nsecond-command",
+            ).read_text()
+
+            self.assertIn(
+                "## Reproduction\n\n```bash\nfirst-command\nsecond-command\n```",
+                report,
+            )
 
 
 if __name__ == "__main__":
