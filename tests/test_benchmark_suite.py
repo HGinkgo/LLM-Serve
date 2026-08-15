@@ -72,6 +72,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "formal-poisson.json",
                 "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
+                "pd-decode-pool-formal.json",
                 "pd-decode-pool-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",
@@ -153,6 +154,22 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     ["tcp://127.0.0.1:24532", "tcp://127.0.0.1:24533"],
                 )
                 self.assertTrue(point["runtime"]["enable_pd_transport_overlap"])
+            if path.name == "pd-decode-pool-formal.json":
+                self.assertEqual(suite["runs"], 3)
+                self.assertEqual(len(points), 24)
+                self.assertEqual(
+                    {point["max_concurrency"] for point in points},
+                    {32, 64, 96, 128},
+                )
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"pd-shared-1p1d", "pd-shared-1p2d"},
+                )
+                for point in points:
+                    self.assertTrue(point["runtime"]["pd"])
+                    self.assertEqual(point["runtime"]["prefill_batch_size"], 4)
+                    self.assertFalse(point["runtime"]["decode_enforce_eager"])
+                    self.assertTrue(point["runtime"]["enable_pd_transport_overlap"])
             if path.name.startswith("formal-"):
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 36)
