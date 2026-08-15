@@ -35,7 +35,7 @@ class PrefillHandoff:
             raise ValueError("KV handoff request id does not match its envelope")
         if (
             self.descriptor.source_worker != "prefill"
-            or self.descriptor.target_worker != "decode"
+            or self.descriptor.target_worker != self.envelope.target_worker
         ):
             raise ValueError("KV handoff has an invalid worker direction")
         if self.descriptor.transport == "shared_slot":

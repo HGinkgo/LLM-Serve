@@ -255,6 +255,39 @@ class TestPDRuntime(unittest.TestCase):
             payload_nbytes=payload.numel() * payload.element_size(),
         )
 
+    def test_handoff_requires_the_envelope_target_decode_worker(self):
+        payload = torch.zeros(2, 1, 2, 1, 2)
+        envelope = RequestEnvelope(
+            request_id=7,
+            prompt_token_ids=(1, 2),
+            max_tokens=4,
+            temperature=1.0,
+            ignore_eos=True,
+            target_worker="decode-1",
+        )
+        descriptor = KVTransferDescriptor(
+            request_id=7,
+            transfer_id="transfer-7",
+            num_tokens=2,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype="float32",
+            block_size=4,
+            payload_nbytes=payload.numel() * payload.element_size(),
+            target_worker="decode-1",
+        )
+
+        handoff = PrefillHandoff(
+            envelope=envelope,
+            first_token_id=3,
+            descriptor=descriptor,
+            kv_payload=payload,
+        )
+
+        self.assertEqual(handoff.descriptor.target_worker, "decode-1")
+        self.assertEqual(handoff.envelope.target_worker, "decode-1")
+
     def test_prefill_runtime_exports_complete_prompt_and_first_token(self):
         prompt = [1, 2, 3, 4]
         engine = FakePrefillEngine(prompt)

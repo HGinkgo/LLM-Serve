@@ -62,6 +62,56 @@ class TestPDConfig(unittest.TestCase):
         self.assertTrue(config.engine_kwargs_for("prefill")["enforce_eager"])
         self.assertFalse(config.engine_kwargs_for("decode")["enforce_eager"])
 
+    def test_config_assigns_unique_roles_and_endpoints_to_decode_pool(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            decode_gpus=(1, 2),
+            prefill_init_method="tcp://127.0.0.1:24431",
+            decode_init_methods=(
+                "tcp://127.0.0.1:24432",
+                "tcp://127.0.0.1:24433",
+            ),
+            decode_enforce_eager=False,
+        )
+
+        self.assertEqual(config.decode_worker_ids, ("decode-0", "decode-1"))
+        self.assertEqual(
+            config.worker_specs(),
+            (
+                ("prefill", 0, "tcp://127.0.0.1:24431"),
+                ("decode-0", 1, "tcp://127.0.0.1:24432"),
+                ("decode-1", 2, "tcp://127.0.0.1:24433"),
+            ),
+        )
+        self.assertFalse(config.engine_kwargs_for("decode-1")["enforce_eager"])
+        self.assertEqual(
+            config.engine_kwargs_for("decode-1")["distributed_init_method"],
+            "tcp://127.0.0.1:24433",
+        )
+
+    def test_config_rejects_duplicate_decode_pool_gpu_or_endpoint(self):
+        with self.assertRaisesRegex(ValueError, "unique"):
+            PDConfig(
+                model="/models/qwen3",
+                prefill_gpu=0,
+                decode_gpu=1,
+                decode_gpus=(1, 1),
+            )
+
+        with self.assertRaisesRegex(ValueError, "different"):
+            PDConfig(
+                model="/models/qwen3",
+                prefill_gpu=0,
+                decode_gpu=1,
+                decode_gpus=(1, 2),
+                decode_init_methods=(
+                    "tcp://127.0.0.1:24432",
+                    "tcp://127.0.0.1:24432",
+                ),
+            )
+
     def test_shared_slot_config_is_transport_only_and_validated(self):
         config = PDConfig(
             model="/models/qwen3",

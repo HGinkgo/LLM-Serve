@@ -20,22 +20,46 @@ class PDConfig:
     model: str
     prefill_gpu: int
     decode_gpu: int
+    decode_gpus: tuple[int, ...] = ()
     prefill_enforce_eager: bool = True
     decode_enforce_eager: bool = True
     prefill_init_method: str = "tcp://127.0.0.1:24431"
     decode_init_method: str = "tcp://127.0.0.1:24432"
+    decode_init_methods: tuple[str, ...] = ()
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
     request_timeout_seconds: float = 120.0
     kv_slot_count: int = 2
     kv_slot_capacity_tokens: int = 1024
 
     def __post_init__(self):
-        if self.prefill_gpu < 0 or self.decode_gpu < 0:
+        decode_gpus = tuple(self.decode_gpus) or (self.decode_gpu,)
+        if (
+            not all(isinstance(gpu_id, int) for gpu_id in decode_gpus)
+            or self.prefill_gpu < 0
+            or any(gpu_id < 0 for gpu_id in decode_gpus)
+        ):
             raise ValueError("worker GPU ids must be non-negative")
-        if self.prefill_gpu == self.decode_gpu:
+        if self.decode_gpu != decode_gpus[0]:
+            raise ValueError("decode_gpu must match the first decode_gpus entry")
+        if len(set(decode_gpus)) != len(decode_gpus):
+            raise ValueError("decode worker GPUs must be unique")
+        if self.prefill_gpu in decode_gpus:
             raise ValueError("Prefill and Decode workers require different GPUs")
-        if self.prefill_init_method == self.decode_init_method:
+
+        decode_init_methods = tuple(self.decode_init_methods)
+        if not decode_init_methods:
+            decode_init_methods = self._derive_decode_init_methods(len(decode_gpus))
+        if len(decode_init_methods) != len(decode_gpus):
+            raise ValueError(
+                "decode_init_methods must contain one endpoint per decode worker"
+            )
+        if len(set((self.prefill_init_method, *decode_init_methods))) != (
+            1 + len(decode_init_methods)
+        ):
             raise ValueError("worker distributed endpoints must be different")
+        self.decode_gpus = decode_gpus
+        self.decode_init_methods = decode_init_methods
+        self.decode_init_method = decode_init_methods[0]
         if self.request_timeout_seconds <= 0:
             raise ValueError("request timeout must be positive")
         if (
@@ -50,6 +74,40 @@ class PDConfig:
         ):
             raise ValueError("KV slot capacity must be a positive integer")
 
+    def _derive_decode_init_methods(self, count: int) -> tuple[str, ...]:
+        if count == 1:
+            return (self.decode_init_method,)
+        prefix, separator, raw_port = self.decode_init_method.rpartition(":")
+        if not separator:
+            raise ValueError(
+                "multiple Decode workers require explicit decode_init_methods"
+            )
+        try:
+            first_port = int(raw_port)
+        except ValueError as error:
+            raise ValueError(
+                "multiple Decode workers require explicit decode_init_methods"
+            ) from error
+        return tuple(f"{prefix}:{first_port + index}" for index in range(count))
+
+    @property
+    def decode_worker_ids(self) -> tuple[str, ...]:
+        if len(self.decode_gpus) == 1:
+            return ("decode",)
+        return tuple(f"decode-{index}" for index in range(len(self.decode_gpus)))
+
+    def worker_specs(self) -> tuple[tuple[str, int, str], ...]:
+        return (
+            ("prefill", self.prefill_gpu, self.prefill_init_method),
+            *tuple(
+                zip(
+                    self.decode_worker_ids,
+                    self.decode_gpus,
+                    self.decode_init_methods,
+                )
+            ),
+        )
+
     def transport_config(self) -> dict[str, int]:
         return {
             "slot_count": self.kv_slot_count,
@@ -57,8 +115,11 @@ class PDConfig:
         }
 
     def engine_kwargs_for(self, role: str) -> dict[str, Any]:
-        if role not in {"prefill", "decode"}:
+        if role != "prefill" and role not in self.decode_worker_ids:
             raise ValueError(f"unsupported PD worker role: {role}")
+        decode_index = (
+            self.decode_worker_ids.index(role) if role != "prefill" else None
+        )
         kwargs = dict(self.engine_kwargs)
         kwargs.update(
             tensor_parallel_size=1,
@@ -72,7 +133,7 @@ class PDConfig:
             distributed_init_method=(
                 self.prefill_init_method
                 if role == "prefill"
-                else self.decode_init_method
+                else self.decode_init_methods[decode_index]
             ),
         )
         return kwargs

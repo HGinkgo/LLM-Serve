@@ -35,6 +35,7 @@ class RequestEnvelope:
     max_tokens: int
     temperature: float
     ignore_eos: bool
+    target_worker: str = "decode"
 
     def __post_init__(self):
         if not isinstance(self.request_id, int) or isinstance(self.request_id, bool):
@@ -52,6 +53,8 @@ class RequestEnvelope:
             raise ValueError("max_tokens must be positive")
         if self.temperature <= 1e-10:
             raise ValueError("temperature must be positive")
+        if not isinstance(self.target_worker, str) or not self.target_worker:
+            raise ValueError("target_worker must be a non-empty string")
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -60,6 +63,7 @@ class RequestEnvelope:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "ignore_eos": self.ignore_eos,
+            "target_worker": self.target_worker,
         }
 
     @classmethod
@@ -71,6 +75,7 @@ class RequestEnvelope:
                 max_tokens=payload["max_tokens"],
                 temperature=payload["temperature"],
                 ignore_eos=payload["ignore_eos"],
+                target_worker=payload.get("target_worker", "decode"),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid request envelope payload") from error

@@ -32,6 +32,7 @@ class TestRequestEnvelope(unittest.TestCase):
                 "max_tokens": 16,
                 "temperature": 0.01,
                 "ignore_eos": True,
+                "target_worker": "decode",
             },
         )
 
