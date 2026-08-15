@@ -378,6 +378,9 @@ def run_point(
             metrics["speculative"][name] = engine_speculative[name]
     metrics["kv_cache"] = observation["engine_summary"].get("kv_cache", {})
     metrics["pd"] = observation["engine_summary"].get("pd", {})
+    decode_workers = observation["engine_summary"].get("decode_workers")
+    if decode_workers is not None:
+        metrics["pd"]["decode_workers"] = decode_workers
     metrics["cuda_graph"] = observation["engine_summary"].get(
         "cuda_graph", {}
     )

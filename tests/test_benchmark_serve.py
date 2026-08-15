@@ -222,6 +222,14 @@ class BenchmarkServeTests(unittest.TestCase):
                     "prefill_batches": 2,
                     "prefill_batch_size_mean": 1.0,
                 }
+                metrics["summary"]["decode_workers"] = {
+                    "decode-0": {
+                        "cuda_graph": {"captured_graphs": 6, "replays": 12}
+                    },
+                    "decode-1": {
+                        "cuda_graph": {"captured_graphs": 6, "replays": 10}
+                    },
+                }
                 metrics["summary"]["cuda_graph"] = {
                     "enabled": True,
                     "replays": 4,
@@ -241,6 +249,10 @@ class BenchmarkServeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["metrics"]["pd"]["prefill_batches"], 2)
+        self.assertEqual(
+            result["metrics"]["pd"]["decode_workers"]["decode-1"]["cuda_graph"]["replays"],
+            10,
+        )
         self.assertTrue(result["metrics"]["cuda_graph"]["enabled"])
         self.assertEqual(result["metrics"]["cuda_graph"]["replays"], 4)
 
