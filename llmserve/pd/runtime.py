@@ -9,7 +9,7 @@ from uuid import uuid4
 import torch
 
 from llmserve.engine.scheduler import SchedulerOutput
-from llmserve.pd.kv_transfer import export_logical_kv
+from llmserve.pd.kv_transfer import export_logical_kv, summarize_cuda_overlap
 from llmserve.pd.protocol import KVTransferDescriptor, RequestEnvelope
 from llmserve.pd.shared_slots import (
     KVSlotLease,
@@ -386,6 +386,8 @@ class DecodeWorkerRuntime:
         self.engine = engine
         self.slot_reader = slot_reader
         self._pending_shared_transfers: dict[str, dict] = {}
+        self.last_step_diagnostics: dict[str, object] = {}
+        self.last_admission_timing: dict[str, float] = {}
 
     def attach_shared_slots(self, handle):
         if self.slot_reader is not None:
@@ -420,6 +422,17 @@ class DecodeWorkerRuntime:
                     "t_kv_import_completion_observed": "decode_worker.cuda_event_query",
                 },
             }
+            compute_interval = pending.get("compute_interval")
+            if completion is not None and compute_interval is not None:
+                try:
+                    telemetry.update(summarize_cuda_overlap(
+                        completion,
+                        compute_interval,
+                    ))
+                except RuntimeError:
+                    # Event timing is diagnostic only. Slot ACK still follows
+                    # the completed H2D/scatter Event above.
+                    pass
             completed.append({
                 "transfer_id": transfer_id,
                 "seq_id": pending["seq_id"],
@@ -436,9 +449,57 @@ class DecodeWorkerRuntime:
             del self._pending_shared_transfers[transfer_id]
         return completed
 
+    def _has_runnable_sequences(self) -> bool:
+        scheduler = getattr(self.engine, "scheduler", None)
+        if scheduler is None:
+            return True
+        return bool(
+            getattr(scheduler, "running", ())
+            or getattr(scheduler, "waiting", ())
+        )
+
     def step(self):
+        self.last_step_diagnostics = {}
+        completed_transfers = []
+        if self._pending_shared_transfers and not self._has_runnable_sequences():
+            wait_started_at = perf_counter()
+            completed_transfers.extend(self.collect_completed_transfers(wait=True))
+            wait_finished_at = perf_counter()
+            self.last_step_diagnostics = {
+                "idle_reason": "waiting_kv_h2d",
+                "started_at": wait_started_at,
+                "finished_at": wait_finished_at,
+                "pending_kv_imports": len(self._pending_shared_transfers),
+            }
         outputs, num_tokens = self.engine.step()
-        return outputs, num_tokens, self.collect_completed_transfers()
+        completed_transfers.extend(self.collect_completed_transfers())
+        return outputs, num_tokens, completed_transfers
+
+    def admit_and_step(self, handoffs: list[PrefillHandoff]):
+        """Submit new KV imports, then run the existing Decode batch.
+
+        New handoffs stay scheduler-ineligible for this step. Their transfer
+        stream can therefore progress alongside the default-stream Decode
+        computation; the next step activates only Event-complete imports.
+        """
+        admissions = self.admit_batch(handoffs)
+        if not self._has_runnable_sequences():
+            outputs, num_tokens, completed_transfers = self.step()
+            return admissions, outputs, num_tokens, completed_transfers
+        outputs, num_tokens = self.engine.step(activate_prefilled_imports=False)
+        compute_interval = getattr(self.engine, "last_step_cuda_interval", None)
+        if compute_interval is not None:
+            for admission in admissions:
+                transfer_id = admission.get("transfer_id")
+                pending = self._pending_shared_transfers.get(transfer_id)
+                if pending is not None:
+                    pending["compute_interval"] = compute_interval
+        return (
+            admissions,
+            outputs,
+            num_tokens,
+            self.collect_completed_transfers(),
+        )
 
     def admit_batch(self, handoffs: list[PrefillHandoff]) -> list[dict]:
         handoffs = list(handoffs)
@@ -447,7 +508,15 @@ class DecodeWorkerRuntime:
         request_ids = [handoff.request_id for handoff in handoffs]
         if len(set(request_ids)) != len(request_ids):
             raise ValueError("admit_batch request ids must be unique")
-        return [self.admit(handoff) for handoff in handoffs]
+        started_at = perf_counter()
+        admissions = [self.admit(handoff) for handoff in handoffs]
+        finished_at = perf_counter()
+        self.last_admission_timing = {
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "wall_ms": (finished_at - started_at) * 1000,
+        }
+        return admissions
 
     def admit(self, handoff: PrefillHandoff):
         telemetry_enabled = bool(getattr(
@@ -526,8 +595,6 @@ class DecodeWorkerRuntime:
             )
             if get_completion is not None:
                 completion = get_completion(seq_id)
-                if completion is not None:
-                    completion.wait_on_current_stream()
             self._pending_shared_transfers[handoff.descriptor.transfer_id] = {
                 "seq_id": seq_id,
                 "completion": completion,

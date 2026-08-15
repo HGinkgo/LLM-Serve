@@ -188,6 +188,31 @@ class TestPDConfig(unittest.TestCase):
         self.assertEqual(result[0]["transfer_id"], "transfer-7")
         self.assertEqual(queue.commands[0]["type"], "admit_batch")
 
+    def test_decode_step_with_handoffs_uses_combined_decode_worker_rpc(self):
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._started = True
+        coordinator._last_rpc_timing = {}
+        queue = FakeQueue(
+            responses=[
+                {
+                    "ok": True,
+                    "result": {"admissions": [], "outputs": [], "num_tokens": 0},
+                }
+            ]
+        )
+        coordinator._workers = {
+            "decode": {"commands": queue, "responses": queue},
+        }
+
+        result = coordinator.decode_step_with_handoffs(["shared-handoff"])
+
+        self.assertEqual(result["num_tokens"], 0)
+        self.assertEqual(queue.commands[0]["type"], "step_with_handoffs")
+        self.assertEqual(queue.commands[0]["handoffs"], ["shared-handoff"])
+        self.assertIn("_rpc_parent_sent_at", queue.commands[0])
+
     def test_abort_decode_request_sends_worker_command(self):
         config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
         coordinator = PDCoordinator.__new__(PDCoordinator)

@@ -3,6 +3,7 @@ from threading import Event, Thread
 from types import SimpleNamespace
 
 from llmserve.pd.protocol import RequestEnvelope
+from llmserve.pd.protocol import RequestState
 from llmserve.pd.serving import PDServingEngine
 from llmserve.sampling_params import SamplingParams
 
@@ -141,6 +142,34 @@ class FakePDCoordinator:
         self.close_calls += 1
 
 
+class CombinedStepCoordinator(FakePDCoordinator):
+
+    def __init__(self):
+        super().__init__()
+        self.combined_handoffs = []
+
+    def decode_step_with_handoffs(self, handoffs):
+        self.combined_handoffs.append(list(handoffs))
+        return {
+            "admissions": [
+                {
+                    "seq_id": 101,
+                    "finished": False,
+                    "output_token_ids": None,
+                }
+            ],
+            "outputs": [(100, [200])],
+            "num_tokens": 1,
+            "completed_transfers": [],
+            "last_step_events": {
+                "step_end": 1.0,
+                "scheduled_seq_ids": [100],
+                "waiting_queue_size": 0,
+                "running_queue_size": 1,
+            },
+        }
+
+
 class TestPDServingEngine(unittest.TestCase):
 
     @staticmethod
@@ -185,6 +214,115 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual(outputs, [(0, [200])])
         self.assertTrue(coordinator.second_prefill_started.wait(timeout=2))
         self.assertTrue(coordinator.decode_called.is_set())
+
+    def test_active_decode_combines_new_handoff_with_next_worker_step(self):
+        coordinator = CombinedStepCoordinator()
+        engine = PDServingEngine(
+            coordinator,
+            prefill_batch_size=1,
+            enable_transport_overlap=True,
+        )
+        active_request_id = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        handoff_request_id = engine.add_request([3, 4], SamplingParams(max_tokens=2))
+        active_request = engine._requests[active_request_id]
+        for state in (RequestState.PREFILLING, RequestState.HANDOFF, RequestState.DECODING):
+            active_request["lifecycle"].transition(state)
+        active_request["decode_seq_id"] = 100
+        engine._active_by_decode_seq[100] = active_request_id
+
+        handoff_request = engine._requests[handoff_request_id]
+        for state in (RequestState.PREFILLING, RequestState.HANDOFF):
+            handoff_request["lifecycle"].transition(state)
+        handoff = SimpleNamespace(
+            request_id=handoff_request_id,
+            envelope=RequestEnvelope(
+                handoff_request_id,
+                (3, 4),
+                2,
+                1.0,
+                True,
+            ),
+            descriptor=SimpleNamespace(transport="inline"),
+            prefill_timing_ms={},
+            telemetry={},
+        )
+        engine._pending_handoff_batch = {
+            "handoffs": [handoff],
+            "meta": {"request_ids": [handoff_request_id], "batch_size": 1},
+            "finished_at": 0.0,
+            "prefill_rpc_timing": {},
+        }
+        engine._pending.clear()
+
+        outputs, num_tokens = engine.step()
+
+        self.assertEqual(outputs, [(active_request_id, [200])])
+        self.assertEqual(num_tokens, 1)
+        self.assertEqual(coordinator.combined_handoffs, [[handoff]])
+        detail = engine.get_metrics()["summary"]["pd"]["prefill_batches_detail"][0]
+        self.assertIn("combined_step_roundtrip_ms", detail)
+        self.assertEqual(engine._requests[handoff_request_id]["decode_seq_id"], 101)
+        self.assertEqual(
+            engine._requests[handoff_request_id]["lifecycle"].state,
+            RequestState.DECODING,
+        )
+
+    def test_decode_idle_records_waiting_kv_import_from_worker_diagnostics(self):
+        class KVWaitCoordinator(FakePDCoordinator):
+            def decode_step(self):
+                self.decode_calls += 1
+                return {
+                    "outputs": [],
+                    "num_tokens": 0,
+                    "last_step_events": {
+                        "scheduled_seq_ids": [],
+                        "waiting_queue_size": 0,
+                        "running_queue_size": 0,
+                    },
+                    "step_diagnostics": {
+                        "idle_reason": "waiting_kv_h2d",
+                        "started_at": 1.0,
+                        "finished_at": 1.25,
+                    },
+                }
+
+        engine = PDServingEngine(
+            KVWaitCoordinator(),
+            prefill_batch_size=1,
+            enable_latency_telemetry=True,
+        )
+        engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        engine.step()
+
+        idle = engine.get_metrics()["summary"]["pd"]["decode_idle"]
+        self.assertEqual(idle["counts"]["waiting_kv_h2d"], 1)
+        self.assertEqual(idle["duration_ms"]["waiting_kv_h2d"], 250.0)
+
+    def test_abort_handoff_request_removes_unsent_shared_transfer(self):
+        engine = PDServingEngine(FakePDCoordinator(), prefill_batch_size=1)
+        request_id = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        request = engine._requests[request_id]
+        for state in (RequestState.PREFILLING, RequestState.HANDOFF):
+            request["lifecycle"].transition(state)
+        handoff = SimpleNamespace(
+            request_id=request_id,
+            descriptor=SimpleNamespace(
+                transport="shared_slot",
+                transfer_id="transfer-0",
+            ),
+        )
+        engine._pending_handoff_batch = {
+            "handoffs": [handoff],
+            "meta": {"request_ids": [request_id], "batch_size": 1},
+            "finished_at": 0.0,
+            "prefill_rpc_timing": {},
+        }
+
+        self.assertTrue(engine.abort_request(request_id))
+
+        self.assertTrue(request["lifecycle"].is_terminal)
+        self.assertIsNone(engine._pending_handoff_batch)
+        self.assertEqual(engine._pending_transfer_acks, ["transfer-0"])
 
     def test_get_metrics_maps_decode_worker_sequences_to_request_ids(self):
         coordinator = FakePDCoordinator()
@@ -466,6 +604,30 @@ class TestPDServingEngine(unittest.TestCase):
 
         self.assertEqual(coordinator.explicit_release_calls, [["transfer-0"]])
         self.assertTrue(engine.is_finished())
+
+    def test_completed_transfer_propagates_device_overlap_telemetry(self):
+        engine = PDServingEngine(
+            FakePDCoordinator(),
+            prefill_batch_size=1,
+            enable_latency_telemetry=True,
+        )
+        request_id = engine.add_request([1, 2], SamplingParams(max_tokens=2))
+        engine._awaiting_transfer_completions["transfer-0"] = request_id
+
+        engine._record_completed_transfers([{
+            "transfer_id": "transfer-0",
+            "telemetry": {
+                "copy_compute_overlap_ms": 0.8,
+                "copy_compute_overlap_ratio": 0.8,
+                "critical_path_reduction_gpu_ms": 0.8,
+            },
+            "kv_import_gpu_ms": 1.0,
+        }])
+
+        timeline = engine._requests[request_id]["timeline"]
+        self.assertEqual(timeline["copy_compute_overlap_ms"], 0.8)
+        self.assertEqual(timeline["copy_compute_overlap_ratio"], 0.8)
+        self.assertEqual(timeline["critical_path_reduction_gpu_ms"], 0.8)
 
     def test_abort_pending_request_is_idempotent_and_reported(self):
         coordinator = FakePDCoordinator()

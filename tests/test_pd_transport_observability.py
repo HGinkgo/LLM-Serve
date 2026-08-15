@@ -201,13 +201,21 @@ class PDTransportObservabilityReportTests(unittest.TestCase):
                 "t_kv_import_enqueued": 1.50,
                 "t_kv_import_completion_observed": 1.60,
                 "kv_import_gpu_ms": 2.5,
+                "copy_gpu_ms": 2.5,
+                "decode_gpu_step_ms": 10.0,
+                "copy_compute_overlap_ms": 2.0,
+                "copy_compute_overlap_ratio": 0.8,
+                "serial_gpu_ms": 12.5,
+                "overlapped_makespan_gpu_ms": 10.5,
+                "critical_path_reduction_gpu_ms": 2.0,
             })
             (runs / "run-1.json").write_text(json.dumps(result))
 
             report = build_report(results_dir).read_text()
 
             self.assertIn("target-side CUDA Event", report)
-            self.assertIn("does not claim copy/compute overlap", report)
+            self.assertIn("device-side copy/GPU-step overlap", report)
+            self.assertIn("Pair coverage: `1/1`", report)
             with (results_dir / "request_transport_timeline.csv").open() as input_file:
                 row = next(csv.DictReader(input_file))
             self.assertEqual(float(row["kv_import_gpu_ms"]), 2.5)
@@ -215,6 +223,39 @@ class PDTransportObservabilityReportTests(unittest.TestCase):
                 float(row["kv_import_completion_observed_after_enqueue_ms"]),
                 100.0,
             )
+            self.assertAlmostEqual(
+                float(row["copy_compute_overlap_ms"]),
+                2.0,
+            )
+
+    def test_report_discloses_overlap_pair_coverage_per_variant(self):
+        from benchmarks.pd_transport_observability import build_report
+
+        with tempfile.TemporaryDirectory() as directory:
+            results_dir = Path(directory)
+            runs = results_dir / "runs"
+            runs.mkdir()
+            (results_dir / "manifest.json").write_text(json.dumps({
+                "complete": True,
+                "git_commit": "abc123",
+                "completed_points": 2,
+                "total_points": 2,
+            }))
+            serial = _result(1)
+            serial["config"]["variant"] = "serial"
+            overlap = _result(2)
+            overlap["config"]["variant"] = "overlap"
+            overlap["requests"][0]["timeline"].update({
+                "copy_compute_overlap_ms": 1.0,
+                "decode_gpu_step_ms": 4.0,
+            })
+            (runs / "serial.json").write_text(json.dumps(serial))
+            (runs / "overlap.json").write_text(json.dumps(overlap))
+
+            report = build_report(results_dir).read_text()
+
+            self.assertIn("| serial | 0/1 |", report)
+            self.assertIn("| overlap | 1/1 |", report)
 
 
 if __name__ == "__main__":

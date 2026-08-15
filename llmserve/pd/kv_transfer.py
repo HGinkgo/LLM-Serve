@@ -59,6 +59,59 @@ class KVImportCompletion:
         return float(self.start_event.elapsed_time(self.end_event))
 
 
+@dataclass(slots=True)
+class CUDAExecutionInterval:
+    """A completed default-stream Decode GPU-step interval on one GPU."""
+
+    device: torch.device
+    start_event: torch.cuda.Event
+    end_event: torch.cuda.Event
+
+    def is_complete(self) -> bool:
+        return bool(self.end_event.query())
+
+    def elapsed_ms(self) -> float:
+        if not self.is_complete():
+            raise RuntimeError("CUDA interval timing requires a completed Event")
+        return float(self.start_event.elapsed_time(self.end_event))
+
+
+def summarize_cuda_overlap(
+    transfer: KVImportCompletion,
+    compute: CUDAExecutionInterval,
+) -> dict[str, float]:
+    """Summarize copy/compute overlap from same-device CUDA Event timelines."""
+    if transfer.device != compute.device:
+        raise ValueError("copy and compute Events must belong to the same GPU")
+    if not transfer.is_complete() or not compute.is_complete():
+        raise RuntimeError("CUDA overlap requires completed copy and compute Events")
+
+    copy_gpu_ms = transfer.elapsed_ms()
+    gpu_step_ms = compute.elapsed_ms()
+    compute_start_ms = float(
+        transfer.start_event.elapsed_time(compute.start_event)
+    )
+    compute_end_ms = float(transfer.start_event.elapsed_time(compute.end_event))
+    overlap_ms = max(
+        0.0,
+        min(copy_gpu_ms, compute_end_ms) - max(0.0, compute_start_ms),
+    )
+    makespan_ms = max(copy_gpu_ms, compute_end_ms) - min(0.0, compute_start_ms)
+    serial_gpu_ms = copy_gpu_ms + gpu_step_ms
+    shortest_interval_ms = min(copy_gpu_ms, gpu_step_ms)
+    return {
+        "copy_gpu_ms": copy_gpu_ms,
+        "decode_gpu_step_ms": gpu_step_ms,
+        "copy_compute_overlap_ms": overlap_ms,
+        "copy_compute_overlap_ratio": (
+            overlap_ms / shortest_interval_ms if shortest_interval_ms else 0.0
+        ),
+        "serial_gpu_ms": serial_gpu_ms,
+        "overlapped_makespan_gpu_ms": makespan_ms,
+        "critical_path_reduction_gpu_ms": max(0.0, serial_gpu_ms - makespan_ms),
+    }
+
+
 def export_logical_kv(
     kv_cache: torch.Tensor,
     block_table: Sequence[int],

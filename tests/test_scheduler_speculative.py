@@ -25,6 +25,7 @@ class SchedulerSpeculativeTest(unittest.TestCase):
         scheduler.enable_chunked_prefill = True
         scheduler.waiting = deque()
         scheduler.running = deque()
+        scheduler.pending_prefilled = deque()
         scheduler.enable_kv_capacity_admission = False
         scheduler.max_model_len = 4096
         scheduler.speculative_reserve_tokens = 0
@@ -102,6 +103,31 @@ class SchedulerSpeculativeTest(unittest.TestCase):
         self.assertEqual(seq.status, SequenceStatus.RUNNING)
         self.assertEqual(list(scheduler.running), [seq])
         self.assertEqual(len(seq.block_table), 2)
+
+    def test_pending_prefilled_sequence_is_not_scheduled_until_activated(self):
+        scheduler = self.make_scheduler()
+        sampling = SimpleNamespace(temperature=1.0, max_tokens=8, ignore_eos=True)
+        active = Sequence([1, 2, 3, 4], sampling)
+        active.status = SequenceStatus.RUNNING
+        active.num_cached_tokens = len(active)
+        scheduler.block_manager.allocate(active)
+        scheduler.running.append(active)
+
+        pending = Sequence([5, 6, 7, 8], sampling)
+        pending.append_token(77)
+        scheduler.admit_prefilled(pending, cached_tokens=4, pending=True)
+
+        first = scheduler.schedule()
+
+        self.assertEqual(first.decode_seqs, [active])
+        self.assertNotIn(pending, first.scheduled_seqs)
+        self.assertEqual(list(scheduler.pending_prefilled), [pending])
+
+        self.assertTrue(scheduler.activate_prefilled(pending.seq_id))
+        second = scheduler.schedule()
+
+        self.assertIn(pending, second.decode_seqs)
+        self.assertEqual(list(scheduler.pending_prefilled), [])
 
     def test_schedule_returns_explicit_mixed_batch_groups_without_negative_sentinel(self):
         scheduler = self.make_scheduler()

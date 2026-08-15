@@ -48,10 +48,22 @@ class Scheduler:
         self.peak_reserved_blocks = 0
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.pending_prefilled: deque[Sequence] = deque()
     # 调度器启动时会记住调度预算、建好 block 管理器、准备两个队列：waiting 和 running。
 
     def is_finished(self):
-        return not self.waiting and not self.running
+        return (
+            not self.waiting
+            and not self.running
+            and not self._pending_prefilled_queue()
+        )
+
+    def _pending_prefilled_queue(self) -> deque[Sequence]:
+        queue = getattr(self, "pending_prefilled", None)
+        if queue is None:
+            queue = deque()
+            self.pending_prefilled = queue
+        return queue
 
     def add(self, seq: Sequence):
         if self.enable_kv_capacity_admission:
@@ -263,6 +275,10 @@ class Scheduler:
             self.running.remove(seq)
         except ValueError:
             pass
+        try:
+            self._pending_prefilled_queue().remove(seq)
+        except ValueError:
+            pass
         if seq.block_table:
             self.block_manager.deallocate(seq)
         self._release_reservation(seq)
@@ -276,7 +292,11 @@ class Scheduler:
         seq = next(
             (
                 candidate
-                for queue in (self.waiting, self.running)
+                for queue in (
+                    self.waiting,
+                    self.running,
+                    self._pending_prefilled_queue(),
+                )
                 for candidate in queue
                 if candidate.seq_id == seq_id
             ),
@@ -296,9 +316,20 @@ class Scheduler:
         """Fail an owned request and release its scheduler resources."""
         return self._terminate_request(seq_id, SequenceStatus.FAILED)
 
-    def admit_prefilled(self, seq: Sequence, cached_tokens: int):
+    def admit_prefilled(
+        self,
+        seq: Sequence,
+        cached_tokens: int,
+        *,
+        pending: bool = False,
+    ):
         """Admit a sequence whose prompt KV arrived from another worker."""
-        if seq.block_table or seq in self.waiting or seq in self.running:
+        if (
+            seq.block_table
+            or seq in self.waiting
+            or seq in self.running
+            or seq in self._pending_prefilled_queue()
+        ):
             raise ValueError("prefilled sequence is already owned by this scheduler")
         if not 0 < cached_tokens < len(seq):
             raise ValueError("cached_tokens must cover the prompt before first decode")
@@ -310,7 +341,59 @@ class Scheduler:
         self.block_manager.allocate(seq)
         seq.num_cached_tokens = cached_tokens
         seq.status = SequenceStatus.RUNNING
+        if pending:
+            self._pending_prefilled_queue().append(seq)
+        else:
+            self.running.append(seq)
+
+    def activate_prefilled(self, seq_id: int) -> bool:
+        """Move an imported PD sequence into the runnable Decode queue."""
+        seq = next(
+            (
+                candidate
+                for candidate in self._pending_prefilled_queue()
+                if candidate.seq_id == seq_id
+            ),
+            None,
+        )
+        if seq is None:
+            return False
+        self._pending_prefilled_queue().remove(seq)
         self.running.append(seq)
+        return True
+
+    def detach_pending_prefilled(
+        self,
+        seq_id: int,
+        status: SequenceStatus,
+    ) -> Sequence | None:
+        """Stop a pending import without releasing its target KV blocks.
+
+        The Decode transfer stream may still be scattering into this sequence's
+        block table. Its owner must defer ``release_detached_prefilled`` until
+        the corresponding CUDA Event has completed.
+        """
+        seq = next(
+            (
+                candidate
+                for candidate in self._pending_prefilled_queue()
+                if candidate.seq_id == seq_id
+            ),
+            None,
+        )
+        if seq is None:
+            return None
+        self._pending_prefilled_queue().remove(seq)
+        seq.status = status
+        seq.num_scheduled_tokens = 0
+        return seq
+
+    def release_detached_prefilled(self, seq: Sequence):
+        """Release a detached PD import after its CUDA Event is complete."""
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+        self._release_reservation(seq)
+        seq.num_scheduled_tokens = 0
 
     def postprocess(self, output: SchedulerOutput, token_ids: list[int]):
         if len(output.scheduled_seqs) != len(token_ids):

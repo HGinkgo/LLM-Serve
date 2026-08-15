@@ -25,18 +25,21 @@ class PDServingEngine:
         coordinator,
         prefill_batch_size: int = 1,
         enable_latency_telemetry: bool = False,
+        enable_transport_overlap: bool = False,
     ):
         if not isinstance(prefill_batch_size, int) or prefill_batch_size <= 0:
             raise ValueError("prefill_batch_size must be a positive integer")
         self.coordinator = coordinator
         self.prefill_batch_size = prefill_batch_size
         self.enable_latency_telemetry = enable_latency_telemetry
+        self.enable_transport_overlap = enable_transport_overlap
         self._next_request_id = 0
         self._pending: deque[RequestEnvelope] = deque()
         self._requests: dict[int, dict] = {}
         self._active_by_decode_seq: dict[int, int] = {}
         self._prefill_future: Future | None = None
         self._prefill_future_meta: dict | None = None
+        self._pending_handoff_batch: dict | None = None
         self._pending_transfer_acks: list[str] = []
         self._awaiting_transfer_completions: dict[str, int] = {}
         self._slot_release_samples: list[dict] = []
@@ -114,6 +117,26 @@ class PDServingEngine:
             if not self.coordinator.abort_decode_request(decode_seq_id):
                 return False
             self._active_by_decode_seq.pop(decode_seq_id, None)
+        elif lifecycle.state == RequestState.HANDOFF:
+            batch = self._pending_handoff_batch
+            if batch is None:
+                return False
+            retained_handoffs = []
+            removed = False
+            for handoff in batch["handoffs"]:
+                if handoff.request_id != request_id:
+                    retained_handoffs.append(handoff)
+                    continue
+                removed = True
+                descriptor = getattr(handoff, "descriptor", None)
+                if getattr(descriptor, "transport", "inline") == "shared_slot":
+                    self._pending_transfer_acks.append(descriptor.transfer_id)
+            if not removed:
+                return False
+            if retained_handoffs:
+                batch["handoffs"] = retained_handoffs
+            else:
+                self._pending_handoff_batch = None
 
         lifecycle.cancel()
         request["finish_time"] = perf_counter()
@@ -177,6 +200,13 @@ class PDServingEngine:
                 key: telemetry.get(key)
                 for key in (
                     "t_kv_import_completion_observed",
+                    "copy_gpu_ms",
+                    "decode_gpu_step_ms",
+                    "copy_compute_overlap_ms",
+                    "copy_compute_overlap_ratio",
+                    "serial_gpu_ms",
+                    "overlapped_makespan_gpu_ms",
+                    "critical_path_reduction_gpu_ms",
                 )
                 if telemetry.get(key) is not None
             })
@@ -217,28 +247,38 @@ class PDServingEngine:
                 continue
             lifecycle.transition(RequestState.HANDOFF)
             admitted_handoffs.append(handoff)
+        if not admitted_handoffs:
+            if self._prefill_future is None and not self._pending:
+                self._flush_transfer_acks()
+            return True
+        if self._pending_handoff_batch is not None:
+            raise RuntimeError("PD has an unadmitted handoff batch")
+        self._pending_handoff_batch = {
+            "handoffs": admitted_handoffs,
+            "meta": meta,
+            "finished_at": finished_at,
+            "prefill_rpc_timing": prefill_rpc_timing,
+        }
+        return True
 
-        admit_started_at = perf_counter()
-        try:
-            admissions = (
-                list(self.coordinator.admit_batch(admitted_handoffs))
-                if admitted_handoffs
-                else []
-            )
-        except Exception:
-            # A failed admission can already own asynchronous H2D work. Its
-            # source slot must remain unavailable until Decode teardown drains
-            # the target CUDA Event.
-            raise
-        admit_finished_at = perf_counter()
-        decode_rpc_timing = (
-            self.coordinator.last_rpc_timing("decode")
-            if admitted_handoffs
-            else {}
-        )
-        if len(admissions) != len(admitted_handoffs):
+    def _apply_handoff_admissions(
+        self,
+        batch: dict,
+        admissions: list[dict],
+        *,
+        admit_started_at: float,
+        admit_finished_at: float,
+        decode_rpc_timing: dict,
+        admission_timing: dict | None = None,
+        combined_step_roundtrip_ms: float | None = None,
+    ):
+        handoffs = batch["handoffs"]
+        meta = batch["meta"]
+        finished_at = batch["finished_at"]
+        prefill_rpc_timing = batch["prefill_rpc_timing"]
+        if len(admissions) != len(handoffs):
             raise RuntimeError("Decode Worker returned an incomplete admission batch")
-        for handoff, admission in zip(admitted_handoffs, admissions):
+        for handoff, admission in zip(handoffs, admissions):
             request_id = handoff.request_id
             if request_id not in self._requests:
                 raise RuntimeError("Decode Worker admitted an unknown request")
@@ -300,8 +340,15 @@ class PDServingEngine:
                 raise RuntimeError("Decode Worker returned duplicate sequence ids")
             self._active_by_decode_seq[decode_seq_id] = request_id
             request["decode_seq_id"] = decode_seq_id
-        prefill_timing = getattr(handoffs[0], "prefill_timing_ms", {}) if handoffs else {}
+        prefill_timing = getattr(handoffs[0], "prefill_timing_ms", {})
         worker_total_ms = prefill_timing.get("worker_total_ms")
+        admission_timing = admission_timing or {}
+        actual_admit_started_at = admission_timing.get(
+            "started_at", admit_started_at
+        )
+        actual_admit_finished_at = admission_timing.get(
+            "finished_at", admit_finished_at
+        )
         self._prefill_batches.append(
             {
                 "request_ids": list(meta.get("request_ids", ())),
@@ -310,11 +357,12 @@ class PDServingEngine:
                     finished_at - meta.get("submitted_at", finished_at)
                 ) * 1000,
                 "admit_roundtrip_ms": (
-                    admit_finished_at - admit_started_at
+                    actual_admit_finished_at - actual_admit_started_at
                 ) * 1000,
                 "handoff_path_ms": (
-                    admit_finished_at - finished_at
+                    actual_admit_finished_at - finished_at
                 ) * 1000,
+                "combined_step_roundtrip_ms": combined_step_roundtrip_ms,
                 "prefill_worker_ms": worker_total_ms,
                 "prefill_model_forward_ms": prefill_timing.get(
                     "model_forward_ms"
@@ -347,8 +395,8 @@ class PDServingEngine:
                 "decode_command_queue_ms": decode_rpc_timing.get(
                     "command_queue_ms"
                 ),
-                "decode_worker_admit_ms": decode_rpc_timing.get(
-                    "worker_service_ms"
+                "decode_worker_admit_ms": admission_timing.get(
+                    "wall_ms", decode_rpc_timing.get("worker_service_ms")
                 ),
                 "decode_response_queue_ms": decode_rpc_timing.get(
                     "response_queue_ms"
@@ -382,8 +430,24 @@ class PDServingEngine:
                 ).get("slot_wait_count") if handoffs else None,
             }
         )
+        self._pending_handoff_batch = None
         if self._prefill_future is None and not self._pending:
             self._flush_transfer_acks()
+
+    def _admit_pending_handoff_batch(self):
+        batch = self._pending_handoff_batch
+        if batch is None:
+            return False
+        admit_started_at = perf_counter()
+        admissions = list(self.coordinator.admit_batch(batch["handoffs"]))
+        admit_finished_at = perf_counter()
+        self._apply_handoff_admissions(
+            batch,
+            admissions,
+            admit_started_at=admit_started_at,
+            admit_finished_at=admit_finished_at,
+            decode_rpc_timing=self.coordinator.last_rpc_timing("decode"),
+        )
         return True
 
     def _record_queue_sample(self):
@@ -397,6 +461,7 @@ class PDServingEngine:
                     and not self._prefill_future.done()
                 ),
                 "pending_transfer_acks": len(self._pending_transfer_acks),
+                "pending_kv_imports": len(self._awaiting_transfer_completions),
             }
         )
 
@@ -430,6 +495,7 @@ class PDServingEngine:
                 request["finish_time"] = now
         self._pending.clear()
         self._active_by_decode_seq.clear()
+        self._pending_handoff_batch = None
         self._pending_transfer_acks.clear()
         self._awaiting_transfer_completions.clear()
         if self._prefill_future is not None and (
@@ -469,7 +535,8 @@ class PDServingEngine:
         self._collect_completed_transfer_acks()
 
         if not self._active_by_decode_seq:
-            if self._prefill_future is not None:
+            self._admit_pending_handoff_batch()
+            if not self._active_by_decode_seq and self._prefill_future is not None:
                 wait_started_at = perf_counter()
                 self._prefill_future.result()
                 wait_finished_at = perf_counter()
@@ -480,6 +547,7 @@ class PDServingEngine:
                 )
                 self._collect_prefill()
                 self._start_prefill()
+                self._admit_pending_handoff_batch()
             if not self._active_by_decode_seq:
                 if self._awaiting_transfer_completions:
                     self._collect_completed_transfer_acks(wait=True)
@@ -494,11 +562,40 @@ class PDServingEngine:
 
         active_decode_before_step = len(self._active_by_decode_seq)
         decode_started_at = perf_counter()
-        result = self.coordinator.decode_step()
-        decode_finished_at = perf_counter()
+        handoff_batch = self._pending_handoff_batch
+        combined_step = getattr(self.coordinator, "decode_step_with_handoffs", None)
+        if (
+            self.enable_transport_overlap
+            and handoff_batch is not None
+            and combined_step is not None
+        ):
+            result = combined_step(handoff_batch["handoffs"])
+            decode_finished_at = perf_counter()
+            self._apply_handoff_admissions(
+                handoff_batch,
+                list(result.get("admissions") or ()),
+                admit_started_at=decode_started_at,
+                admit_finished_at=decode_finished_at,
+                decode_rpc_timing=self.coordinator.last_rpc_timing("decode"),
+                admission_timing=result.get("admission_timing"),
+                combined_step_roundtrip_ms=(
+                    decode_finished_at - decode_started_at
+                ) * 1000,
+            )
+        else:
+            self._admit_pending_handoff_batch()
+            result = self.coordinator.decode_step()
+            decode_finished_at = perf_counter()
         raw_events = result.get("last_step_events") or {}
         self._record_completed_transfers(result.get("completed_transfers") or ())
-        if (
+        step_diagnostics = result.get("step_diagnostics") or {}
+        if step_diagnostics.get("idle_reason") == DecodeIdleReason.WAITING_KV_H2D.value:
+            self._record_decode_idle_interval(
+                DecodeIdleReason.WAITING_KV_H2D,
+                step_diagnostics["started_at"],
+                step_diagnostics["finished_at"],
+            )
+        elif (
             active_decode_before_step
             and not raw_events.get("scheduled_seq_ids")
         ):
@@ -536,6 +633,9 @@ class PDServingEngine:
         )
         events["pd_active_decode_requests"] = len(self._active_by_decode_seq)
         events["pd_pending_prefill_requests"] = len(self._pending)
+        events["pd_pending_kv_imports"] = len(
+            self._awaiting_transfer_completions
+        )
         if self.enable_latency_telemetry:
             events["pd_slot_state"] = (
                 deepcopy(self._prefill_batches[-1].get("slot_stats_after_ready"))
@@ -556,6 +656,7 @@ class PDServingEngine:
         return (
             not self._pending
             and self._prefill_future is None
+            and self._pending_handoff_batch is None
             and not self._active_by_decode_seq
             and not self._pending_transfer_acks
             and not self._awaiting_transfer_completions
@@ -569,6 +670,7 @@ class PDServingEngine:
         self.coordinator.reset_decode_metrics()
         self._requests.clear()
         self._awaiting_transfer_completions.clear()
+        self._pending_handoff_batch = None
         self._prefill_batches.clear()
         self._queue_samples.clear()
         self._decode_idle_intervals.clear()
@@ -663,6 +765,7 @@ class PDServingEngine:
             "decode_command_queue_ms": "decode_command_queue_ms",
             "decode_worker_admit_ms": "decode_worker_admit_ms",
             "decode_response_queue_ms": "decode_response_queue_ms",
+            "combined_step_roundtrip_ms": "combined_step_roundtrip_ms",
         }
         prefill_timing = {}
         for output_name, field_name in timing_fields.items():

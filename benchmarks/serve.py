@@ -85,6 +85,7 @@ def _default_pd_engine_factory(model, **kwargs):
     decode_enforce_eager = kwargs.pop("decode_enforce_eager", True)
     kv_slot_count = kwargs.pop("kv_slot_count", 2)
     kv_slot_capacity_tokens = kwargs.pop("kv_slot_capacity_tokens", 1024)
+    enable_transport_overlap = kwargs.pop("enable_pd_transport_overlap", False)
     coordinator = PDCoordinator(
         PDConfig(
             model=model,
@@ -103,6 +104,7 @@ def _default_pd_engine_factory(model, **kwargs):
         coordinator,
         prefill_batch_size=prefill_batch_size,
         enable_latency_telemetry=kwargs.get("enable_latency_telemetry", False),
+        enable_transport_overlap=enable_transport_overlap,
     )
 
 
@@ -132,6 +134,7 @@ def _effective_runtime_config(engine):
             "kv_slot_count": config.kv_slot_count,
             "kv_slot_capacity_tokens": config.kv_slot_capacity_tokens,
             "prefill_batch_size": engine.prefill_batch_size,
+            "enable_pd_transport_overlap": engine.enable_transport_overlap,
             "engine_kwargs": {
                 name: config.engine_kwargs.get(name) for name in fields
             },
@@ -276,6 +279,9 @@ def run_point(
                 "kv_slot_count": runtime.get("kv_slot_count", 2),
                 "kv_slot_capacity_tokens": runtime.get(
                     "kv_slot_capacity_tokens", 1024
+                ),
+                "enable_pd_transport_overlap": runtime.get(
+                    "enable_pd_transport_overlap", False
                 ),
             }
         )

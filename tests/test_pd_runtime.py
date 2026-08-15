@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -84,6 +85,9 @@ class FakeKVImportCompletion:
             raise RuntimeError("completion timing is unavailable before completion")
         return 1.25
 
+    def synchronize(self):
+        self.ready = True
+
 
 class CompletionAwareDecodeEngine(FakeDecodeEngine):
 
@@ -94,6 +98,50 @@ class CompletionAwareDecodeEngine(FakeDecodeEngine):
     def get_prefilled_import_completion(self, seq_id):
         self.calls.append(("get_prefilled_import_completion", seq_id))
         return self.completion
+
+
+class OverlapDecodeEngine(CompletionAwareDecodeEngine):
+
+    def __init__(self):
+        super().__init__()
+        self.step_activation_flags = []
+
+    def step(self, *, activate_prefilled_imports=True):
+        self.step_activation_flags.append(activate_prefilled_imports)
+        self.calls.append(("step", activate_prefilled_imports))
+        return [], 0
+
+
+class ColdStartDecodeEngine(CompletionAwareDecodeEngine):
+
+    def __init__(self):
+        super().__init__()
+        self.scheduler.running = []
+        self.scheduler.waiting = []
+
+    def complete_prefilled_import(self, seq_id):
+        self.scheduler.running.append(seq_id)
+        return self.completion
+
+    def step(self):
+        if not self.scheduler.running:
+            raise AssertionError("cold start ran Decode before KV import completed")
+        self.calls.append(("step",))
+        return [], 0
+
+
+class PendingOnlyCombinedDecodeEngine(ColdStartDecodeEngine):
+
+    def __init__(self):
+        super().__init__()
+        self.step_activation_flags = []
+
+    def step(self, *, activate_prefilled_imports=True):
+        self.step_activation_flags.append(activate_prefilled_imports)
+        if not self.scheduler.running:
+            raise AssertionError("combined Decode ran before KV import completed")
+        self.calls.append(("step", activate_prefilled_imports))
+        return [], 0
 
 
 class FakeBatchPrefillScheduler:
@@ -335,7 +383,7 @@ class TestPDRuntime(unittest.TestCase):
         )
         self.assertEqual(pool.stats()["free_slots"], 2)
 
-    def test_shared_slot_ack_waits_for_target_import_completion(self):
+    def test_shared_slot_ack_defers_default_stream_wait_until_import_completion(self):
         payload = torch.zeros(2, 1, 4, 1, 2)
         pool = SharedKVSlotPool.create(
             slot_count=2,
@@ -378,7 +426,7 @@ class TestPDRuntime(unittest.TestCase):
 
         self.assertEqual(admission["transfer_id"], "transfer-1")
         self.assertEqual(runtime.collect_completed_transfers(), [])
-        self.assertTrue(decode_engine.completion.waited)
+        self.assertFalse(decode_engine.completion.waited)
 
         decode_engine.completion.ready = True
         completions = runtime.collect_completed_transfers()
@@ -388,6 +436,165 @@ class TestPDRuntime(unittest.TestCase):
         self.assertIn(
             "t_kv_import_completion_observed",
             completions[0]["telemetry"],
+        )
+
+    def test_admit_and_step_defers_new_import_activation_for_current_decode(self):
+        payload = torch.zeros(2, 1, 4, 1, 2)
+        pool = SharedKVSlotPool.create(
+            slot_count=1,
+            capacity_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+        )
+        lease = pool.acquire(4)
+        descriptor = KVTransferDescriptor(
+            request_id=7,
+            transfer_id="transfer-1",
+            num_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype="float32",
+            block_size=4,
+            payload_nbytes=payload.numel() * payload.element_size(),
+            transport="shared_slot",
+            slot_id=lease.slot_id,
+            slot_generation=lease.generation,
+            token_offset=0,
+        )
+        pool.mark_ready(lease, {descriptor.transfer_id})
+        handoff = PrefillHandoff(
+            envelope=RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True),
+            first_token_id=77,
+            descriptor=descriptor,
+        )
+        decode_engine = OverlapDecodeEngine()
+        decode_engine.scheduler.running = [123]
+        decode_engine.last_step_cuda_interval = object()
+        runtime = DecodeWorkerRuntime(
+            decode_engine,
+            slot_reader=SharedKVSlotReader(pool.handle, register_cuda=False),
+        )
+
+        with patch(
+            "llmserve.pd.runtime.summarize_cuda_overlap",
+            return_value={
+                "copy_compute_overlap_ms": 0.8,
+                "critical_path_reduction_gpu_ms": 0.8,
+            },
+        ):
+            admissions, outputs, num_tokens, completions = runtime.admit_and_step(
+                [handoff]
+            )
+            decode_engine.completion.ready = True
+            completed_after_event = runtime.collect_completed_transfers()
+
+        self.assertEqual([item["seq_id"] for item in admissions], [123])
+        self.assertEqual(outputs, [])
+        self.assertEqual(num_tokens, 0)
+        self.assertEqual(completions, [])
+        self.assertEqual(decode_engine.step_activation_flags, [False])
+        self.assertFalse(decode_engine.completion.waited)
+        self.assertEqual(
+            completed_after_event[0]["telemetry"]["copy_compute_overlap_ms"],
+            0.8,
+        )
+
+    def test_cold_start_waits_for_pending_import_before_decode_step(self):
+        payload = torch.zeros(2, 1, 4, 1, 2)
+        pool = SharedKVSlotPool.create(
+            slot_count=1,
+            capacity_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+        )
+        lease = pool.acquire(4)
+        descriptor = KVTransferDescriptor(
+            request_id=7,
+            transfer_id="transfer-1",
+            num_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype="float32",
+            block_size=4,
+            payload_nbytes=payload.numel() * payload.element_size(),
+            transport="shared_slot",
+            slot_id=lease.slot_id,
+            slot_generation=lease.generation,
+            token_offset=0,
+        )
+        pool.mark_ready(lease, {descriptor.transfer_id})
+        handoff = PrefillHandoff(
+            envelope=RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True),
+            first_token_id=77,
+            descriptor=descriptor,
+        )
+        decode_engine = ColdStartDecodeEngine()
+        runtime = DecodeWorkerRuntime(
+            decode_engine,
+            slot_reader=SharedKVSlotReader(pool.handle, register_cuda=False),
+        )
+        runtime.admit(handoff)
+
+        _, _, completions = runtime.step()
+
+        self.assertTrue(decode_engine.completion.ready)
+        self.assertEqual([item["transfer_id"] for item in completions], ["transfer-1"])
+
+    def test_combined_step_waits_for_pending_import_without_runnable_decode(self):
+        payload = torch.zeros(2, 1, 4, 1, 2)
+        pool = SharedKVSlotPool.create(
+            slot_count=1,
+            capacity_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=torch.float32,
+            register_cuda=False,
+        )
+        lease = pool.acquire(4)
+        descriptor = KVTransferDescriptor(
+            request_id=7,
+            transfer_id="transfer-1",
+            num_tokens=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype="float32",
+            block_size=4,
+            payload_nbytes=payload.numel() * payload.element_size(),
+            transport="shared_slot",
+            slot_id=lease.slot_id,
+            slot_generation=lease.generation,
+            token_offset=0,
+        )
+        pool.mark_ready(lease, {descriptor.transfer_id})
+        handoff = PrefillHandoff(
+            envelope=RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True),
+            first_token_id=77,
+            descriptor=descriptor,
+        )
+        decode_engine = PendingOnlyCombinedDecodeEngine()
+        runtime = DecodeWorkerRuntime(
+            decode_engine,
+            slot_reader=SharedKVSlotReader(pool.handle, register_cuda=False),
+        )
+
+        _, _, _, completions = runtime.admit_and_step([handoff])
+
+        self.assertTrue(decode_engine.completion.ready)
+        self.assertEqual(decode_engine.step_activation_flags, [True])
+        self.assertEqual([item["transfer_id"] for item in completions], ["transfer-1"])
+        self.assertEqual(
+            runtime.last_step_diagnostics["idle_reason"],
+            "waiting_kv_h2d",
         )
 
     def test_prefill_runtime_completes_partial_chunks_before_handoff(self):

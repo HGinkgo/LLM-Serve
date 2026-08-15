@@ -45,6 +45,20 @@ def _reply(
     )
 
 
+def _cleanup_worker_resources(engine, runtime):
+    """Synchronize target imports before unregistering shared pinned memory."""
+    try:
+        if engine is not None:
+            engine.exit()
+    finally:
+        if runtime is not None:
+            transport = getattr(runtime, "slot_reader", None) or getattr(
+                runtime, "slot_pool", None
+            )
+            if transport is not None:
+                transport.close()
+
+
 def worker_main(
     role: str,
     model: str,
@@ -162,6 +176,28 @@ def worker_main(
                         "num_tokens": num_tokens,
                         "completed_transfers": completed_transfers,
                         "last_step_events": engine.last_step_events,
+                        "step_diagnostics": runtime.last_step_diagnostics,
+                    },
+                    worker_received_at=worker_received_at,
+                )
+                continue
+            if role == "decode" and command_type == "step_with_handoffs":
+                (
+                    admissions,
+                    outputs,
+                    num_tokens,
+                    completed_transfers,
+                ) = runtime.admit_and_step(command["handoffs"])
+                _reply(
+                    response_queue,
+                    result={
+                        "admissions": admissions,
+                        "outputs": outputs,
+                        "num_tokens": num_tokens,
+                        "completed_transfers": completed_transfers,
+                        "last_step_events": engine.last_step_events,
+                        "step_diagnostics": runtime.last_step_diagnostics,
+                        "admission_timing": runtime.last_admission_timing,
                     },
                     worker_received_at=worker_received_at,
                 )
@@ -209,13 +245,6 @@ def worker_main(
         )
     finally:
         try:
-            if runtime is not None:
-                transport = getattr(runtime, "slot_reader", None) or getattr(
-                    runtime, "slot_pool", None
-                )
-                if transport is not None:
-                    transport.close()
-            if engine is not None:
-                engine.exit()
+            _cleanup_worker_resources(engine, runtime)
         finally:
             _destroy_process_group()

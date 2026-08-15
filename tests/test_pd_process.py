@@ -1,7 +1,11 @@
 import unittest
 import signal
 
-from llmserve.pd.process import _destroy_process_group, _handle_termination
+from llmserve.pd.process import (
+    _cleanup_worker_resources,
+    _destroy_process_group,
+    _handle_termination,
+)
 
 
 class FakeDistributed:
@@ -39,6 +43,26 @@ class TestPDProcessCleanup(unittest.TestCase):
         _destroy_process_group(distributed)
 
         self.assertEqual(distributed.destroy_calls, 0)
+
+    def test_cleanup_synchronizes_engine_before_closing_shared_transport(self):
+        calls = []
+
+        class Engine:
+
+            def exit(self):
+                calls.append("engine.exit")
+
+        class Transport:
+
+            def close(self):
+                calls.append("transport.close")
+
+        class Runtime:
+            slot_reader = Transport()
+
+        _cleanup_worker_resources(Engine(), Runtime())
+
+        self.assertEqual(calls, ["engine.exit", "transport.close"])
 
 
 if __name__ == "__main__":

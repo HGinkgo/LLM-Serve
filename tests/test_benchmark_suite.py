@@ -76,6 +76,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-strong-baseline.json",
                 "pd-transport-observability.json",
                 "pd-transport-v2-telemetry.json",
+                "pd-transport-v3-overlap.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
             },
@@ -129,6 +130,17 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     and point["measurement_seconds"] == 60
                     for point in shared_points
                 ))
+            if path.name == "pd-transport-v3-overlap.json":
+                self.assertEqual(suite["runs"], 3)
+                self.assertEqual(len(points), 6)
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"pd-shared-event-serial", "pd-shared-event-overlap"},
+                )
+                for point in points:
+                    self.assertTrue(point["runtime"]["pd"])
+                    self.assertEqual(point["max_concurrency"], 64)
+                    self.assertEqual(point["runtime"]["prefill_batch_size"], 4)
             if path.name.startswith("formal-"):
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 36)

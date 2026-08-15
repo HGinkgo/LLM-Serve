@@ -296,6 +296,12 @@ class PDCoordinator:
     def decode_step(self):
         return self._call("decode", {"type": "step"})
 
+    def decode_step_with_handoffs(self, handoffs):
+        return self._call(
+            "decode",
+            {"type": "step_with_handoffs", "handoffs": list(handoffs)},
+        )
+
     def collect_completed_transfers(self, *, wait: bool = False):
         return self._call(
             "decode",

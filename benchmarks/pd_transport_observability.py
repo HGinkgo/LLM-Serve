@@ -98,6 +98,7 @@ def _timeline_rows(results: list[dict]) -> list[dict]:
             row = {
                 "point_id": result["point_id"],
                 "run": int(config.get("run", 0)) + 1,
+                "variant": config.get("variant"),
                 "request_id": request.get("request_id"),
                 "first_token_ms": _ms(
                     timeline["t_submit"], timeline["t_first_token"]
@@ -147,6 +148,23 @@ def _timeline_rows(results: list[dict]) -> list[dict]:
                     timeline.get("t_kv_import_completion_observed"),
                 ),
                 "kv_import_gpu_ms": timeline.get("kv_import_gpu_ms"),
+                "copy_gpu_ms": timeline.get("copy_gpu_ms"),
+                "decode_gpu_step_ms": timeline.get(
+                    "decode_gpu_step_ms"
+                ),
+                "copy_compute_overlap_ms": timeline.get(
+                    "copy_compute_overlap_ms"
+                ),
+                "copy_compute_overlap_ratio": timeline.get(
+                    "copy_compute_overlap_ratio"
+                ),
+                "serial_gpu_ms": timeline.get("serial_gpu_ms"),
+                "overlapped_makespan_gpu_ms": timeline.get(
+                    "overlapped_makespan_gpu_ms"
+                ),
+                "critical_path_reduction_gpu_ms": timeline.get(
+                    "critical_path_reduction_gpu_ms"
+                ),
                 "decode_continuation_enqueue_ready_ms": _ms(
                     timeline["t_submit"],
                     timeline["t_decode_admission_returned"],
@@ -181,6 +199,13 @@ def _timeline_summary(rows: list[dict]) -> list[dict]:
         "kv_import_enqueue_wall_ms",
         "kv_import_completion_observed_after_enqueue_ms",
         "kv_import_gpu_ms",
+        "copy_gpu_ms",
+        "decode_gpu_step_ms",
+        "copy_compute_overlap_ms",
+        "copy_compute_overlap_ratio",
+        "serial_gpu_ms",
+        "overlapped_makespan_gpu_ms",
+        "critical_path_reduction_gpu_ms",
         "decode_continuation_enqueue_ready_ms",
         "e2e_ms",
     )
@@ -205,6 +230,22 @@ def _timeline_summary(rows: list[dict]) -> list[dict]:
             "run_p50_max": max(run_p50) if run_p50 else None,
         })
     return summary
+
+
+def _variant_overlap_coverage(rows: list[dict]) -> list[dict]:
+    coverage = defaultdict(lambda: {"total": 0, "paired": 0})
+    for row in rows:
+        item = coverage[row.get("variant")]
+        item["total"] += 1
+        item["paired"] += row.get("copy_compute_overlap_ms") is not None
+    return [
+        {
+            "variant": variant,
+            "paired": item["paired"],
+            "total": item["total"],
+        }
+        for variant, item in sorted(coverage.items(), key=lambda entry: str(entry[0]))
+    ]
 
 
 def _decode_idle_rows(results: list[dict]) -> list[dict]:
@@ -332,6 +373,15 @@ def _markdown_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _variant_coverage_table(rows: list[dict]) -> str:
+    lines = ["| Variant | Pair coverage |", "|---|---:|"]
+    lines.extend(
+        f"| {row['variant']} | {row['paired']}/{row['total']} |"
+        for row in rows
+    )
+    return "\n".join(lines)
+
+
 def build_report(results_dir: Path, *, reproduction_command: str | None = None) -> Path:
     """Write derived telemetry views while preserving raw run JSON unchanged."""
 
@@ -342,8 +392,17 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
     if not timeline_rows:
         raise ValueError("no complete measurement-window transport timelines found")
     timeline_summary = _timeline_summary(timeline_rows)
+    variant_overlap_coverage = _variant_overlap_coverage(timeline_rows)
     has_target_completion_events = any(
         row.get("kv_import_gpu_ms") is not None for row in timeline_rows
+    )
+    has_device_overlap_events = any(
+        row.get("copy_compute_overlap_ms") is not None
+        for row in timeline_rows
+    )
+    overlap_pair_count = sum(
+        row.get("copy_compute_overlap_ms") is not None
+        for row in timeline_rows
     )
     idle_rows = _decode_idle_rows(results)
     slot_rows = _slot_rows(results)
@@ -380,7 +439,16 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
         "end-to-end latency."
     )
     completion_limit = (
-        "Target H2D plus scatter has a safe Event completion boundary, but the "
+        "This pipeline records same-GPU CUDA Event intervals for target H2D plus "
+        "scatter and the following Decode GPU step. Nonzero "
+        "`copy_compute_overlap_ms` is device-side copy/GPU-step overlap, while "
+        "`critical_path_reduction_gpu_ms` compares the observed overlapped makespan "
+        "with their serial sum. These metrics prove only the measured transfer/step "
+        "pairs; end-to-end throughput still requires its own A/B comparison. "
+        f"Pair coverage: `{overlap_pair_count}/{len(timeline_rows)}` complete "
+        "measurement-window request timelines include a paired Event interval."
+        if has_device_overlap_events
+        else "Target H2D plus scatter has a safe Event completion boundary, but the "
         "current command loop still serializes admission before the following Decode "
         "step. This report does not claim copy/compute overlap; that needs a separate "
         "pipeline experiment with stream timelines and critical-path comparison."
@@ -390,7 +458,12 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
         "boundary and therefore cannot claim copy/compute overlap or use this timestamp "
         "as a safe asynchronous ACK boundary."
     )
-    report = f"""# PD Transport Observability {'v2' if has_target_completion_events else 'Baseline'}
+    report_version = (
+        "v3 Pipeline"
+        if has_device_overlap_events
+        else "v2" if has_target_completion_events else "Baseline"
+    )
+    report = f"""# PD Transport Observability {report_version}
 
 ## Scope
 
@@ -415,6 +488,15 @@ def build_report(results_dir: Path, *, reproduction_command: str | None = None) 
 first-token latency.
 
 {completion_limit}
+
+## Event Pair Coverage
+
+Only request timelines with a transfer Event and the immediately following
+Decode GPU-step Event are eligible for an overlap measurement. Cold-start and
+serial steps remain in the raw timeline but are excluded from the overlap
+statistics.
+
+{_variant_coverage_table(variant_overlap_coverage)}
 
 ## Decode Idle Reasons
 
@@ -441,7 +523,7 @@ experiment.
 
 The source relay still synchronizes D2H export. Do not change slot count or add
 Prefill workers until a separate pipeline experiment reports actual
-copy/compute overlap and critical-path reduction. Only then can the data decide
+copy/GPU-step overlap and critical-path reduction. Only then can the data decide
 whether Decode starvation is due to Prefill supply, KV import, or scheduler
 behavior.
 """

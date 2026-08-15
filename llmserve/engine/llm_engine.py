@@ -12,10 +12,14 @@ import torch.multiprocessing as mp
 
 from llmserve.config import Config
 from llmserve.sampling_params import SamplingParams
-from llmserve.engine.sequence import Sequence
+from llmserve.engine.sequence import Sequence, SequenceStatus
 from llmserve.engine.scheduler import Scheduler
 from llmserve.engine.model_runner import ModelRunner
-from llmserve.pd.kv_transfer import KVImportCompletion, import_logical_kv
+from llmserve.pd.kv_transfer import (
+    CUDAExecutionInterval,
+    KVImportCompletion,
+    import_logical_kv,
+)
 
 
 class LLMEngine:
@@ -48,6 +52,8 @@ class LLMEngine:
         self.last_step_events = {}
         self._prefilled_import_stream = None
         self._prefilled_import_completions: dict[int, KVImportCompletion] = {}
+        self._prefilled_import_deferred_releases: dict[int, Sequence] = {}
+        self.last_step_cuda_interval: CUDAExecutionInterval | None = None
         self.speculative_batch_calls = 0
         self.speculative_batch_sequences = 0
         self.speculative_max_batch_size = 0
@@ -82,16 +88,19 @@ class LLMEngine:
         if self._exited:
             return
         self._exited = True
-        for completion in self._prefilled_import_completions.values():
+        for completion in getattr(
+            self, "_prefilled_import_completions", {}
+        ).values():
             completion.synchronize()
-        self._prefilled_import_completions.clear()
+        self._release_completed_deferred_prefilled_imports()
+        getattr(self, "_prefilled_import_completions", {}).clear()
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
 
     def reset_metrics(self):
-        if not self.scheduler.is_finished():
+        if not self.is_finished():
             raise RuntimeError("cannot reset metrics while requests are active")
         self.request_metrics.clear()
         self.last_step_events = {}
@@ -157,7 +166,12 @@ class LLMEngine:
 
     def abort_request(self, seq_id: int) -> bool:
         """Cancel a waiting or running request between engine steps."""
-        seq = self.scheduler.abort_request(seq_id)
+        seq = self._defer_pending_prefilled_import_release(
+            seq_id,
+            SequenceStatus.CANCELLED,
+        )
+        if seq is None:
+            seq = self.scheduler.abort_request(seq_id)
         if seq is None:
             return False
 
@@ -177,7 +191,12 @@ class LLMEngine:
         """Fail a waiting or running request and release its resources."""
         if not reason:
             raise ValueError("failure reason must not be empty")
-        seq = self.scheduler.fail_request(seq_id)
+        seq = self._defer_pending_prefilled_import_release(
+            seq_id,
+            SequenceStatus.FAILED,
+        )
+        if seq is None:
+            seq = self.scheduler.fail_request(seq_id)
         if seq is None:
             return False
 
@@ -206,7 +225,11 @@ class LLMEngine:
         prompt_token_ids = list(prompt_token_ids)
         seq = Sequence(prompt_token_ids, sampling_params)
         seq.append_token(int(first_token_id))
-        self.scheduler.admit_prefilled(seq, cached_tokens=len(prompt_token_ids))
+        self.scheduler.admit_prefilled(
+            seq,
+            cached_tokens=len(prompt_token_ids),
+            pending=async_kv_import,
+        )
         admitted_at = perf_counter()
         try:
             completion = import_logical_kv(
@@ -226,6 +249,10 @@ class LLMEngine:
 
         if completion is not None:
             self._prefilled_import_completions[seq.seq_id] = completion
+        elif async_kv_import:
+            # A non-CUDA test double may complete synchronously. It is safe to
+            # activate immediately because no asynchronous dependency exists.
+            self.scheduler.activate_prefilled(seq.seq_id)
 
         now = perf_counter()
         metric = self._new_request_metric(seq, arrival_time=now)
@@ -253,7 +280,13 @@ class LLMEngine:
         ):
             metric["finish_time"] = now
             metric["success"] = True
-            self.scheduler.remove_sequence(seq)
+            if completion is not None:
+                self._defer_pending_prefilled_import_release(
+                    seq.seq_id,
+                    SequenceStatus.FINISHED,
+                )
+            else:
+                self.scheduler.remove_sequence(seq)
         return seq.seq_id
 
     def _prefilled_import_stream_for_kv_cache(self):
@@ -269,16 +302,97 @@ class LLMEngine:
     def get_prefilled_import_completion(self, seq_id: int):
         return self._prefilled_import_completions.get(seq_id)
 
-    def complete_prefilled_import(self, seq_id: int):
-        return self._prefilled_import_completions.pop(seq_id, None)
+    def _defer_pending_prefilled_import_release(
+        self,
+        seq_id: int,
+        status: SequenceStatus,
+    ) -> Sequence | None:
+        """Detach a pending import and retain its blocks through Event completion."""
+        completions = getattr(self, "_prefilled_import_completions", {})
+        if seq_id not in completions:
+            return None
+        detach = getattr(self.scheduler, "detach_pending_prefilled", None)
+        if detach is None:
+            return None
+        seq = detach(seq_id, status)
+        if seq is not None:
+            deferred = getattr(self, "_prefilled_import_deferred_releases", None)
+            if deferred is None:
+                deferred = {}
+                self._prefilled_import_deferred_releases = deferred
+            deferred[seq_id] = seq
+        return seq
 
-    def _wait_for_prefilled_imports(self):
-        for completion in getattr(
+    def _release_completed_deferred_prefilled_imports(self):
+        """Return target KV blocks only after their import Event is complete."""
+        release = getattr(self.scheduler, "release_detached_prefilled", None)
+        if release is None:
+            return
+        for seq_id, seq in list(
+            getattr(self, "_prefilled_import_deferred_releases", {}).items()
+        ):
+            completion = getattr(
+                self, "_prefilled_import_completions", {}
+            ).get(seq_id)
+            if completion is not None and not completion.is_complete():
+                continue
+            release(seq)
+            del self._prefilled_import_deferred_releases[seq_id]
+
+    def complete_prefilled_import(self, seq_id: int):
+        self.activate_completed_prefilled_imports()
+        return getattr(self, "_prefilled_import_completions", {}).pop(
+            seq_id, None
+        )
+
+    def activate_completed_prefilled_imports(self) -> list[int]:
+        """Make only completed asynchronous imports eligible for Decode.
+
+        This deliberately polls CUDA Events instead of inserting a default
+        stream wait. Pending imports remain outside the scheduler's runnable
+        queue, allowing their transfer stream to overlap an existing Decode
+        batch.
+        """
+        activated = []
+        scheduler = getattr(self, "scheduler", None)
+        activate = getattr(scheduler, "activate_prefilled", None)
+        if activate is None:
+            return activated
+        for seq_id, completion in getattr(
             self,
             "_prefilled_import_completions",
             {},
-        ).values():
-            completion.wait_on_current_stream()
+        ).items():
+            if not completion.is_complete():
+                continue
+            if seq_id in getattr(self, "_prefilled_import_deferred_releases", {}):
+                self._release_completed_deferred_prefilled_imports()
+            elif activate(seq_id):
+                activated.append(seq_id)
+        return activated
+
+    def begin_step_cuda_interval(self) -> CUDAExecutionInterval | None:
+        """Record the default-stream boundary for one telemetry-enabled step."""
+        self.last_step_cuda_interval = None
+        if not self._latency_telemetry_enabled():
+            return None
+        kv_cache = getattr(getattr(self, "model_runner", None), "kv_cache", None)
+        device = getattr(kv_cache, "device", None)
+        if device is None or device.type != "cuda":
+            return None
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        return CUDAExecutionInterval(device, start_event, end_event)
+
+    def finish_step_cuda_interval(
+        self,
+        interval: CUDAExecutionInterval | None,
+    ):
+        if interval is None:
+            return
+        interval.end_event.record()
+        self.last_step_cuda_interval = interval
 
     @staticmethod
     def _build_speculative_trace_entry(
@@ -323,8 +437,10 @@ class LLMEngine:
             for name, value in sorted(timing.items())
         }
 
-    def step(self):
-        self._wait_for_prefilled_imports()
+    def step(self, *, activate_prefilled_imports: bool = True):
+        self.last_step_cuda_interval = None
+        if activate_prefilled_imports:
+            self.activate_completed_prefilled_imports()
         step_start = perf_counter()
         scheduler_output = self.scheduler.schedule()
         seqs = scheduler_output.scheduled_seqs
@@ -359,7 +475,11 @@ class LLMEngine:
             if seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens
         ]
         before_completion_tokens = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-        token_ids = self.model_runner.call("run", scheduler_output)
+        cuda_interval = self.begin_step_cuda_interval()
+        try:
+            token_ids = self.model_runner.call("run", scheduler_output)
+        finally:
+            self.finish_step_cuda_interval(cuda_interval)
         self.scheduler.postprocess(scheduler_output, token_ids)
         step_end = perf_counter()
 
@@ -805,7 +925,10 @@ class LLMEngine:
         }
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return (
+            self.scheduler.is_finished()
+            and not getattr(self, "_prefilled_import_completions", {})
+        )
 
     def generate(
         self,
