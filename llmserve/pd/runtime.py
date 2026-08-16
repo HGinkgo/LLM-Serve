@@ -285,6 +285,7 @@ class PrefillWorkerRuntime:
         model_forward_gpu_ms = 0.0
         kv_export_copy_ms = 0.0
         forward_calls = 0
+        partial_prefill_chunk_lengths = []
         prefill_first_scheduled_at = None
         try:
             for envelope in envelopes:
@@ -398,6 +399,9 @@ class PrefillWorkerRuntime:
                     completed.append((seq, handoff))
 
                 if partial_seqs:
+                    partial_prefill_chunk_lengths.extend(
+                        seq.num_scheduled_tokens for seq in partial_seqs
+                    )
                     partial_output = SchedulerOutput(
                         partial_seqs,
                         partial_seqs,
@@ -420,6 +424,12 @@ class PrefillWorkerRuntime:
                 "model_forward_gpu_ms": model_forward_gpu_ms,
                 "kv_export_copy_ms": kv_export_copy_ms,
                 "forward_calls": forward_calls,
+                "partial_prefill_chunk_count": len(
+                    partial_prefill_chunk_lengths
+                ),
+                "partial_prefill_chunk_lengths": list(
+                    partial_prefill_chunk_lengths
+                ),
             }
             for handoff in handoffs_by_request_id.values():
                 handoff.prefill_timing_ms = dict(batch_timing)

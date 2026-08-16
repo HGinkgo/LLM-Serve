@@ -289,6 +289,56 @@ class BenchmarkServeTests(unittest.TestCase):
         self.assertEqual(factory_calls[0]["kv_slot_count"], 2)
         self.assertEqual(factory_calls[0]["kv_slot_capacity_tokens"], 1024)
 
+    def test_run_point_selects_dual_collocated_factory(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        point = make_point()
+        point["runtime"].update({
+            "dual_collocated": True,
+            "collocated_gpus": [0, 1],
+            "collocated_init_methods": [
+                "tcp://127.0.0.1:24711",
+                "tcp://127.0.0.1:24712",
+            ],
+            "startup_timeout_seconds": 300,
+            "enforce_eager": False,
+        })
+        factory_calls = []
+
+        def factory(model, **kwargs):
+            factory_calls.append((model, kwargs))
+            return FakeEngine(clock)
+
+        with patch("benchmarks.serve._default_dual_collocated_engine_factory", factory):
+            run_point(
+                point,
+                model="/models/Qwen3-8B",
+                make_sampling_params=lambda spec: spec.output_len,
+                clock=clock.perf_counter,
+                sleep=clock.sleep,
+            )
+
+        self.assertEqual(factory_calls[0][1]["collocated_gpus"], (0, 1))
+        self.assertEqual(
+            factory_calls[0][1]["collocated_init_methods"],
+            ("tcp://127.0.0.1:24711", "tcp://127.0.0.1:24712"),
+        )
+        self.assertFalse(factory_calls[0][1].get("pd", False))
+
+    def test_run_point_rejects_pd_dual_collocated_hybrid(self):
+        from benchmarks.serve import run_point
+
+        point = make_point()
+        point["runtime"].update({"pd": True, "dual_collocated": True})
+
+        with self.assertRaisesRegex(ValueError, "cannot enable both"):
+            run_point(
+                point,
+                model="/models/Qwen3-8B",
+                engine_factory=lambda *args, **kwargs: None,
+            )
+
     def test_run_point_passes_pd_startup_timeout_to_engine_factory(self):
         from benchmarks.serve import run_point
 

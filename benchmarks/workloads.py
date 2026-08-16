@@ -88,11 +88,14 @@ def iter_request_specs(
     classes: Sequence[WorkloadClass],
     seed: int,
     cycle_size: int = 100,
+    ordering: str = "shuffled",
 ):
     if not classes:
         raise ValueError("classes cannot be empty")
     if cycle_size <= 0:
         raise ValueError("cycle_size must be positive")
+    if ordering not in {"shuffled", "interleaved"}:
+        raise ValueError("ordering must be shuffled or interleaved")
 
     rng = Random(seed)
     request_id = 0
@@ -101,7 +104,18 @@ def iter_request_specs(
         assignments = []
         for workload_class, count in zip(classes, counts):
             assignments.extend([workload_class] * count)
-        rng.shuffle(assignments)
+        if ordering == "shuffled":
+            rng.shuffle(assignments)
+        else:
+            ordered = []
+            remaining = list(counts)
+            while any(remaining):
+                for index, workload_class in enumerate(classes):
+                    if remaining[index] <= 0:
+                        continue
+                    ordered.append(workload_class)
+                    remaining[index] -= 1
+            assignments = ordered
         for workload_class in assignments:
             prompt_token_ids = tuple(
                 rng.randint(0, 10000)

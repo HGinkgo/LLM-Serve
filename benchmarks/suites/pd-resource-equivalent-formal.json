@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "name": "pd-resource-equivalent-formal",
+  "runs": 3,
+  "execution_order_seed": 20260816,
+  "profiles": {
+    "uniform-short": {
+      "trace_order": "interleaved",
+      "classes": [
+        {
+          "name": "short",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 64
+        }
+      ]
+    },
+    "long-short-interleaved": {
+      "trace_order": "interleaved",
+      "classes": [
+        {
+          "name": "short",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 64
+        },
+        {
+          "name": "long",
+          "weight": 1,
+          "input_len": 2048,
+          "output_len": 64
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "pd-resource-uniform-short",
+      "arrival": "closed-loop",
+      "profile": "uniform-short",
+      "max_concurrencies": [64],
+      "warmup_seconds": 30,
+      "measurement_seconds": 60,
+      "variants": [
+        {
+          "name": "strong-collocated",
+          "pd": false,
+          "dual_collocated": false,
+          "enforce_eager": false
+        },
+        {
+          "name": "dual-collocated",
+          "pd": false,
+          "dual_collocated": true,
+          "collocated_gpus": [0, 1],
+          "collocated_init_methods": [
+            "tcp://127.0.0.1:24711",
+            "tcp://127.0.0.1:24712"
+          ],
+          "startup_timeout_seconds": 300,
+          "enforce_eager": false
+        },
+        {
+          "name": "pd-shared",
+          "pd": true,
+          "dual_collocated": false,
+          "prefill_gpu": 0,
+          "decode_gpu": 1,
+          "prefill_init_method": "tcp://127.0.0.1:24713",
+          "decode_init_method": "tcp://127.0.0.1:24714",
+          "prefill_batch_size": 4,
+          "prefill_enforce_eager": true,
+          "decode_enforce_eager": false,
+          "kv_slot_count": 2,
+          "kv_slot_capacity_tokens": 1024,
+          "enable_pd_transport_overlap": true,
+          "startup_timeout_seconds": 300
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "sample_gpu_clocks": true,
+        "random_seed": 20260816,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9
+      },
+      "slo_ms": {
+        "ttft": 30000,
+        "tpot": 250,
+        "e2e": 180000
+      }
+    },
+    {
+      "name": "pd-resource-long-short-mixed",
+      "arrival": "closed-loop",
+      "profile": "long-short-interleaved",
+      "max_concurrencies": [64],
+      "warmup_seconds": 30,
+      "measurement_seconds": 60,
+      "variants": [
+        {
+          "name": "strong-collocated",
+          "pd": false,
+          "dual_collocated": false,
+          "enforce_eager": false
+        },
+        {
+          "name": "dual-collocated",
+          "pd": false,
+          "dual_collocated": true,
+          "collocated_gpus": [0, 1],
+          "collocated_init_methods": [
+            "tcp://127.0.0.1:24721",
+            "tcp://127.0.0.1:24722"
+          ],
+          "startup_timeout_seconds": 300,
+          "enforce_eager": false
+        },
+        {
+          "name": "pd-shared",
+          "pd": true,
+          "dual_collocated": false,
+          "prefill_gpu": 0,
+          "decode_gpu": 1,
+          "prefill_init_method": "tcp://127.0.0.1:24723",
+          "decode_init_method": "tcp://127.0.0.1:24724",
+          "prefill_batch_size": 4,
+          "prefill_enforce_eager": true,
+          "decode_enforce_eager": false,
+          "kv_slot_count": 2,
+          "kv_slot_capacity_tokens": 8192,
+          "enable_pd_transport_overlap": true,
+          "startup_timeout_seconds": 300
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "sample_gpu_clocks": true,
+        "random_seed": 20260816,
+        "max_model_len": 2304,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9
+      },
+      "slo_ms": {
+        "ttft": 30000,
+        "tpot": 250,
+        "e2e": 180000
+      }
+    }
+  ]
+}

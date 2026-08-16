@@ -76,6 +76,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-decode-pool-smoke.json",
                 "pd-decode-pool-output-smoke.json",
                 "pd-prefill-batch-mixed-smoke.json",
+                "pd-resource-equivalent-formal.json",
                 "pd-serving-mixed-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",

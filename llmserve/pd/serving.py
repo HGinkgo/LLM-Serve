@@ -470,6 +470,12 @@ class PDServingEngine:
                     "kv_export_copy_ms"
                 ),
                 "prefill_forward_calls": prefill_timing.get("forward_calls"),
+                "partial_prefill_chunk_count": prefill_timing.get(
+                    "partial_prefill_chunk_count"
+                ),
+                "partial_prefill_chunk_lengths": prefill_timing.get(
+                    "partial_prefill_chunk_lengths"
+                ),
                 "prefill_parent_overhead_ms": (
                     (finished_at - meta.get("submitted_at", finished_at)) * 1000
                     - worker_total_ms

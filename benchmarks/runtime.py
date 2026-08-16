@@ -1,6 +1,8 @@
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
+from hashlib import sha256
+import json
 
 from benchmarks.workloads import RequestSpec
 
@@ -15,11 +17,19 @@ _SCHEDULER_TELEMETRY_FIELDS = (
     "partial_prefill_seq_ids", "partial_prefill_chunk_count",
     "prefill_chunk_lengths", "model_forward_gpu_ms", "model_forward_stage",
     "pd_slot_state", "pd_handoff_count",
+    "replica_events", "replica_queue_state",
 )
 
 
 def _submit_request(engine, prompt_token_ids, sampling_params, clock):
     submitted_at = clock()
+    benchmark_submit = getattr(engine, "add_benchmark_request", None)
+    if benchmark_submit is not None:
+        return benchmark_submit(
+            prompt_token_ids,
+            sampling_params,
+            submitted_at,
+        )
     seq_id = engine.add_request(prompt_token_ids, sampling_params)
     recorder = getattr(engine, "record_benchmark_submit", None)
     if recorder is not None:
@@ -35,6 +45,30 @@ def _compact_scheduler_step(events):
     }
     record["scheduled_request_count"] = len(events.get("scheduled_seq_ids", ()))
     return record
+
+
+def _request_trace_audit(seq_to_spec):
+    """Audit deterministic request content without persisting prompt tokens."""
+    entries = []
+    for spec in sorted(seq_to_spec.values(), key=lambda item: item.request_id):
+        prompt_payload = json.dumps(
+            list(spec.prompt_token_ids), separators=(",", ":")
+        ).encode()
+        entries.append({
+            "request_id": spec.request_id,
+            "request_class": spec.request_class,
+            "input_len": spec.input_len,
+            "output_len": spec.output_len,
+            "prompt_sha256": sha256(prompt_payload).hexdigest(),
+        })
+    digest_payload = json.dumps(
+        entries, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return {
+        "entry_count": len(entries),
+        "sha256": sha256(digest_payload).hexdigest(),
+        "entries": entries,
+    }
 
 
 def run_poisson(
@@ -121,6 +155,7 @@ def run_poisson(
         "running_queue_sizes": running_queue_sizes,
         "scheduler_steps": scheduler_steps,
         "engine_summary": engine_metrics.get("summary", {}),
+        "request_trace": _request_trace_audit(seq_to_spec),
     }
 
 
@@ -230,4 +265,5 @@ def run_closed_loop(
         "running_queue_sizes": running_queue_sizes,
         "scheduler_steps": scheduler_steps,
         "engine_summary": engine_metrics.get("summary", {}),
+        "request_trace": _request_trace_audit(seq_to_spec),
     }
