@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -287,6 +288,61 @@ class BenchmarkServeTests(unittest.TestCase):
         self.assertFalse(factory_calls[0]["decode_enforce_eager"])
         self.assertEqual(factory_calls[0]["kv_slot_count"], 2)
         self.assertEqual(factory_calls[0]["kv_slot_capacity_tokens"], 1024)
+
+    def test_run_point_passes_pd_startup_timeout_to_engine_factory(self):
+        from benchmarks.serve import run_point
+
+        clock = FakeClock()
+        factory_calls = []
+        point = make_point()
+        point["runtime"].update({
+            "pd": True,
+            "startup_timeout_seconds": 300.0,
+        })
+
+        def engine_factory(model, **kwargs):
+            factory_calls.append(kwargs)
+            return FakeEngine(clock)
+
+        run_point(
+            point,
+            model="/models/Qwen3-8B",
+            engine_factory=engine_factory,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(factory_calls[0]["startup_timeout_seconds"], 300.0)
+
+    def test_pd_factory_consumes_startup_timeout_before_engine_construction(self):
+        from benchmarks.serve import _default_pd_engine_factory
+
+        class FakeCoordinator:
+
+            def __init__(self, config):
+                self.config = config
+
+        class FakeServingEngine:
+
+            def __init__(self, coordinator, **kwargs):
+                self.coordinator = coordinator
+                self.kwargs = kwargs
+
+        with (
+            patch("llmserve.pd.PDCoordinator", FakeCoordinator),
+            patch("llmserve.pd.PDServingEngine", FakeServingEngine),
+        ):
+            engine = _default_pd_engine_factory(
+                "/models/Qwen3-8B",
+                startup_timeout_seconds=300.0,
+            )
+
+        self.assertEqual(engine.coordinator.config.startup_timeout_seconds, 300.0)
+        self.assertNotIn(
+            "startup_timeout_seconds",
+            engine.coordinator.config.engine_kwargs,
+        )
 
     def test_run_point_passes_decode_pool_configuration(self):
         from benchmarks.serve import run_point

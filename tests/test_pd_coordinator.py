@@ -13,11 +13,13 @@ class FakeQueue:
         self.responses = deque(responses)
         self.commands = []
         self.closed = False
+        self.timeouts = []
 
     def put(self, command):
         self.commands.append(command)
 
     def get(self, timeout=None):
+        self.timeouts.append(timeout)
         if not self.responses:
             raise Empty
         return self.responses.popleft()
@@ -64,6 +66,28 @@ class TestPDConfig(unittest.TestCase):
 
         self.assertTrue(config.engine_kwargs_for("prefill")["enforce_eager"])
         self.assertFalse(config.engine_kwargs_for("decode")["enforce_eager"])
+
+    def test_startup_timeout_is_independent_from_worker_rpc_timeout(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            request_timeout_seconds=12.0,
+            startup_timeout_seconds=300.0,
+        )
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        queue = FakeQueue(responses=[{
+            "ok": True,
+            "result": {"ready": True, "role": "prefill"},
+        }])
+        coordinator._workers = {"prefill": {"responses": queue}}
+
+        coordinator._wait_worker_ready("prefill")
+
+        self.assertEqual(config.request_timeout_seconds, 12.0)
+        self.assertEqual(config.startup_timeout_seconds, 300.0)
+        self.assertGreater(queue.timeouts[0], 12.0)
 
     def test_config_assigns_unique_roles_and_endpoints_to_decode_pool(self):
         config = PDConfig(

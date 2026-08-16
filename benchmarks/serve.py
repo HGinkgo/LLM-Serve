@@ -88,6 +88,7 @@ def _default_pd_engine_factory(model, **kwargs):
     kv_slot_count = kwargs.pop("kv_slot_count", 2)
     kv_slot_capacity_tokens = kwargs.pop("kv_slot_capacity_tokens", 1024)
     enable_transport_overlap = kwargs.pop("enable_pd_transport_overlap", False)
+    startup_timeout_seconds = kwargs.pop("startup_timeout_seconds", None)
     coordinator = PDCoordinator(
         PDConfig(
             model=model,
@@ -101,6 +102,7 @@ def _default_pd_engine_factory(model, **kwargs):
             decode_init_methods=decode_init_methods,
             kv_slot_count=kv_slot_count,
             kv_slot_capacity_tokens=kv_slot_capacity_tokens,
+            startup_timeout_seconds=startup_timeout_seconds,
             engine_kwargs=kwargs,
         )
     )
@@ -140,6 +142,7 @@ def _effective_runtime_config(engine):
             "decode_enforce_eager": config.decode_enforce_eager,
             "kv_slot_count": config.kv_slot_count,
             "kv_slot_capacity_tokens": config.kv_slot_capacity_tokens,
+            "startup_timeout_seconds": config.startup_timeout_seconds,
             "prefill_batch_size": engine.prefill_batch_size,
             "enable_pd_transport_overlap": engine.enable_transport_overlap,
             "engine_kwargs": {
@@ -294,6 +297,7 @@ def run_point(
                 "enable_pd_transport_overlap": runtime.get(
                     "enable_pd_transport_overlap", False
                 ),
+                "startup_timeout_seconds": runtime.get("startup_timeout_seconds"),
             }
         )
     if distributed_init_method is not None:

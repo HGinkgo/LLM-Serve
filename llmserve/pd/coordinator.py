@@ -28,6 +28,7 @@ class PDConfig:
     decode_init_methods: tuple[str, ...] = ()
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
     request_timeout_seconds: float = 120.0
+    startup_timeout_seconds: float | None = None
     kv_slot_count: int = 2
     kv_slot_capacity_tokens: int = 1024
 
@@ -62,6 +63,10 @@ class PDConfig:
         self.decode_init_method = decode_init_methods[0]
         if self.request_timeout_seconds <= 0:
             raise ValueError("request timeout must be positive")
+        if self.startup_timeout_seconds is None:
+            self.startup_timeout_seconds = self.request_timeout_seconds
+        elif self.startup_timeout_seconds <= 0:
+            raise ValueError("startup timeout must be positive")
         if (
             not isinstance(self.kv_slot_count, int)
             or self.kv_slot_count < 0
@@ -216,7 +221,7 @@ class PDCoordinator:
 
     def _wait_worker_ready(self, role: str):
         worker = self._workers[role]
-        deadline = perf_counter() + self.config.request_timeout_seconds
+        deadline = perf_counter() + self.config.startup_timeout_seconds
         progress = worker.setdefault("startup_progress", [])
         while True:
             timeout = deadline - perf_counter()
@@ -266,7 +271,7 @@ class PDCoordinator:
             )
         return PDWorkerError(
             f"{role} worker did not become ready within "
-            f"{self.config.request_timeout_seconds:.1f}s "
+            f"{self.config.startup_timeout_seconds:.1f}s "
             f"(last startup stage: {last_stage}; {process_state})"
         )
 

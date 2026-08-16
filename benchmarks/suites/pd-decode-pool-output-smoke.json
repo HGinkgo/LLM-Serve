@@ -36,6 +36,7 @@
           "decode_enforce_eager": false,
           "kv_slot_count": 2,
           "kv_slot_capacity_tokens": 1024,
+          "startup_timeout_seconds": 300,
           "enable_pd_transport_overlap": true
         },
         {
@@ -54,6 +55,7 @@
           "decode_enforce_eager": false,
           "kv_slot_count": 2,
           "kv_slot_capacity_tokens": 1024,
+          "startup_timeout_seconds": 300,
           "enable_pd_transport_overlap": true
         }
       ],
