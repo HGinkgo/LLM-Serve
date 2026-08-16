@@ -194,6 +194,19 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     ]
                     for point in points
                 ))
+                pd_point = next(
+                    point
+                    for point in points
+                    if point["variant"] == "pd-shared-1p1d"
+                )
+                max_prompt_tokens = max(
+                    item["input_len"]
+                    for item in pd_point["workload"]["classes"]
+                )
+                self.assertEqual(
+                    pd_point["runtime"]["kv_slot_capacity_tokens"],
+                    pd_point["runtime"]["prefill_batch_size"] * max_prompt_tokens,
+                )
             if path.name == "pd-decode-pool-formal.json":
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 24)
