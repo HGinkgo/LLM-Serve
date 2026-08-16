@@ -74,6 +74,8 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-kv-pipeline-smoke.json",
                 "pd-decode-pool-formal.json",
                 "pd-decode-pool-smoke.json",
+                "pd-decode-pool-output-smoke.json",
+                "pd-serving-mixed-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",
                 "pd-transport-observability.json",
@@ -154,6 +156,44 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     ["tcp://127.0.0.1:24532", "tcp://127.0.0.1:24533"],
                 )
                 self.assertTrue(point["runtime"]["enable_pd_transport_overlap"])
+            if path.name == "pd-decode-pool-output-smoke.json":
+                self.assertEqual(suite["runs"], 1)
+                self.assertEqual(len(points), 2)
+                self.assertEqual({point["max_concurrency"] for point in points}, {64})
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"pd-shared-1p1d", "pd-shared-1p2d"},
+                )
+                self.assertTrue(all(
+                    point["warmup_seconds"] == 10
+                    and point["measurement_seconds"] == 20
+                    and point["workload"]["classes"] == [{
+                        "name": "decode",
+                        "weight": 1,
+                        "input_len": 128,
+                        "output_len": 256,
+                    }]
+                    for point in points
+                ))
+            if path.name == "pd-serving-mixed-smoke.json":
+                self.assertEqual(suite["runs"], 1)
+                self.assertEqual(len(points), 2)
+                self.assertEqual({point["max_concurrency"] for point in points}, {16})
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"strong-collocated", "pd-shared-1p1d"},
+                )
+                self.assertTrue(all(
+                    point["warmup_seconds"] == 10
+                    and point["measurement_seconds"] == 20
+                    and point["runtime"]["enable_chunked_prefill"]
+                    and point["runtime"]["max_model_len"] == 2304
+                    and point["workload"]["classes"] == [
+                        {"name": "short", "weight": 0.8, "input_len": 128, "output_len": 64},
+                        {"name": "long", "weight": 0.2, "input_len": 2048, "output_len": 64},
+                    ]
+                    for point in points
+                ))
             if path.name == "pd-decode-pool-formal.json":
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 24)

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "name": "pd-decode-pool-output-smoke",
+  "runs": 1,
+  "execution_order_seed": 20260816,
+  "profiles": {
+    "output-heavy": {
+      "classes": [
+        {
+          "name": "decode",
+          "weight": 1,
+          "input_len": 128,
+          "output_len": 256
+        }
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "pd-decode-pool-output-smoke",
+      "arrival": "closed-loop",
+      "profile": "output-heavy",
+      "max_concurrencies": [64],
+      "warmup_seconds": 10,
+      "measurement_seconds": 20,
+      "variants": [
+        {
+          "name": "pd-shared-1p1d",
+          "pd": true,
+          "prefill_gpu": 0,
+          "decode_gpu": 1,
+          "prefill_init_method": "tcp://127.0.0.1:24711",
+          "decode_init_method": "tcp://127.0.0.1:24712",
+          "prefill_batch_size": 4,
+          "prefill_enforce_eager": true,
+          "decode_enforce_eager": false,
+          "kv_slot_count": 2,
+          "kv_slot_capacity_tokens": 1024,
+          "enable_pd_transport_overlap": true
+        },
+        {
+          "name": "pd-shared-1p2d",
+          "pd": true,
+          "prefill_gpu": 0,
+          "decode_gpu": 1,
+          "decode_gpus": [1, 2],
+          "prefill_init_method": "tcp://127.0.0.1:24721",
+          "decode_init_methods": [
+            "tcp://127.0.0.1:24722",
+            "tcp://127.0.0.1:24723"
+          ],
+          "prefill_batch_size": 4,
+          "prefill_enforce_eager": true,
+          "decode_enforce_eager": false,
+          "kv_slot_count": 2,
+          "kv_slot_capacity_tokens": 1024,
+          "enable_pd_transport_overlap": true
+        }
+      ],
+      "runtime": {
+        "enforce_eager": true,
+        "argmax_sampler": false,
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "sample_gpu_clocks": true,
+        "random_seed": 20260816,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9
+      },
+      "slo_ms": {
+        "ttft": 10000,
+        "tpot": 250,
+        "e2e": 120000
+      }
+    }
+  ]
+}
