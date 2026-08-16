@@ -75,6 +75,7 @@ class BenchmarkSuiteTests(unittest.TestCase):
                 "pd-decode-pool-formal.json",
                 "pd-decode-pool-smoke.json",
                 "pd-decode-pool-output-smoke.json",
+                "pd-prefill-batch-mixed-smoke.json",
                 "pd-serving-mixed-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
                 "pd-strong-baseline.json",
@@ -207,6 +208,31 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     pd_point["runtime"]["kv_slot_capacity_tokens"],
                     pd_point["runtime"]["prefill_batch_size"] * max_prompt_tokens,
                 )
+            if path.name == "pd-prefill-batch-mixed-smoke.json":
+                self.assertEqual(suite["runs"], 1)
+                self.assertEqual(len(points), 3)
+                self.assertEqual({point["max_concurrency"] for point in points}, {16})
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"pd-shared-b1", "pd-shared-b2", "pd-shared-b4"},
+                )
+                self.assertEqual(
+                    {point["runtime"]["prefill_batch_size"] for point in points},
+                    {1, 2, 4},
+                )
+                self.assertTrue(all(
+                    point["warmup_seconds"] == 10
+                    and point["measurement_seconds"] == 20
+                    and point["runtime"]["pd"]
+                    and point["runtime"]["kv_slot_count"] == 2
+                    and point["runtime"]["kv_slot_capacity_tokens"] == 8192
+                    and point["runtime"]["enable_pd_transport_overlap"]
+                    and point["workload"]["classes"] == [
+                        {"name": "short", "weight": 0.8, "input_len": 128, "output_len": 64},
+                        {"name": "long", "weight": 0.2, "input_len": 2048, "output_len": 64},
+                    ]
+                    for point in points
+                ))
             if path.name == "pd-decode-pool-formal.json":
                 self.assertEqual(suite["runs"], 3)
                 self.assertEqual(len(points), 24)
