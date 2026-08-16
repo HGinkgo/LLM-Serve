@@ -423,6 +423,9 @@ class PDCoordinator:
             environment = worker.get("ready_result", {}).get("environment")
             if environment is not None:
                 item["environment"] = environment
+            startup_progress = worker.get("startup_progress")
+            if startup_progress:
+                item["startup_progress"] = list(startup_progress)
             health[role] = item
         return health
 

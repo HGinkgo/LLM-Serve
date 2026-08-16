@@ -251,6 +251,9 @@ class TestPDConfig(unittest.TestCase):
                 "ready_result": {
                     "environment": {"cpu_affinity": [0, 1]},
                 },
+                "startup_progress": [
+                    {"stage": "engine_initialized", "elapsed_ms": 123.0},
+                ],
             },
             "decode": {
                 "ready_result": {
@@ -262,6 +265,10 @@ class TestPDConfig(unittest.TestCase):
         health = coordinator.worker_health()
 
         self.assertEqual(health["prefill"]["environment"]["cpu_affinity"], [0, 1])
+        self.assertEqual(
+            health["prefill"]["startup_progress"],
+            [{"stage": "engine_initialized", "elapsed_ms": 123.0}],
+        )
         self.assertEqual(health["decode"]["environment"]["cpu_affinity"], [2, 3])
 
     def test_prefill_batch_serializes_envelopes_for_worker_rpc(self):
