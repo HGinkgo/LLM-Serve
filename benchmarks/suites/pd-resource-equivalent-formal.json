@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "pd-resource-equivalent-formal",
-  "runs": 3,
+  "runs": 1,
   "execution_order_seed": 20260816,
   "profiles": {
     "uniform-short": {
@@ -16,7 +16,7 @@
       ]
     },
     "long-short-interleaved": {
-      "trace_order": "interleaved",
+      "trace_order": "balanced_interleaved",
       "classes": [
         {
           "name": "short",

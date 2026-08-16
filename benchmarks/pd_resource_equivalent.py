@@ -166,13 +166,16 @@ def _trace_audit(results):
         ):
             raise ValueError("A/B/C request trace prefixes differ")
         classes = reference.get("workload", {}).get("classes", [])
+        trace_order = reference.get("workload", {}).get("trace_order")
         if (
-            reference.get("workload", {}).get("trace_order") == "interleaved"
+            trace_order in {"interleaved", "balanced_interleaved"}
             and len(classes) == 2
             and classes[0].get("weight") == classes[1].get("weight")
         ):
+            pattern = (0, 1) if trace_order == "interleaved" else (0, 1, 1, 0)
             expected_classes = [
-                classes[index % 2]["name"] for index in range(common)
+                classes[pattern[index % len(pattern)]]["name"]
+                for index in range(common)
             ]
             actual_classes = [
                 entry.get("request_class") for entry in reference_entries
@@ -515,6 +518,7 @@ def build_report(results_dir: Path):
     )
 
     experiments = sorted({result["config"]["experiment"] for result in results})
+    run_count = len({result["config"]["run"] for result in results})
     lookup = _summary_lookup(summary)
     comparison_lines = []
     for experiment in experiments:
@@ -539,16 +543,16 @@ def build_report(results_dir: Path):
 This report is generated only from the raw JSON in this directory. It compares:
 
 - **A**: one GPU, one complete Collocated Runtime.
-- **B**: two independent complete Collocated replicas, one on each GPU, with class-agnostic two-request striped round-robin routing (`replica-0, replica-1, replica-1, replica-0, ...`). There is no PD role, KV handoff, Shared Slot, or Inline Queue path.
+- **B**: two independent complete Collocated replicas, one on each GPU, with frontend `round_robin` routing. There is no PD role, KV handoff, Shared Slot, or Inline Queue path.
 - **C**: one Prefill GPU and one Decode GPU with the existing descriptor-only, pinned Shared KV slots and ACK/backpressure path. Every validated C handoff is `shared_slot`.
 
-`C vs A` is a complete deployment comparison; it includes the extra GPU/model copy, resource isolation, PD pipeline, and Shared KV. `C vs B` is the equal-resource comparison. Neither is attributed to Inline or to pure Shared KV.
+`C vs A` is a complete deployment comparison; it includes the extra GPU/model copy, resource isolation, PD pipeline, and Shared KV. `C vs B` is the equal-resource comparison. Neither is attributed to Inline or to pure Shared KV. The c=64 cap is enforced once at the frontend and is shared by both B replicas; it is not 64 requests per replica.
 
 ## Aggregate Results
 
 {chr(10).join(f'### {experiment}{chr(10)}{_table(summary, experiment)}' for experiment in experiments)}
 
-Values are three-run means; `med` is the three-run median and the trailing range is min/max. Engine TTFT is the engine's submit-to-first-sampled-token interval, TPOT is between first and final generated token, and E2E is submit-to-finish. Latency samples are requests submitted after warmup and finished before the measurement-window end; output throughput counts tokens emitted within the 60-second window.
+Values are {run_count}-run means; `med` is the {run_count}-run median and the trailing range is min/max. Engine TTFT is the engine's submit-to-first-sampled-token interval, TPOT is between first and final generated token, and E2E is submit-to-finish. Latency samples are requests submitted after warmup and finished before the measurement-window end; output throughput counts tokens emitted within the 60-second window.
 
 ## Resource-Equivalent Comparisons
 
@@ -556,7 +560,7 @@ Values are three-run means; `med` is the three-run median and the trailing range
 
 ## Long/Short Mixed Results
 
-The mixed experiment uses a deterministic 50:50 `short, long, short, long, ...` trace: short is `128 input / 64 output`; long is `2048 input / 64 output`. Each run uses c=64 closed-loop, 30-second warmup and 60-second measurement. C reserves `8192` tokens per Shared KV slot so a four-request all-long Prefill batch stays on the Shared Slot path.
+The mixed experiment uses a deterministic 50:50 `short, long, long, short, ...` trace: short is `128 input / 64 output`; long is `2048 input / 64 output`. The fixed four-request pattern is deliberately de-correlated from B's `replica-0, replica-1, ...` routing, so each replica receives one short and one long request per pattern. Each run uses global c=64 closed-loop, 30-second warmup and 60-second measurement. C reserves `8192` tokens per Shared KV slot so a four-request all-long Prefill batch stays on the Shared Slot path.
 
 {mixed_class_table}
 
@@ -564,7 +568,7 @@ The mixed experiment uses a deterministic 50:50 `short, long, short, long, ...` 
 
 {_replica_table(replica_rows)}
 
-`dual_collocated_replicas.csv` records the same data, including short/long request allocation. The stripe only uses request order, never request class; this prevents the fixed `short,long,...` trace from pinning one class to one GPU. A nonzero imbalance or missing replica state is reported as data, not hidden by global aggregation.
+`dual_collocated_replicas.csv` records the same data, including short/long request allocation. The fixed request order prevents round-robin routing from pinning one class to one GPU. A nonzero imbalance or missing replica state is reported as data, not hidden by global aggregation.
 
 ## C Stage Diagnostics
 

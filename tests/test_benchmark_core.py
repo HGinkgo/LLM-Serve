@@ -86,6 +86,35 @@ class BenchmarkWorkloadTests(unittest.TestCase):
             list(range(12)),
         )
 
+    def test_balanced_interleaved_stream_breaks_round_robin_class_correlation(self):
+        from benchmarks.workloads import WorkloadClass, iter_request_specs
+
+        classes = [
+            WorkloadClass("short", weight=1, input_len=8, output_len=4),
+            WorkloadClass("long", weight=1, input_len=16, output_len=4),
+        ]
+
+        stream = iter_request_specs(
+            classes,
+            seed=19,
+            cycle_size=12,
+            ordering="balanced_interleaved",
+        )
+        specs = [next(stream) for _ in range(12)]
+
+        self.assertEqual(
+            [spec.request_class for spec in specs],
+            ["short", "long", "long", "short"] * 3,
+        )
+        self.assertEqual(
+            [spec.request_class for spec in specs[::2]],
+            ["short", "long"] * 3,
+        )
+        self.assertEqual(
+            [spec.request_class for spec in specs[1::2]],
+            ["long", "short"] * 3,
+        )
+
 
 class BenchmarkArrivalTests(unittest.TestCase):
     def test_poisson_arrivals_start_immediately_and_are_reproducible(self):

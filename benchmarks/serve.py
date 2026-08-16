@@ -165,7 +165,7 @@ def _effective_runtime_config(engine):
             "replica_gpus": list(config.gpu_ids),
             "replica_worker_ids": list(config.worker_ids),
             "replica_init_methods": list(config.init_methods),
-            "routing_policy": "two_request_striped_round_robin",
+            "routing_policy": "round_robin",
             "startup_timeout_seconds": config.startup_timeout_seconds,
             "engine_kwargs": {
                 name: config.engine_kwargs.get(name) for name in fields

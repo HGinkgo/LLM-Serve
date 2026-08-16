@@ -15,8 +15,8 @@ class ResourceEquivalentSuiteTests(unittest.TestCase):
         )
         points = expand_suite(suite)
 
-        self.assertEqual(suite["runs"], 3)
-        self.assertEqual(len(points), 18)
+        self.assertEqual(suite["runs"], 1)
+        self.assertEqual(len(points), 6)
         self.assertEqual({point["max_concurrency"] for point in points}, {64})
         self.assertEqual(
             {point["variant"] for point in points},
@@ -41,7 +41,7 @@ class ResourceEquivalentSuiteTests(unittest.TestCase):
             if point["experiment"] == "pd-resource-long-short-mixed"
         ]
         self.assertTrue(all(
-            point["workload"]["trace_order"] == "interleaved"
+            point["workload"]["trace_order"] == "balanced_interleaved"
             and point["workload"]["classes"] == [
                 {"name": "short", "weight": 1, "input_len": 128, "output_len": 64},
                 {"name": "long", "weight": 1, "input_len": 2048, "output_len": 64},

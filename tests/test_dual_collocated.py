@@ -87,7 +87,7 @@ class DualCollocatedServingEngineTests(unittest.TestCase):
         coordinator = FakeCoordinator()
         return DualCollocatedServingEngine(coordinator), coordinator
 
-    def test_striped_round_robin_balances_an_interleaved_trace(self):
+    def test_round_robin_routes_requests_to_both_replicas(self):
         engine, coordinator = self._engine()
 
         request_ids = [
@@ -98,22 +98,19 @@ class DualCollocatedServingEngineTests(unittest.TestCase):
         self.assertEqual(request_ids, list(range(8)))
         self.assertEqual(
             [call[0] for call in coordinator.add_calls],
-            [
-                "replica-0", "replica-1", "replica-1", "replica-0",
-                "replica-0", "replica-1", "replica-1", "replica-0",
-            ],
+            ["replica-0", "replica-1"] * 4,
         )
         self.assertEqual(
             engine.request_assignments(),
             {
                 0: "replica-0",
                 1: "replica-1",
-                2: "replica-1",
-                3: "replica-0",
+                2: "replica-0",
+                3: "replica-1",
                 4: "replica-0",
                 5: "replica-1",
-                6: "replica-1",
-                7: "replica-0",
+                6: "replica-0",
+                7: "replica-1",
             },
         )
 
@@ -214,7 +211,7 @@ class DualCollocatedServingEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             metrics["summary"]["routing"]["policy"],
-            "two_request_striped_round_robin",
+            "round_robin",
         )
 
     def test_exit_closes_both_workers(self):

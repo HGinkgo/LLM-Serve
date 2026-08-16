@@ -56,7 +56,7 @@ def _result(experiment, variant, run):
         metrics["latency"]["long"] = _latency(0.4 / scale)
     if variant == "dual-collocated":
         metrics["dual_collocated"] = {
-            "policy": "two_request_striped_round_robin",
+            "policy": "round_robin",
             "assigned_requests": {"replica-0": 20, "replica-1": 20},
         }
         metrics["cuda_graph"]["replicas"] = {
@@ -82,7 +82,7 @@ def _result(experiment, variant, run):
         }
     request_trace = {
         "generator": "iter_request_specs",
-        "ordering": "interleaved",
+        "ordering": "balanced_interleaved",
         "entry_count": 2,
         "sha256": f"run-{run}",
         "entries": [
@@ -108,7 +108,7 @@ def _result(experiment, variant, run):
                 "max_tokens": "per_request_output_len",
             },
             "runtime": runtime,
-            "workload": {"trace_order": "interleaved", "classes": classes},
+            "workload": {"trace_order": "balanced_interleaved", "classes": classes},
         },
         "metrics": metrics,
         "requests": [
@@ -158,7 +158,7 @@ class ResourceEquivalentReportTests(unittest.TestCase):
             self.assertIn("C vs B", report)
             self.assertIn("C vs A", report)
             self.assertIn("Long Prefill / short Decode overlap", report)
-            self.assertIn("striped round-robin", report)
+            self.assertIn("round_robin", report)
             self.assertIn("shared_slot", report)
             self.assertIn("pure PD", report)
             self.assertIn("Chunked Prefill Evidence", report)

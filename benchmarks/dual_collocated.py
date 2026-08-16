@@ -365,8 +365,7 @@ class DualCollocatedServingEngine:
         self.worker_ids = tuple(coordinator.worker_ids)
         if len(self.worker_ids) != 2 or len(set(self.worker_ids)) != 2:
             raise ValueError("dual collocated serving requires exactly two workers")
-        self._stripe_start_index = 0
-        self._stripe_offset = 0
+        self._next_worker_index = 0
         self._next_request_id = 0
         self._requests = {}
         self._local_to_global = {}
@@ -376,18 +375,10 @@ class DualCollocatedServingEngine:
     def _add_request(self, prompt_token_ids, sampling_params, submitted_at):
         request_id = self._next_request_id
         self._next_request_id += 1
-        # Rotate the leading replica for each two-request stripe. This stays
-        # class-agnostic while avoiding a fixed short/long trace alternating
-        # onto different GPUs under ordinary one-request round robin.
-        worker_id = self.worker_ids[
-            (self._stripe_start_index + self._stripe_offset) % len(self.worker_ids)
-        ]
-        self._stripe_offset += 1
-        if self._stripe_offset == len(self.worker_ids):
-            self._stripe_offset = 0
-            self._stripe_start_index = (
-                self._stripe_start_index + 1
-            ) % len(self.worker_ids)
+        worker_id = self.worker_ids[self._next_worker_index]
+        self._next_worker_index = (
+            self._next_worker_index + 1
+        ) % len(self.worker_ids)
         local_seq_id = self.coordinator.add_request(
             worker_id,
             prompt_token_ids,
@@ -552,7 +543,7 @@ class DualCollocatedServingEngine:
             "summary": {
                 "replicas": replicas,
                 "routing": {
-                    "policy": "two_request_striped_round_robin",
+                    "policy": "round_robin",
                     "assigned_requests": {
                         worker_id: assignments[worker_id]
                         for worker_id in self.worker_ids
