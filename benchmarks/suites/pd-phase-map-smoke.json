@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "name": "pd-phase-map-smoke",
+  "runs": 1,
+  "execution_order_seed": 20260816,
+  "profiles": {
+    "w0-short": {
+      "trace_order": "shuffled",
+      "classes": [
+        {"name": "short", "weight": 1, "input_len": 128, "output_len": 64}
+      ]
+    },
+    "w2-decode": {
+      "trace_order": "shuffled",
+      "classes": [
+        {"name": "decode", "weight": 1, "input_len": 128, "output_len": 256}
+      ]
+    },
+    "w4-token-balanced": {
+      "trace_order": "replica_balanced",
+      "classes": [
+        {"name": "short", "weight": 94, "input_len": 128, "output_len": 64},
+        {"name": "long", "weight": 6, "input_len": 2048, "output_len": 64}
+      ]
+    },
+    "w5-prefill-stress": {
+      "trace_order": "balanced_interleaved",
+      "classes": [
+        {"name": "short", "weight": 1, "input_len": 128, "output_len": 64},
+        {"name": "long", "weight": 1, "input_len": 2048, "output_len": 64}
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "pd-phase-map-W0",
+      "arrival": "poisson",
+      "profile": "w0-short",
+      "num_requests": 300,
+      "request_rates": [2, 4, 6],
+      "warmup_seconds": 10,
+      "measurement_seconds": 20,
+      "runtime": {
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9,
+        "random_seed": 20260816
+      },
+      "variants": [
+        {"name": "dual-collocated", "dual_collocated": true, "collocated_gpus": [0, 1], "collocated_init_methods": ["tcp://127.0.0.1:24901", "tcp://127.0.0.1:24902"], "startup_timeout_seconds": 300, "enforce_eager": false},
+        {"name": "pd-shared-1p1d", "pd": true, "prefill_gpu": 0, "decode_gpu": 1, "prefill_init_method": "tcp://127.0.0.1:24903", "decode_init_method": "tcp://127.0.0.1:24904", "prefill_batch_size": 4, "prefill_enforce_eager": true, "decode_enforce_eager": false, "kv_slot_count": 2, "kv_slot_capacity_tokens": 8192, "enable_pd_transport_overlap": true, "startup_timeout_seconds": 300}
+      ],
+      "slo_ms": {"ttft": 5000, "tpot": 100, "e2e": 120000}
+    },
+    {
+      "name": "pd-phase-map-W2",
+      "arrival": "poisson",
+      "profile": "w2-decode",
+      "num_requests": 300,
+      "request_rates": [2, 4, 6],
+      "warmup_seconds": 10,
+      "measurement_seconds": 20,
+      "runtime": {
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "max_model_len": 512,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9,
+        "random_seed": 20260816
+      },
+      "variants": [
+        {"name": "dual-collocated", "dual_collocated": true, "collocated_gpus": [0, 1], "collocated_init_methods": ["tcp://127.0.0.1:24911", "tcp://127.0.0.1:24912"], "startup_timeout_seconds": 300, "enforce_eager": false},
+        {"name": "pd-shared-1p1d", "pd": true, "prefill_gpu": 0, "decode_gpu": 1, "prefill_init_method": "tcp://127.0.0.1:24913", "decode_init_method": "tcp://127.0.0.1:24914", "prefill_batch_size": 4, "prefill_enforce_eager": true, "decode_enforce_eager": false, "kv_slot_count": 2, "kv_slot_capacity_tokens": 8192, "enable_pd_transport_overlap": true, "startup_timeout_seconds": 300}
+      ],
+      "slo_ms": {"ttft": 5000, "tpot": 100, "e2e": 120000}
+    },
+    {
+      "name": "pd-phase-map-W4",
+      "arrival": "poisson",
+      "profile": "w4-token-balanced",
+      "num_requests": 300,
+      "request_rates": [2, 4, 6],
+      "warmup_seconds": 10,
+      "measurement_seconds": 20,
+      "runtime": {
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "max_model_len": 2304,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9,
+        "random_seed": 20260816
+      },
+      "variants": [
+        {"name": "dual-collocated", "dual_collocated": true, "collocated_gpus": [0, 1], "collocated_init_methods": ["tcp://127.0.0.1:24921", "tcp://127.0.0.1:24922"], "startup_timeout_seconds": 300, "enforce_eager": false},
+        {"name": "pd-shared-1p1d", "pd": true, "prefill_gpu": 0, "decode_gpu": 1, "prefill_init_method": "tcp://127.0.0.1:24923", "decode_init_method": "tcp://127.0.0.1:24924", "prefill_batch_size": 4, "prefill_enforce_eager": true, "decode_enforce_eager": false, "kv_slot_count": 2, "kv_slot_capacity_tokens": 8192, "enable_pd_transport_overlap": true, "startup_timeout_seconds": 300}
+      ],
+      "slo_ms": {"ttft": 5000, "tpot": 100, "e2e": 120000}
+    },
+    {
+      "name": "pd-phase-map-W5",
+      "arrival": "poisson",
+      "profile": "w5-prefill-stress",
+      "num_requests": 300,
+      "request_rates": [2, 4, 6],
+      "warmup_seconds": 10,
+      "measurement_seconds": 20,
+      "runtime": {
+        "enable_chunked_prefill": true,
+        "enable_kv_capacity_admission": true,
+        "enable_latency_telemetry": true,
+        "max_model_len": 2304,
+        "max_num_batched_tokens": 1024,
+        "max_num_seqs": 128,
+        "gpu_memory_utilization": 0.9,
+        "random_seed": 20260816
+      },
+      "variants": [
+        {"name": "dual-collocated", "dual_collocated": true, "collocated_gpus": [0, 1], "collocated_init_methods": ["tcp://127.0.0.1:24931", "tcp://127.0.0.1:24932"], "startup_timeout_seconds": 300, "enforce_eager": false},
+        {"name": "pd-shared-1p1d", "pd": true, "prefill_gpu": 0, "decode_gpu": 1, "prefill_init_method": "tcp://127.0.0.1:24933", "decode_init_method": "tcp://127.0.0.1:24934", "prefill_batch_size": 4, "prefill_enforce_eager": true, "decode_enforce_eager": false, "kv_slot_count": 2, "kv_slot_capacity_tokens": 8192, "enable_pd_transport_overlap": true, "startup_timeout_seconds": 300}
+      ],
+      "slo_ms": {"ttft": 5000, "tpot": 100, "e2e": 120000}
+    }
+  ]
+}

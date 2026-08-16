@@ -19,7 +19,7 @@ from benchmarks.metrics import (
     summarize_speculative_requests,
     summarize_values,
 )
-from benchmarks.runtime import run_closed_loop, run_poisson
+from benchmarks.runtime import run_closed_loop, run_poisson, run_windowed_poisson
 from benchmarks.schema import compact_request_record
 from benchmarks.workloads import (
     WorkloadClass,
@@ -259,6 +259,41 @@ def _closed_loop_metrics(observation: dict, slo_ms):
     return metrics
 
 
+def _windowed_poisson_metrics(observation: dict, slo_ms):
+    metrics = summarize_serving_run(
+        observation["latency_requests"],
+        observation["duration"],
+        slo_ms=slo_ms,
+    )
+    completed_requests = [
+        request
+        for request in observation["latency_requests"]
+        if request["finish_time"] is not None
+        and request["finish_time"] < observation["measurement_end"]
+    ]
+    input_tokens = sum(
+        request["prompt_tokens"] for request in completed_requests
+    )
+    metrics["completed"] = observation["window_completed"]
+    metrics["latency_sample_requests"] = len(observation["latency_requests"])
+    metrics["failed"] = sum(
+        not request["success"] for request in completed_requests
+    )
+    metrics["throughput"] = {
+        "requests_per_second": (
+            observation["window_completed"] / observation["duration"]
+        ),
+        "input_tokens_per_second": input_tokens / observation["duration"],
+        "output_tokens_per_second": (
+            observation["window_output_tokens"] / observation["duration"]
+        ),
+        "total_tokens_per_second": (
+            input_tokens + observation["window_output_tokens"]
+        ) / observation["duration"],
+    }
+    return metrics
+
+
 def run_point(
     point: dict,
     model: str,
@@ -396,27 +431,44 @@ def run_point(
                 classes,
                 num_requests=point["num_requests"],
                 seed=point["workload_seed"],
+                ordering=point["workload"].get("trace_order", "shuffled"),
             )
             arrivals = poisson_arrival_times(
                 num_requests=point["num_requests"],
                 request_rate=point["request_rate"],
                 seed=point["arrival_seed"],
             )
-            observation = run_poisson(
-                engine,
-                specs,
-                arrivals,
-                make_sampling_params=make_sampling_params,
-                clock=clock,
-                sleep=sleep,
-            )
-            metrics = summarize_serving_run(
-                observation["requests"],
-                observation["duration"],
-                slo_ms=point.get("slo_ms"),
-            )
+            if "measurement_seconds" in point:
+                observation = run_windowed_poisson(
+                    engine,
+                    specs,
+                    arrivals,
+                    warmup_seconds=point["warmup_seconds"],
+                    measurement_seconds=point["measurement_seconds"],
+                    make_sampling_params=make_sampling_params,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                metrics = _windowed_poisson_metrics(
+                    observation, point.get("slo_ms")
+                )
+                metric_requests = observation["latency_requests"]
+            else:
+                observation = run_poisson(
+                    engine,
+                    specs,
+                    arrivals,
+                    make_sampling_params=make_sampling_params,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                metrics = summarize_serving_run(
+                    observation["requests"],
+                    observation["duration"],
+                    slo_ms=point.get("slo_ms"),
+                )
+                metric_requests = observation["requests"]
             metrics["offered_request_rate"] = point["request_rate"]
-            metric_requests = observation["requests"]
         elif point["arrival"] == "closed-loop":
             observation = run_closed_loop(
                 engine,
@@ -505,7 +557,11 @@ def run_point(
                 "end": observation.get("measurement_end"),
             },
             "request_trace": {
-                "generator": "iter_request_specs",
+                "generator": (
+                    "build_request_specs"
+                    if point["arrival"] == "poisson"
+                    else "iter_request_specs"
+                ),
                 "ordering": point["workload"].get("trace_order", "shuffled"),
                 **observation.get("request_trace", {}),
             },

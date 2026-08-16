@@ -69,13 +69,13 @@ class BenchmarkSuiteTests(unittest.TestCase):
             {
                 "awq-capacity-confirm.json",
                 "formal-closed-loop.json",
-                "formal-poisson.json",
                 "pd-kv-pipeline-formal.json",
                 "pd-kv-pipeline-smoke.json",
                 "pd-decode-pool-formal.json",
                 "pd-decode-pool-smoke.json",
                 "pd-decode-pool-output-smoke.json",
                 "pd-prefill-batch-mixed-smoke.json",
+                "pd-phase-map-smoke.json",
                 "pd-resource-equivalent-formal.json",
                 "pd-serving-mixed-smoke.json",
                 "pd-strong-baseline-chunked-validation.json",
@@ -232,6 +232,21 @@ class BenchmarkSuiteTests(unittest.TestCase):
                         {"name": "short", "weight": 0.8, "input_len": 128, "output_len": 64},
                         {"name": "long", "weight": 0.2, "input_len": 2048, "output_len": 64},
                     ]
+                    for point in points
+                ))
+            if path.name == "pd-phase-map-smoke.json":
+                self.assertEqual(suite["runs"], 1)
+                self.assertEqual(len(points), 24)
+                self.assertEqual(
+                    {point["variant"] for point in points},
+                    {"dual-collocated", "pd-shared-1p1d"},
+                )
+                self.assertEqual(
+                    {point["request_rate"] for point in points}, {2, 4, 6}
+                )
+                self.assertTrue(all(
+                    point["warmup_seconds"] == 10
+                    and point["measurement_seconds"] == 20
                     for point in points
                 ))
             if path.name == "pd-decode-pool-formal.json":

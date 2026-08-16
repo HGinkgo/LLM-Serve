@@ -175,6 +175,36 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(observation["speculative_batch_sizes"], [])
 
+    def test_windowed_poisson_uses_arrival_cohort_and_token_window(self):
+        from benchmarks.runtime import run_windowed_poisson
+
+        clock = FakeClock()
+        engine = FakeEngine(clock)
+        specs = [
+            RequestSpec(index, "short", 1, 1, (index,))
+            for index in range(5)
+        ]
+
+        observation = run_windowed_poisson(
+            engine,
+            specs,
+            arrival_times=[0.0, 0.25, 0.5, 0.75, 1.0],
+            warmup_seconds=0.5,
+            measurement_seconds=0.5,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(observation["duration"], 0.5)
+        self.assertEqual(observation["admitted"], 4)
+        self.assertEqual(observation["window_completed"], 1)
+        self.assertEqual(observation["window_output_tokens"], 1)
+        self.assertEqual(
+            [request["request_id"] for request in observation["latency_requests"]],
+            [2, 3],
+        )
+
     def test_closed_loop_refills_during_window_then_drains(self):
         import benchmarks.runtime as runtime
 
