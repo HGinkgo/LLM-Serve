@@ -1,5 +1,6 @@
 import unittest
 import signal
+from unittest.mock import patch
 
 import torch
 
@@ -8,6 +9,7 @@ from llmserve.pd.process import (
     _cleanup_worker_resources,
     _destroy_process_group,
     _handle_termination,
+    _report_startup_progress,
 )
 
 
@@ -26,6 +28,34 @@ class FakeDistributed:
 
 
 class TestPDProcessCleanup(unittest.TestCase):
+
+    def test_startup_progress_reports_worker_local_elapsed_time(self):
+        messages = []
+
+        class ResponseQueue:
+
+            def put(self, message):
+                messages.append(message)
+
+        with patch("llmserve.pd.process.perf_counter", return_value=10.125):
+            _report_startup_progress(
+                ResponseQueue(),
+                stage="engine_initialized",
+                started_at=10.0,
+            )
+
+        self.assertEqual(
+            messages,
+            [{
+                "ok": True,
+                "result": {
+                    "startup_stage": "engine_initialized",
+                    "startup_elapsed_ms": 125.0,
+                },
+                "error": None,
+                "timing": None,
+            }],
+        )
 
     def test_creates_an_isolated_shared_slot_pool_for_each_decode_worker(self):
         engine = type(

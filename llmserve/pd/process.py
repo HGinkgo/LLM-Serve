@@ -45,6 +45,17 @@ def _reply(
     )
 
 
+def _report_startup_progress(response_queue, *, stage: str, started_at: float):
+    """Emit a lightweight startup boundary before the final readiness payload."""
+    _reply(
+        response_queue,
+        result={
+            "startup_stage": stage,
+            "startup_elapsed_ms": (perf_counter() - started_at) * 1000,
+        },
+    )
+
+
 def _cleanup_worker_resources(engine, runtime):
     """Synchronize target imports before unregistering shared pinned memory."""
     try:
@@ -110,17 +121,48 @@ def worker_main(
     """
     signal.signal(signal.SIGTERM, _handle_termination)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    from llmserve import LLM
-    from llmserve.pd.observability import collect_process_numa_observability
-    from llmserve.pd.protocol import RequestEnvelope
-    from llmserve.pd.runtime import DecodeWorkerRuntime, PrefillWorkerRuntime
-
     engine = None
     runtime = None
+    startup_started_at = perf_counter()
     try:
+        _report_startup_progress(
+            response_queue,
+            stage="worker_started",
+            started_at=startup_started_at,
+        )
+        from llmserve import LLM
+        from llmserve.pd.observability import collect_process_numa_observability
+        from llmserve.pd.protocol import RequestEnvelope
+        from llmserve.pd.runtime import DecodeWorkerRuntime, PrefillWorkerRuntime
+
+        _report_startup_progress(
+            response_queue,
+            stage="imports_complete",
+            started_at=startup_started_at,
+        )
+        _report_startup_progress(
+            response_queue,
+            stage="engine_initializing",
+            started_at=startup_started_at,
+        )
         engine = LLM(model, **engine_kwargs)
+        _report_startup_progress(
+            response_queue,
+            stage="engine_initialized",
+            started_at=startup_started_at,
+        )
         if role == "prefill":
+            _report_startup_progress(
+                response_queue,
+                stage="shared_slots_initializing",
+                started_at=startup_started_at,
+            )
             slot_pools = _create_prefill_slot_pools(engine, transport_config)
+            _report_startup_progress(
+                response_queue,
+                stage="shared_slots_initialized",
+                started_at=startup_started_at,
+            )
             slot_handles = {
                 worker_id: pool.handle for worker_id, pool in slot_pools.items()
             }
@@ -147,6 +189,11 @@ def worker_main(
                 "role": role,
                 "environment": collect_process_numa_observability(),
             }
+        _report_startup_progress(
+            response_queue,
+            stage="ready_payload_prepared",
+            started_at=startup_started_at,
+        )
         _reply(
             response_queue,
             result=ready_result,

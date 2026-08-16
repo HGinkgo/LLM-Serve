@@ -216,27 +216,59 @@ class PDCoordinator:
 
     def _wait_worker_ready(self, role: str):
         worker = self._workers[role]
-        try:
-            response = worker["responses"].get(
-                timeout=self.config.request_timeout_seconds
+        deadline = perf_counter() + self.config.request_timeout_seconds
+        progress = worker.setdefault("startup_progress", [])
+        while True:
+            timeout = deadline - perf_counter()
+            if timeout <= 0:
+                raise self._startup_timeout_error(role, worker)
+            try:
+                response = worker["responses"].get(timeout=timeout)
+            except Empty as error:
+                raise self._startup_timeout_error(role, worker) from error
+            if not response.get("ok"):
+                error = response.get("error") or {}
+                detail = (
+                    error.get("traceback")
+                    or error.get("message")
+                    or "unknown worker error"
+                )
+                raise PDWorkerError(f"{role} worker failed during startup: {detail}")
+            result = response.get("result") or {}
+            if "startup_stage" in result:
+                progress.append({
+                    "stage": result["startup_stage"],
+                    "elapsed_ms": result.get("startup_elapsed_ms"),
+                })
+                continue
+            if not result.get("ready") or result.get("role") != role:
+                raise PDWorkerError(
+                    f"{role} worker returned an invalid readiness response"
+                )
+            worker["ready"] = True
+            worker["ready_result"] = result
+            return
+
+    def _startup_timeout_error(self, role: str, worker: dict[str, Any]):
+        progress = worker.get("startup_progress") or ()
+        last_stage = progress[-1]["stage"] if progress else "none"
+        process = worker.get("process")
+        if process is None:
+            process_state = "pid=None, alive=False, exitcode=None"
+        else:
+            try:
+                alive = process.is_alive()
+            except AttributeError:
+                alive = getattr(process, "exitcode", None) is None
+            process_state = (
+                f"pid={getattr(process, 'pid', None)}, alive={alive}, "
+                f"exitcode={getattr(process, 'exitcode', None)}"
             )
-        except Empty as error:
-            raise PDWorkerError(f"{role} worker did not become ready") from error
-        if not response.get("ok"):
-            error = response.get("error") or {}
-            detail = (
-                error.get("traceback")
-                or error.get("message")
-                or "unknown worker error"
-            )
-            raise PDWorkerError(f"{role} worker failed during startup: {detail}")
-        result = response.get("result") or {}
-        if not result.get("ready") or result.get("role") != role:
-            raise PDWorkerError(
-                f"{role} worker returned an invalid readiness response"
-            )
-        worker["ready"] = True
-        worker["ready_result"] = result
+        return PDWorkerError(
+            f"{role} worker did not become ready within "
+            f"{self.config.request_timeout_seconds:.1f}s "
+            f"(last startup stage: {last_stage}; {process_state})"
+        )
 
     def _abort_startup(self):
         for worker in self._workers.values():

@@ -1,5 +1,6 @@
 import unittest
 from collections import deque
+from queue import Empty
 from types import SimpleNamespace
 
 from llmserve.pd.coordinator import PDConfig, PDCoordinator, PDWorkerError
@@ -17,6 +18,8 @@ class FakeQueue:
         self.commands.append(command)
 
     def get(self, timeout=None):
+        if not self.responses:
+            raise Empty
         return self.responses.popleft()
 
     def close(self):
@@ -175,6 +178,71 @@ class TestPDConfig(unittest.TestCase):
         coordinator._wait_worker_ready("prefill")
 
         self.assertTrue(coordinator._workers["prefill"]["ready"])
+
+    def test_wait_worker_ready_records_progress_before_readiness(self):
+        config = PDConfig(model="/models/qwen3", prefill_gpu=0, decode_gpu=1)
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._workers = {
+            "prefill": {
+                "responses": FakeQueue(
+                    responses=[
+                        {
+                            "ok": True,
+                            "result": {
+                                "startup_stage": "engine_initializing",
+                                "startup_elapsed_ms": 12.5,
+                            },
+                        },
+                        {
+                            "ok": True,
+                            "result": {"ready": True, "role": "prefill"},
+                        },
+                    ]
+                )
+            }
+        }
+
+        coordinator._wait_worker_ready("prefill")
+
+        worker = coordinator._workers["prefill"]
+        self.assertTrue(worker["ready"])
+        self.assertEqual(
+            worker["startup_progress"],
+            [{"stage": "engine_initializing", "elapsed_ms": 12.5}],
+        )
+
+    def test_wait_worker_ready_timeout_reports_last_stage_and_process_state(self):
+        config = PDConfig(
+            model="/models/qwen3",
+            prefill_gpu=0,
+            decode_gpu=1,
+            request_timeout_seconds=0.001,
+        )
+        coordinator = PDCoordinator.__new__(PDCoordinator)
+        coordinator.config = config
+        coordinator._workers = {
+            "prefill": {
+                "responses": FakeQueue(
+                    responses=[
+                        {
+                            "ok": True,
+                            "result": {
+                                "startup_stage": "shared_slots_initializing",
+                                "startup_elapsed_ms": 57.0,
+                            },
+                        },
+                    ]
+                ),
+                "process": SimpleNamespace(pid=4321, exitcode=None),
+            }
+        }
+
+        with self.assertRaisesRegex(
+            PDWorkerError,
+            "last startup stage: shared_slots_initializing.*pid=4321.*alive=True.*exitcode=None",
+        ):
+            coordinator._wait_worker_ready("prefill")
 
     def test_worker_health_retains_worker_environment_snapshot(self):
         coordinator = PDCoordinator.__new__(PDCoordinator)
