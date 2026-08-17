@@ -1,19 +1,14 @@
 # Public Benchmark Evidence
 
-本目录只包含新 serving benchmark 系统生成的正式数据，旧 Stage 4/5 脚本与结果已删除。
+本目录仅保留仍与当前 Runtime 边界一致的脱敏证据：
 
-## 数据集
+- `awq-w4a16/`：AWQ checkpoint 的质量、显存容量与外部 Marlin 对照。
+- `stage8-graph-formal/`：EAGLE Target Verify CUDA Graph 对照。
 
-- `formal-poisson/`：36 个 run，Poisson request-rate 主实验。
-- `formal-closed-loop/`：36 个 run，固定并发稳态补充实验。
-- `stage8-graph-formal/`：18 个 run，线性 EAGLE target verify eager/ CUDA Graph 对照。
-- `pd-kv-pipeline-formal/`：18 个精简脱敏 run，双卡 PD inline Queue / pinned shared-memory KV transport 对照。
-- `awq-w4a16/`：AWQ 质量、LLM-Serve 容量矩阵和 vLLM Marlin 控制实验的脱敏汇总。
+早期非 Chunked 单卡基线、Inline Queue 对照和旧的有限请求 Poisson 数据均已移除。
+它们不能代表当前强 Collocated 基线或 Shared KV 默认路径。
 
-每个 serving 目录包含 `manifest.json`、`summary.csv`、`aggregate.csv` 和 `runs/*.json`。原有 72 个 run 对应 commit `ad35e65cacdcb306362268c3a60923abd199b431`；Stage 8 的 18 个 run 对应 commit `3bb5d21ad5fd9ae0044943d93255a4542cc5ca75`；PD KV Pipeline 的 18 个 run 对应 commit `e779a6aa4186683327060697b8c04f3da12c0284`。模型 revision 和软硬件环境见各自 manifest。
-
-公开文件已经扫描，不包含本地绝对路径、prompt token IDs、凭据、traceback 或 host-specific workspace 信息。PD 精简 run 删除重复的逐请求记录和逐 Prefill batch 明细，保留聚合指标、Queue/slot 样本、Graph 和 worker health；`summary.csv` 与 `aggregate.csv` 仍为 suite runner 的原始输出。
-
-AWQ 目录只公开汇总 CSV 和 metadata；checkpoint、校准文本、逐层 cache 与原始日志保留在本地。LLM-Serve 自研 CUDA 与 vLLM Marlin 的归因边界见该目录 README。
-
-CPU 回归、编译检查和结果完整性校验见 [`verification.md`](verification.md)。
+后续 PD 结论必须使用 `pd-resource-equivalent-formal.json` 或
+`pd-phase-map-smoke.json` 在报告硬件上重跑。manifest、展开 point 配置、逐运行
+JSON 和 CSV 共同构成可追溯证据。PD+Shared 相对单卡的结果属于完整部署收益，不能
+归因为纯 PD 或纯 KV 传输收益。

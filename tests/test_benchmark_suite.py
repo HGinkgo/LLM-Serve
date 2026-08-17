@@ -68,21 +68,8 @@ class BenchmarkSuiteTests(unittest.TestCase):
             {path.name for path in suite_paths},
             {
                 "awq-capacity-confirm.json",
-                "formal-closed-loop.json",
-                "pd-kv-pipeline-formal.json",
-                "pd-kv-pipeline-smoke.json",
-                "pd-decode-pool-formal.json",
-                "pd-decode-pool-smoke.json",
-                "pd-decode-pool-output-smoke.json",
-                "pd-prefill-batch-mixed-smoke.json",
                 "pd-phase-map-smoke.json",
                 "pd-resource-equivalent-formal.json",
-                "pd-serving-mixed-smoke.json",
-                "pd-strong-baseline-chunked-validation.json",
-                "pd-strong-baseline.json",
-                "pd-transport-observability.json",
-                "pd-transport-v2-telemetry.json",
-                "pd-transport-v3-overlap.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
             },
@@ -110,130 +97,6 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     point["runtime"]["enable_kv_capacity_admission"]
                     for point in points
                 ))
-            if path.name == "pd-kv-pipeline-formal.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 18)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {32, 48, 64},
-                )
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"pd-inline-b4-graph", "pd-shared-b4-graph"},
-                )
-                shared_points = [
-                    point
-                    for point in points
-                    if point["variant"] == "pd-shared-b4-graph"
-                ]
-                self.assertTrue(all(
-                    point["runtime"]["pd"]
-                    and point["runtime"]["prefill_batch_size"] == 4
-                    and point["runtime"]["prefill_enforce_eager"]
-                    and not point["runtime"]["decode_enforce_eager"]
-                    and point["runtime"]["kv_slot_count"] == 2
-                    and point["warmup_seconds"] == 30
-                    and point["measurement_seconds"] == 60
-                    for point in shared_points
-                ))
-            if path.name == "pd-transport-v3-overlap.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 6)
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"pd-shared-event-serial", "pd-shared-event-overlap"},
-                )
-                for point in points:
-                    self.assertTrue(point["runtime"]["pd"])
-                    self.assertEqual(point["max_concurrency"], 64)
-                    self.assertEqual(point["runtime"]["prefill_batch_size"], 4)
-            if path.name == "pd-decode-pool-smoke.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 1)
-                point = points[0]
-                self.assertTrue(point["runtime"]["pd"])
-                self.assertEqual(point["runtime"]["decode_gpus"], [1, 2])
-                self.assertEqual(
-                    point["runtime"]["decode_init_methods"],
-                    ["tcp://127.0.0.1:24532", "tcp://127.0.0.1:24533"],
-                )
-                self.assertTrue(point["runtime"]["enable_pd_transport_overlap"])
-            if path.name == "pd-decode-pool-output-smoke.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 2)
-                self.assertEqual({point["max_concurrency"] for point in points}, {64})
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"pd-shared-1p1d", "pd-shared-1p2d"},
-                )
-                self.assertTrue(all(
-                    point["warmup_seconds"] == 10
-                    and point["measurement_seconds"] == 20
-                    and point["workload"]["classes"] == [{
-                        "name": "decode",
-                        "weight": 1,
-                        "input_len": 128,
-                        "output_len": 256,
-                    }]
-                    for point in points
-                ))
-            if path.name == "pd-serving-mixed-smoke.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 2)
-                self.assertEqual({point["max_concurrency"] for point in points}, {16})
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"strong-collocated", "pd-shared-1p1d"},
-                )
-                self.assertTrue(all(
-                    point["warmup_seconds"] == 10
-                    and point["measurement_seconds"] == 20
-                    and point["runtime"]["enable_chunked_prefill"]
-                    and point["runtime"]["max_model_len"] == 2304
-                    and point["workload"]["classes"] == [
-                        {"name": "short", "weight": 0.8, "input_len": 128, "output_len": 64},
-                        {"name": "long", "weight": 0.2, "input_len": 2048, "output_len": 64},
-                    ]
-                    for point in points
-                ))
-                pd_point = next(
-                    point
-                    for point in points
-                    if point["variant"] == "pd-shared-1p1d"
-                )
-                max_prompt_tokens = max(
-                    item["input_len"]
-                    for item in pd_point["workload"]["classes"]
-                )
-                self.assertEqual(
-                    pd_point["runtime"]["kv_slot_capacity_tokens"],
-                    pd_point["runtime"]["prefill_batch_size"] * max_prompt_tokens,
-                )
-            if path.name == "pd-prefill-batch-mixed-smoke.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 3)
-                self.assertEqual({point["max_concurrency"] for point in points}, {16})
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"pd-shared-b1", "pd-shared-b2", "pd-shared-b4"},
-                )
-                self.assertEqual(
-                    {point["runtime"]["prefill_batch_size"] for point in points},
-                    {1, 2, 4},
-                )
-                self.assertTrue(all(
-                    point["warmup_seconds"] == 10
-                    and point["measurement_seconds"] == 20
-                    and point["runtime"]["pd"]
-                    and point["runtime"]["kv_slot_count"] == 2
-                    and point["runtime"]["kv_slot_capacity_tokens"] == 8192
-                    and point["runtime"]["enable_pd_transport_overlap"]
-                    and point["workload"]["classes"] == [
-                        {"name": "short", "weight": 0.8, "input_len": 128, "output_len": 64},
-                        {"name": "long", "weight": 0.2, "input_len": 2048, "output_len": 64},
-                    ]
-                    for point in points
-                ))
             if path.name == "pd-phase-map-smoke.json":
                 self.assertEqual(suite["runs"], 1)
                 self.assertEqual(len(points), 24)
@@ -249,25 +112,17 @@ class BenchmarkSuiteTests(unittest.TestCase):
                     and point["measurement_seconds"] == 20
                     for point in points
                 ))
-            if path.name == "pd-decode-pool-formal.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 24)
+            if path.name == "pd-resource-equivalent-formal.json":
+                self.assertEqual(suite["runs"], 1)
+                self.assertEqual(len(points), 6)
                 self.assertEqual(
                     {point["max_concurrency"] for point in points},
-                    {32, 64, 96, 128},
+                    {64},
                 )
                 self.assertEqual(
                     {point["variant"] for point in points},
-                    {"pd-shared-1p1d", "pd-shared-1p2d"},
+                    {"strong-collocated", "dual-collocated", "pd-shared"},
                 )
-                for point in points:
-                    self.assertTrue(point["runtime"]["pd"])
-                    self.assertEqual(point["runtime"]["prefill_batch_size"], 4)
-                    self.assertFalse(point["runtime"]["decode_enforce_eager"])
-                    self.assertTrue(point["runtime"]["enable_pd_transport_overlap"])
-            if path.name.startswith("formal-"):
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 36)
 
     def test_expand_suite_pairs_variants_with_identical_randomness(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.suite"))
