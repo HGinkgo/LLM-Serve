@@ -691,6 +691,12 @@ class TestPDRuntime(unittest.TestCase):
         self.assertEqual(handoff.first_token_id, 103)
         self.assertEqual(handoff.descriptor.num_tokens, 5)
         self.assertEqual(len(engine.scheduler.removed), 1)
+        self.assertEqual(
+            handoff.prefill_timing_ms["partial_prefill_chunk_count"], 2
+        )
+        self.assertEqual(
+            handoff.prefill_timing_ms["partial_prefill_chunk_lengths"], [2, 2]
+        )
 
     def test_decode_runtime_forwards_handoff_to_engine_bridge(self):
         envelope = RequestEnvelope(7, (1, 2, 3, 4), 4, 1.0, True)

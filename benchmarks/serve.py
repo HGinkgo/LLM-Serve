@@ -19,7 +19,7 @@ from benchmarks.metrics import (
     summarize_speculative_requests,
     summarize_values,
 )
-from benchmarks.runtime import run_closed_loop, run_poisson
+from benchmarks.runtime import run_closed_loop, run_poisson, run_windowed_poisson
 from benchmarks.schema import compact_request_record
 from benchmarks.workloads import (
     WorkloadClass,
@@ -114,6 +114,35 @@ def _default_pd_engine_factory(model, **kwargs):
     )
 
 
+def _default_dual_collocated_engine_factory(model, **kwargs):
+    from benchmarks.dual_collocated import (
+        DualCollocatedConfig,
+        DualCollocatedCoordinator,
+        DualCollocatedServingEngine,
+    )
+
+    distributed_init_method = kwargs.pop("distributed_init_method", None)
+    gpu_ids = tuple(kwargs.pop("collocated_gpus", (0, 1)))
+    init_methods = tuple(kwargs.pop("collocated_init_methods", ()))
+    if not init_methods:
+        first = distributed_init_method or "tcp://127.0.0.1:24441"
+        init_methods = (first, _next_worker_endpoint(first))
+    startup_timeout_seconds = kwargs.pop("startup_timeout_seconds", 300.0)
+    request_timeout_seconds = kwargs.pop("request_timeout_seconds", 120.0)
+    coordinator = DualCollocatedCoordinator(
+        DualCollocatedConfig(
+            model=model,
+            gpu_ids=gpu_ids,
+            init_methods=init_methods,
+            engine_kwargs=kwargs,
+            request_timeout_seconds=request_timeout_seconds,
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
+    )
+    coordinator.start()
+    return DualCollocatedServingEngine(coordinator)
+
+
 def _effective_runtime_config(engine):
     """Read selected values from the constructed runtime, not only the suite."""
     fields = (
@@ -129,6 +158,19 @@ def _effective_runtime_config(engine):
         "random_seed",
     )
     coordinator = getattr(engine, "coordinator", None)
+    if getattr(engine, "is_dual_collocated", False):
+        config = coordinator.config
+        return {
+            "kind": "dual_collocated",
+            "replica_gpus": list(config.gpu_ids),
+            "replica_worker_ids": list(config.worker_ids),
+            "replica_init_methods": list(config.init_methods),
+            "routing_policy": "round_robin",
+            "startup_timeout_seconds": config.startup_timeout_seconds,
+            "engine_kwargs": {
+                name: config.engine_kwargs.get(name) for name in fields
+            },
+        }
     if coordinator is not None:
         config = coordinator.config
         return {
@@ -217,6 +259,41 @@ def _closed_loop_metrics(observation: dict, slo_ms):
     return metrics
 
 
+def _windowed_poisson_metrics(observation: dict, slo_ms):
+    metrics = summarize_serving_run(
+        observation["latency_requests"],
+        observation["duration"],
+        slo_ms=slo_ms,
+    )
+    completed_requests = [
+        request
+        for request in observation["latency_requests"]
+        if request["finish_time"] is not None
+        and request["finish_time"] < observation["measurement_end"]
+    ]
+    input_tokens = sum(
+        request["prompt_tokens"] for request in completed_requests
+    )
+    metrics["completed"] = observation["window_completed"]
+    metrics["latency_sample_requests"] = len(observation["latency_requests"])
+    metrics["failed"] = sum(
+        not request["success"] for request in completed_requests
+    )
+    metrics["throughput"] = {
+        "requests_per_second": (
+            observation["window_completed"] / observation["duration"]
+        ),
+        "input_tokens_per_second": input_tokens / observation["duration"],
+        "output_tokens_per_second": (
+            observation["window_output_tokens"] / observation["duration"]
+        ),
+        "total_tokens_per_second": (
+            input_tokens + observation["window_output_tokens"]
+        ) / observation["duration"],
+    }
+    return metrics
+
+
 def run_point(
     point: dict,
     model: str,
@@ -233,17 +310,35 @@ def run_point(
 ):
     runtime = point["runtime"]
     enable_speculative = runtime.get("enable_speculative", False)
+    dual_collocated = runtime.get("dual_collocated", False)
+    if dual_collocated and runtime.get("pd", False):
+        raise ValueError("cannot enable both PD and dual_collocated")
     if enable_speculative and not speculative_model:
         raise ValueError("speculative_model is required for speculative variants")
     if runtime.get("pd", False) and enable_speculative:
         raise ValueError("PD benchmark currently requires speculative decoding to be disabled")
+    if dual_collocated and enable_speculative:
+        raise ValueError("dual collocated benchmark requires speculative decoding to be disabled")
 
     engine_factory = engine_factory or (
-        _default_pd_engine_factory
-        if runtime.get("pd", False)
-        else _default_engine_factory
+        _default_dual_collocated_engine_factory
+        if dual_collocated
+        else (
+            _default_pd_engine_factory
+            if runtime.get("pd", False)
+            else _default_engine_factory
+        )
     )
     make_sampling_params = make_sampling_params or _default_sampling_params
+    sampling_audit = (
+        {
+            "temperature": 0.01,
+            "ignore_eos": True,
+            "max_tokens": "per_request_output_len",
+        }
+        if make_sampling_params is _default_sampling_params
+        else {"source": "custom_sampling_factory"}
+    )
     active_speculative_model = speculative_model if enable_speculative else None
     engine_kwargs = {
         "enforce_eager": runtime.get("enforce_eager", True),
@@ -300,6 +395,21 @@ def run_point(
                 "startup_timeout_seconds": runtime.get("startup_timeout_seconds"),
             }
         )
+    if dual_collocated:
+        engine_kwargs.update(
+            {
+                "collocated_gpus": tuple(runtime.get("collocated_gpus", (0, 1))),
+                "collocated_init_methods": tuple(
+                    runtime.get("collocated_init_methods", ())
+                ),
+                "startup_timeout_seconds": runtime.get(
+                    "startup_timeout_seconds", 300.0
+                ),
+                "request_timeout_seconds": runtime.get(
+                    "request_timeout_seconds", 120.0
+                ),
+            }
+        )
     if distributed_init_method is not None:
         engine_kwargs["distributed_init_method"] = distributed_init_method
     engine = engine_factory(model, **engine_kwargs)
@@ -321,31 +431,52 @@ def run_point(
                 classes,
                 num_requests=point["num_requests"],
                 seed=point["workload_seed"],
+                ordering=point["workload"].get("trace_order", "shuffled"),
             )
             arrivals = poisson_arrival_times(
                 num_requests=point["num_requests"],
                 request_rate=point["request_rate"],
                 seed=point["arrival_seed"],
             )
-            observation = run_poisson(
-                engine,
-                specs,
-                arrivals,
-                make_sampling_params=make_sampling_params,
-                clock=clock,
-                sleep=sleep,
-            )
-            metrics = summarize_serving_run(
-                observation["requests"],
-                observation["duration"],
-                slo_ms=point.get("slo_ms"),
-            )
+            if "measurement_seconds" in point:
+                observation = run_windowed_poisson(
+                    engine,
+                    specs,
+                    arrivals,
+                    warmup_seconds=point["warmup_seconds"],
+                    measurement_seconds=point["measurement_seconds"],
+                    make_sampling_params=make_sampling_params,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                metrics = _windowed_poisson_metrics(
+                    observation, point.get("slo_ms")
+                )
+                metric_requests = observation["latency_requests"]
+            else:
+                observation = run_poisson(
+                    engine,
+                    specs,
+                    arrivals,
+                    make_sampling_params=make_sampling_params,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                metrics = summarize_serving_run(
+                    observation["requests"],
+                    observation["duration"],
+                    slo_ms=point.get("slo_ms"),
+                )
+                metric_requests = observation["requests"]
             metrics["offered_request_rate"] = point["request_rate"]
-            metric_requests = observation["requests"]
         elif point["arrival"] == "closed-loop":
             observation = run_closed_loop(
                 engine,
-                iter_request_specs(classes, seed=point["workload_seed"]),
+                iter_request_specs(
+                    classes,
+                    seed=point["workload_seed"],
+                    ordering=point["workload"].get("trace_order", "shuffled"),
+                ),
                 max_concurrency=point["max_concurrency"],
                 warmup_seconds=point["warmup_seconds"],
                 measurement_seconds=point["measurement_seconds"],
@@ -382,6 +513,9 @@ def run_point(
             metrics["speculative"][name] = engine_speculative[name]
     metrics["kv_cache"] = observation["engine_summary"].get("kv_cache", {})
     metrics["pd"] = observation["engine_summary"].get("pd", {})
+    metrics["dual_collocated"] = observation["engine_summary"].get(
+        "routing", {}
+    )
     decode_workers = observation["engine_summary"].get("decode_workers")
     if decode_workers is not None:
         metrics["pd"]["decode_workers"] = decode_workers
@@ -392,6 +526,7 @@ def run_point(
     public_config = deepcopy(point)
     public_config["model"] = Path(model).name
     public_config["model_revision"] = model_revision
+    public_config["sampling"] = sampling_audit
     public_config["speculative_model"] = (
         Path(active_speculative_model).name
         if active_speculative_model
@@ -420,6 +555,15 @@ def run_point(
             "measurement_window": {
                 "start": observation.get("measurement_start"),
                 "end": observation.get("measurement_end"),
+            },
+            "request_trace": {
+                "generator": (
+                    "build_request_specs"
+                    if point["arrival"] == "poisson"
+                    else "iter_request_specs"
+                ),
+                "ordering": point["workload"].get("trace_order", "shuffled"),
+                **observation.get("request_trace", {}),
             },
             "effective_runtime": effective_runtime,
         },

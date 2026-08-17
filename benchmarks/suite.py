@@ -72,6 +72,18 @@ def expand_suite(suite: dict) -> list[dict]:
                     point[dimension_name] = dimension_value
                     if arrival == "poisson":
                         point["num_requests"] = experiment["num_requests"]
+                        has_warmup = "warmup_seconds" in experiment
+                        has_measurement = "measurement_seconds" in experiment
+                        if has_warmup != has_measurement:
+                            raise ValueError(
+                                "poisson experiments require both warmup_seconds "
+                                "and measurement_seconds"
+                            )
+                        if has_warmup:
+                            point["warmup_seconds"] = experiment["warmup_seconds"]
+                            point["measurement_seconds"] = experiment[
+                                "measurement_seconds"
+                            ]
                     else:
                         point["warmup_seconds"] = experiment["warmup_seconds"]
                         point["measurement_seconds"] = experiment[

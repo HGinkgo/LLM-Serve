@@ -59,6 +59,7 @@ def compact_request_record(request: dict):
     return {
         "seq_id": request["seq_id"],
         "request_id": request.get("request_id"),
+        "replica_id": request.get("replica_id"),
         "request_class": request["request_class"],
         "prompt_tokens": request["prompt_tokens"],
         "output_tokens": output_tokens,

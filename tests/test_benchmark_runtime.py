@@ -68,6 +68,43 @@ class FakeEngine:
 
 
 class BenchmarkRuntimeTests(unittest.TestCase):
+    def test_scheduler_telemetry_keeps_replica_local_events(self):
+        from benchmarks.runtime import _compact_scheduler_step
+
+        compact = _compact_scheduler_step({
+            "replica_events": {
+                "replica-0": {"prefill_request_count": 1},
+                "replica-1": {"decode_request_count": 1},
+            },
+            "replica_queue_state": {"replica-0": {"running_queue_size": 1}},
+            "scheduled_seq_ids": [0, 1],
+        })
+
+        self.assertEqual(compact["scheduled_request_count"], 2)
+        self.assertEqual(compact["replica_events"]["replica-0"]["prefill_request_count"], 1)
+
+    def test_submit_uses_benchmark_submission_boundary_when_engine_supports_it(self):
+        from benchmarks.runtime import _submit_request
+
+        class BenchmarkBoundaryEngine(FakeEngine):
+            def __init__(self, clock):
+                super().__init__(clock)
+                self.benchmark_submissions = []
+
+            def add_benchmark_request(self, prompt, sampling_params, submitted_at):
+                self.benchmark_submissions.append((tuple(prompt), sampling_params, submitted_at))
+                return 71
+
+            def add_request(self, prompt, sampling_params):
+                raise AssertionError("benchmark path must not use add_request")
+
+        clock = FakeClock()
+        engine = BenchmarkBoundaryEngine(clock)
+
+        seq_id = _submit_request(engine, [1, 2], "params", clock.perf_counter)
+
+        self.assertEqual(seq_id, 71)
+        self.assertEqual(engine.benchmark_submissions, [((1, 2), "params", 0.0)])
     def test_poisson_runner_submits_on_schedule_and_labels_requests(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.runtime"))
         from benchmarks.runtime import run_poisson
@@ -138,6 +175,36 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(observation["speculative_batch_sizes"], [])
 
+    def test_windowed_poisson_uses_arrival_cohort_and_token_window(self):
+        from benchmarks.runtime import run_windowed_poisson
+
+        clock = FakeClock()
+        engine = FakeEngine(clock)
+        specs = [
+            RequestSpec(index, "short", 1, 1, (index,))
+            for index in range(5)
+        ]
+
+        observation = run_windowed_poisson(
+            engine,
+            specs,
+            arrival_times=[0.0, 0.25, 0.5, 0.75, 1.0],
+            warmup_seconds=0.5,
+            measurement_seconds=0.5,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(observation["duration"], 0.5)
+        self.assertEqual(observation["admitted"], 4)
+        self.assertEqual(observation["window_completed"], 1)
+        self.assertEqual(observation["window_output_tokens"], 1)
+        self.assertEqual(
+            [request["request_id"] for request in observation["latency_requests"]],
+            [2, 3],
+        )
+
     def test_closed_loop_refills_during_window_then_drains(self):
         import benchmarks.runtime as runtime
 
@@ -170,6 +237,35 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(observation["speculative_batch_sizes"], [])
         self.assertTrue(engine.is_finished())
 
+    def test_closed_loop_emits_auditable_request_trace_without_prompt_tokens(self):
+        from benchmarks.runtime import run_closed_loop
+
+        clock = FakeClock()
+        engine = FakeEngine(clock)
+        specs = (
+            RequestSpec(index, "short", 2, 1, (index, index + 1))
+            for index in range(8)
+        )
+
+        observation = run_closed_loop(
+            engine,
+            specs,
+            max_concurrency=2,
+            warmup_seconds=0,
+            measurement_seconds=1,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+        )
+
+        trace = observation["request_trace"]
+        self.assertEqual(trace["entry_count"], observation["admitted"])
+        self.assertTrue(trace["sha256"])
+        self.assertEqual(
+            [entry["request_id"] for entry in trace["entries"]],
+            list(range(observation["admitted"])),
+        )
+        self.assertNotIn("prompt_token_ids", trace["entries"][0])
+
 
 class BenchmarkSchemaTests(unittest.TestCase):
     def test_compact_request_removes_absolute_timestamps(self):
@@ -178,6 +274,7 @@ class BenchmarkSchemaTests(unittest.TestCase):
 
         request = {
             "seq_id": 7,
+            "replica_id": "replica-1",
             "request_class": "short",
             "prompt_tokens": 10,
             "output_tokens": 3,
@@ -202,6 +299,7 @@ class BenchmarkSchemaTests(unittest.TestCase):
         compact = compact_request_record(request)
 
         self.assertEqual(compact["seq_id"], 7)
+        self.assertEqual(compact["replica_id"], "replica-1")
         self.assertEqual(compact["request_class"], "short")
         self.assertFalse(compact["cancelled"])
         self.assertEqual(compact["status"], "completed")
