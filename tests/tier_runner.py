@@ -18,6 +18,7 @@ CORE_MODULES = (
     "tests.test_llm_engine_speculative",
     "tests.test_linear_loading",
     "tests.test_model_runner_speculative",
+    "tests.test_moe_gptq",
     "tests.test_pd_coordinator",
     "tests.test_pd_engine_bridge",
     "tests.test_pd_kv_transfer",
@@ -46,6 +47,7 @@ EXTENDED_ONLY_MODULES = (
     "tests.test_benchmark_runtime",
     "tests.test_benchmark_serve",
     "tests.test_benchmark_suite",
+    "tests.test_moe_reference_parity",
     "tests.test_optional_dependencies",
     "tests.test_pd_batch_example",
     "tests.test_service_overload_benchmark",
@@ -57,6 +59,7 @@ GPU_MODULES = (
     "tests.test_eagle3_target_bridge",
     "tests.test_eagle3_verify",
     "tests.test_model_runner_speculative",
+    "tests.test_moe_gptq",
     "tests.test_qwen3_aux_hidden",
     "tests.test_target_verify_graph",
 )

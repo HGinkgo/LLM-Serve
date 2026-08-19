@@ -118,13 +118,27 @@ class CLITest(unittest.TestCase):
                         "32",
                         "--temperature",
                         "0.7",
+                        "--max-model-len",
+                        "512",
+                        "--max-num-batched-tokens",
+                        "128",
+                        "--max-num-seqs",
+                        "1",
+                        "--gpu-memory-utilization",
+                        "0.85",
                         "--enforce-eager",
                     ],
                     stdout=stdout,
                 )
 
             self.assertEqual(calls["tokenizer_model"], model_dir)
-            self.assertEqual(calls["llm"], (model_dir, {"enforce_eager": True}))
+            self.assertEqual(calls["llm"], (model_dir, {
+                "max_model_len": 512,
+                "max_num_batched_tokens": 128,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.85,
+                "enforce_eager": True,
+            }))
 
         self.assertEqual(status, 0)
         self.assertEqual(calls["messages"], [{"role": "user", "content": "hello"}])

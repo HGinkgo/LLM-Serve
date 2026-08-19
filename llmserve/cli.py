@@ -72,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--prompt", required=True, help="user prompt")
     generate.add_argument("--max-tokens", type=_positive_int, default=64)
     generate.add_argument("--temperature", type=_positive_float, default=0.6)
+    generate.add_argument("--max-model-len", type=_positive_int, default=4096)
+    generate.add_argument("--max-num-batched-tokens", type=_positive_int, default=16384)
+    generate.add_argument("--max-num-seqs", type=_positive_int, default=512)
+    generate.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     generate.add_argument(
         "--enforce-eager",
         action="store_true",
@@ -253,7 +257,14 @@ def _run_generate(args: argparse.Namespace, stdout: TextIO) -> int:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
     )
-    llm = llm_class(model_path, enforce_eager=args.enforce_eager)
+    llm = llm_class(
+        model_path,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
+    )
     try:
         outputs = llm.generate(
             [formatted_prompt],

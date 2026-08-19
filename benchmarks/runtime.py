@@ -316,9 +316,9 @@ def run_closed_loop(
             seq_to_spec[seq_id] = spec
             active_requests += 1
 
-    refill()
     measurement_start = clock() + warmup_seconds
     measurement_end = measurement_start + measurement_seconds
+    refill()
     scheduled_batch_sizes = []
     speculative_batch_sizes = []
     waiting_queue_sizes = []

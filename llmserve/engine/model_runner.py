@@ -11,9 +11,16 @@ from llmserve.engine.speculative_executor import SpeculativeExecutor
 from llmserve.speculative.target_graph import TargetVerifyGraphBackend
 from llmserve.speculative.types import SpeculativeDecodeOutput
 from llmserve.models.qwen3 import Qwen3ForCausalLM
+from llmserve.models.qwen3_moe import Qwen3MoeForCausalLM
 from llmserve.layers.sampler import Sampler
 from llmserve.utils.context import set_context, get_context, reset_context
 from llmserve.utils.loader import load_model
+
+
+def select_model_class(config: Config):
+    if config.quantization is None:
+        return Qwen3ForCausalLM
+    return Qwen3MoeForCausalLM
 
 
 def initialize_distributed(config: Config, rank: int, world_size: int):
@@ -44,10 +51,10 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(
-            hf_config,
-        )
+        self.model = select_model_class(config)(hf_config)
         load_model(self.model, config.model)
+        if config.quantization is not None:
+            self.model.prepare_for_runtime()
         self.speculative_executor = SpeculativeExecutor(self)
         self.draft_model = self.load_draft_model()
         self.speculative_gamma = config.speculative_gamma

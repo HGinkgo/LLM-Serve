@@ -237,6 +237,36 @@ class BenchmarkRuntimeTests(unittest.TestCase):
         self.assertEqual(observation["speculative_batch_sizes"], [])
         self.assertTrue(engine.is_finished())
 
+    def test_closed_loop_zero_warmup_includes_initial_submission_in_latency_cohort(self):
+        from benchmarks.runtime import run_closed_loop
+
+        class SubmitDelayEngine(FakeEngine):
+            def add_request(self, prompt, sampling_params):
+                seq_id = super().add_request(prompt, sampling_params)
+                self.clock.now += 0.01
+                return seq_id
+
+        clock = FakeClock()
+        specs = (
+            RequestSpec(index, "short", 2, 1, (index, index + 1))
+            for index in range(4)
+        )
+
+        observation = run_closed_loop(
+            SubmitDelayEngine(clock),
+            specs,
+            max_concurrency=1,
+            warmup_seconds=0,
+            measurement_seconds=0.3,
+            make_sampling_params=lambda spec: spec.output_len,
+            clock=clock.perf_counter,
+        )
+
+        self.assertEqual(
+            [request["request_id"] for request in observation["latency_requests"]],
+            [0],
+        )
+
     def test_closed_loop_emits_auditable_request_trace_without_prompt_tokens(self):
         from benchmarks.runtime import run_closed_loop
 

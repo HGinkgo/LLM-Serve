@@ -1,0 +1,22 @@
+[
+  {
+    "id": "en-arithmetic",
+    "prompt": "What is 2 + 2?"
+  },
+  {
+    "id": "zh-paged-kv",
+    "prompt": "用一句话解释 Paged KV Cache。"
+  },
+  {
+    "id": "python-docstring",
+    "prompt": "def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n"
+  },
+  {
+    "id": "word-problem",
+    "prompt": "A train leaves at 9:00 and travels 60 km/h for 2 hours. How far does it travel?"
+  },
+  {
+    "id": "scheduler-context",
+    "prompt": "The scheduler prioritizes decode tokens before prefilling waiting requests. The scheduler prioritizes decode tokens before prefilling waiting requests. The scheduler prioritizes decode tokens before prefilling waiting requests. Summarize the policy in one sentence."
+  }
+]

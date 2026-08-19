@@ -71,6 +71,35 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmarks.service_startup \
 显存快照。它不是性能测试；`request_ok: false` 时不应把后续的吞吐或延迟数字当作
 有效结论。
 
+## Qwen3 MoE GPTQ 外部对照
+
+`moe_reference` 用外部 vLLM 的 `gptq_marlin` 后端对照 LLM-Serve 对同一 GPTQ
+checkpoint 的贪婪生成结果。它只验证模型加载、量化线性层和 MoE 路径的端到端 token
+一致性，不报告或比较吞吐、延迟和显存。
+
+参考运行时必须安装在与 LLM-Serve 环境隔离的目录中，并在该机器上完成一次导入验证。
+工具仅将该目录注入 vLLM 子进程的 `PYTHONPATH`；候选子进程不会看到它。两个子进程按
+顺序运行，避免在一张 24 GiB 卡上同时加载模型。示例中的 vLLM `0.9.1` 是本项目已
+验证的参考版本；更换版本或 PyTorch 组合后，必须重新完成对照，不应假定兼容。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.moe_reference \
+  --model /path/to/Qwen3-30B-A3B-GPTQ-Int4 \
+  --reference-package-dir /path/to/isolate/vllm-0.9.1 \
+  --output /tmp/llmserve-moe-gptq-parity.json \
+  --prompts-file benchmarks/fixtures/qwen3_moe_gptq_parity.json \
+  --max-new-tokens 16 \
+  --max-model-len 512 \
+  --max-num-batched-tokens 128
+```
+
+fixture 包含英文、中文、Python、算术和较长上下文，顺序与 case ID 是验收契约。工具先由
+checkpoint tokenizer 编码每个 prompt，并把同一份 token IDs 传给两个运行时。两侧都固定
+greedy、`ignore_eos` 和相同的生成长度；每个运行时只加载一次模型，随后按 case 顺序以
+单请求生成。输出 JSON 记录每个 prompt token hash、参考版本、两侧 token IDs 和首个
+不匹配 case/位置。退出码 `0` 表示完整 token trace 一致，退出码 `2` 表示两侧成功运行
+但结果不一致。临时诊断可用 `--prompt` 替代 `--prompts-file`。
+
 ## 指标
 
 - `output_tokens_per_second`：measurement window 内生成的输出 token 数除以窗口时长。

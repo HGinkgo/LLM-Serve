@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+from llmserve.quantization.gptq import GPTQConfig
+
 
 @dataclass(slots=True)
 class Config:
@@ -27,6 +29,7 @@ class Config:
     enable_latency_telemetry: bool = False
     random_seed: int | None = None
     hf_config: AutoConfig | None = None
+    quantization: GPTQConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -48,6 +51,20 @@ class Config:
         if self.speculative_model is not None:
             assert os.path.isdir(self.speculative_model)
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        if getattr(self.hf_config, "quantization_config", None) is not None:
+        model_type = getattr(self.hf_config, "model_type", None)
+        quantization_config = getattr(self.hf_config, "quantization_config", None)
+        if model_type == "qwen3_moe":
+            if quantization_config is None:
+                raise ValueError("Qwen3-MoE serving requires the supported GPTQ-Int4 checkpoint")
+            self.quantization = GPTQConfig.from_dict(quantization_config)
+            if self.tensor_parallel_size != 1:
+                raise ValueError("GPTQ MoE requires tensor_parallel_size=1")
+            if not self.enforce_eager:
+                raise ValueError("GPTQ MoE currently requires enforce_eager=True")
+            if self.speculative_model is not None:
+                raise ValueError("GPTQ MoE does not support speculative decoding")
+            if self.enable_speculative_cuda_graph:
+                raise ValueError("GPTQ MoE does not support speculative CUDA Graph")
+        elif quantization_config is not None:
             raise ValueError("quantized checkpoints are not supported")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
