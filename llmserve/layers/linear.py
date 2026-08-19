@@ -41,23 +41,6 @@ class LinearBase(nn.Module):
         raise NotImplementedError
 
 
-class ReplicatedLinear(LinearBase):
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-    ):
-        super().__init__(input_size, output_size, bias)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.apply_linear(x)
-
-
 class ColumnParallelLinear(LinearBase):
 
     def __init__(
