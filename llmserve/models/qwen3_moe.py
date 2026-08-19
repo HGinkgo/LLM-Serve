@@ -42,30 +42,6 @@ class ExpertRouter:
             )
         return routing_weights.to(hidden_states.dtype), expert_ids
 
-    @staticmethod
-    def combine(
-        token_ids: torch.Tensor,
-        routing_weights: torch.Tensor,
-        expert_outputs: torch.Tensor,
-        *,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        if token_ids.ndim != 1 or routing_weights.ndim != 1:
-            raise ValueError("token ids and routing weights must be rank one")
-        if token_ids.shape != routing_weights.shape:
-            raise ValueError("token ids and routing weights must have the same shape")
-        if expert_outputs.ndim != 2 or expert_outputs.size(0) != token_ids.numel():
-            raise ValueError("expert outputs must contain one row per assignment")
-        output = torch.zeros(
-            num_tokens,
-            expert_outputs.size(-1),
-            dtype=expert_outputs.dtype,
-            device=expert_outputs.device,
-        )
-        output.index_add_(0, token_ids, expert_outputs * routing_weights.unsqueeze(-1))
-        return output
-
-
 class Qwen3MoeAttention(nn.Module):
     """Qwen3 attention with unfused GPTQ projections for one GPU."""
 
@@ -140,8 +116,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             Qwen3MoeExpert(config.hidden_size, config.moe_intermediate_size, group_size)
             for _ in range(config.num_experts)
         ])
-        self.last_active_experts = 0
-        self.last_max_assignments_per_expert = 0
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         routing_weights, expert_ids = self.router(hidden_states, self.gate.weight)
@@ -157,11 +131,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # The current one-GPU implementation dispatches each active expert from
         # Python. Move both grouping vectors together to avoid two device syncs.
         groups = torch.stack((active_experts, counts), dim=1).tolist()
-        self.last_active_experts = len(groups)
-        self.last_max_assignments_per_expert = max(
-            (count for _, count in groups),
-            default=0,
-        )
 
         output = torch.zeros_like(hidden_states)
         offset = 0

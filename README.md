@@ -35,6 +35,9 @@ LLM-Serve 是一个以 Qwen3-8B 为主要目标、面向单机 GPU 推理系统�
 
 - EAGLE3 线性投机解码默认关闭，只用于可控的 A/B 实验。
 - PD + Shared KV Transport 已保留，但当前不扩展动态路由、1P2D 或新的 PD 功能。
+- 本分支额外支持 Qwen3-30B-A3B GPTQ-Int4 的单卡 MoE 实验路径。checkpoint
+  契约固定为 group size 128、对称量化且关闭 act-order；TinyGEMM 是默认对照后端，
+  Marlin 通过显式加载已验证的 vLLM 0.9.1 CUDA 扩展启用。
 
 ## 快速开始
 
@@ -152,7 +155,9 @@ CUDA_VISIBLE_DEVICES=0,1 llmserve serve \
 
 - 主要支持 Qwen3-8B、单卡 TP=1；双卡用于 Prefill/Decode 分离，不用于 Tensor Parallel。
 - EAGLE 和 PD 是实验性/受限能力；Chunked Prefill、KV 容量准入和普通 Decode CUDA Graph 是单机服务基线的一部分。
-- 仅支持非量化 checkpoint；HTTP 服务当前为单模型、纯文本接口，不提供鉴权、工具调用、多模态或跨节点路由。
+- Dense Qwen3 路径仅支持非量化 checkpoint；MoE 路径仅支持上述 GPTQ-Int4
+  checkpoint，限制为单卡 TP=1 与 eager 执行。HTTP 服务当前为单模型、纯文本接口，
+  不提供鉴权、工具调用、多模态或跨节点路由。
 - PD 服务与 EAGLE 尚未耦合；PD 模式会拒绝 `--speculative-model`，避免把未实现组合包装成可用能力。
 
 ## License

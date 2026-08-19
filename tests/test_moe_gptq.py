@@ -206,24 +206,6 @@ class ExpertRouterTest(unittest.TestCase):
         self.assertGreater(weights[0, 0], weights[0, 1])
         self.assertGreater(weights[1, 0], weights[1, 1])
 
-    def test_accumulates_each_expert_result_using_its_routing_weight(self):
-        token_ids = torch.tensor([0, 0, 1, 1])
-        routing_weights = torch.tensor([0.75, 0.25, 0.4, 0.6])
-        expert_outputs = torch.tensor([
-            [4.0, 0.0],
-            [0.0, 4.0],
-            [1.0, 1.0],
-            [3.0, 1.0],
-        ])
-
-        output = ExpertRouter.combine(token_ids, routing_weights, expert_outputs, num_tokens=2)
-
-        self.assertTrue(torch.allclose(output, torch.tensor([
-            [3.0, 1.0],
-            [2.2, 1.0],
-        ])))
-
-
 class SparseMoeBlockTest(unittest.TestCase):
 
     def test_groups_assignments_and_combines_each_active_expert_once(self):
@@ -261,8 +243,6 @@ class SparseMoeBlockTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output[:, 0], expected_scale))
         self.assertTrue(torch.equal(output[:, 1:], torch.zeros(2, 127)))
-        self.assertEqual(block.last_active_experts, 2)
-        self.assertEqual(block.last_max_assignments_per_expert, 2)
 
 
 class GPTQLinearTest(unittest.TestCase):

@@ -33,6 +33,11 @@ LLM-Serve is an educational inference runtime centered on Qwen3-8B and single-ho
 
 - EAGLE3 linear speculative decoding is off by default and kept for controlled A/B measurements.
 - PD with Shared KV transport is retained but frozen. Dynamic routing, 1P2D, and new PD features are out of scope.
+- This branch also supports a single-GPU Qwen3-30B-A3B GPTQ-Int4 MoE
+  experiment. Its checkpoint contract is fixed to group size 128, symmetric
+  quantization, and no act-order. TinyGEMM is the default comparison backend;
+  Marlin is enabled by explicitly loading the validated vLLM 0.9.1 CUDA
+  extension.
 
 ## Quick Start
 
@@ -152,7 +157,11 @@ Performance numbers are intentionally kept out of the root README. Benchmark con
 
 - The primary target is Qwen3-8B with single-GPU TP=1. The dual-GPU path is for Prefill/Decode disaggregation, not Tensor Parallelism.
 - EAGLE and PD are experimental or constrained paths. Chunked prefill, KV capacity admission, and normal decode CUDA Graphs are part of the single-host serving baseline.
-- Only non-quantized checkpoints are supported. The HTTP service is currently single-model and text-only; it does not provide authentication, tool calling, multimodality, or cross-node routing.
+- The dense Qwen3 path only supports non-quantized checkpoints. The MoE path
+  only supports the GPTQ-Int4 contract above and is limited to single-GPU TP=1
+  eager execution. The HTTP service is currently single-model and text-only;
+  it does not provide authentication, tool calling, multimodality, or
+  cross-node routing.
 - PD serving and EAGLE are not coupled yet. `pd-shared` rejects `--speculative-model` rather than presenting an unimplemented combination as supported.
 
 ## License
