@@ -1,4 +1,4 @@
-"""Qwen3-MoE model backed by GPTQ W4A16 TinyGEMM linears."""
+"""Qwen3-MoE model backed by GPTQ W4A16 CUDA linears."""
 
 from __future__ import annotations
 
@@ -224,10 +224,19 @@ class Qwen3MoeModel(nn.Module):
 
 class Qwen3MoeForCausalLM(nn.Module):
 
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        *,
+        gptq_backend: str = "tinygemm",
+        marlin_library: str | None = None,
+    ) -> None:
         super().__init__()
         self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        for module in self.modules():
+            if isinstance(module, GPTQLinear):
+                module.configure_backend(gptq_backend, marlin_library)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, positions)

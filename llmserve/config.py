@@ -28,6 +28,8 @@ class Config:
     # Benchmark-only observability. Disabled for normal serving paths.
     enable_latency_telemetry: bool = False
     random_seed: int | None = None
+    gptq_backend: str = "tinygemm"
+    marlin_library: str | None = None
     hf_config: AutoConfig | None = None
     quantization: GPTQConfig | None = None
     eos: int = -1
@@ -65,6 +67,14 @@ class Config:
                 raise ValueError("GPTQ MoE does not support speculative decoding")
             if self.enable_speculative_cuda_graph:
                 raise ValueError("GPTQ MoE does not support speculative CUDA Graph")
+            if self.gptq_backend not in {"tinygemm", "marlin"}:
+                raise ValueError("gptq_backend must be 'tinygemm' or 'marlin'")
+            if self.gptq_backend == "marlin":
+                if not self.marlin_library:
+                    raise ValueError("gptq_backend=marlin requires marlin_library")
+                self.marlin_library = os.path.abspath(os.path.expanduser(self.marlin_library))
+                if not os.path.isfile(self.marlin_library):
+                    raise ValueError(f"marlin_library does not exist: {self.marlin_library}")
         elif quantization_config is not None:
             raise ValueError("quantized checkpoints are not supported")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

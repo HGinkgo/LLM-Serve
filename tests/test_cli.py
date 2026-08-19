@@ -126,6 +126,10 @@ class CLITest(unittest.TestCase):
                         "1",
                         "--gpu-memory-utilization",
                         "0.85",
+                        "--gptq-backend",
+                        "marlin",
+                        "--marlin-library",
+                        "/opt/vllm/_C.abi3.so",
                         "--enforce-eager",
                     ],
                     stdout=stdout,
@@ -137,6 +141,8 @@ class CLITest(unittest.TestCase):
                 "max_num_batched_tokens": 128,
                 "max_num_seqs": 1,
                 "gpu_memory_utilization": 0.85,
+                "gptq_backend": "marlin",
+                "marlin_library": "/opt/vllm/_C.abi3.so",
                 "enforce_eager": True,
             }))
 

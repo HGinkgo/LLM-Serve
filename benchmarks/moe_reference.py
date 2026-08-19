@@ -262,6 +262,8 @@ def _run_llmserve_worker(payload: dict) -> dict:
         max_num_seqs=1,
         gpu_memory_utilization=payload["gpu_memory_utilization"],
         random_seed=payload["seed"],
+        gptq_backend=payload.get("candidate_gptq_backend", "tinygemm"),
+        marlin_library=payload.get("candidate_marlin_library"),
     )
     try:
         engine.model_runner.sampler = _ArgmaxSampler()
@@ -335,6 +337,22 @@ def run_comparison(args: argparse.Namespace) -> dict:
         )
     if args.max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
+    if args.candidate_gptq_backend == "marlin":
+        if args.candidate_marlin_library is None:
+            raise ValueError(
+                "candidate_gptq_backend=marlin requires --candidate-marlin-library"
+            )
+        candidate_marlin_library = Path(args.candidate_marlin_library).resolve()
+        if not candidate_marlin_library.is_file():
+            raise ValueError(
+                f"candidate Marlin library does not exist: {candidate_marlin_library}"
+            )
+    else:
+        if args.candidate_marlin_library is not None:
+            raise ValueError(
+                "--candidate-marlin-library requires --candidate-gptq-backend marlin"
+            )
+        candidate_marlin_library = None
 
     tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
     prompt_cases = load_prompt_cases(
@@ -350,6 +368,10 @@ def run_comparison(args: argparse.Namespace) -> dict:
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "seed": args.seed,
+        "candidate_gptq_backend": args.candidate_gptq_backend,
+        "candidate_marlin_library": (
+            None if candidate_marlin_library is None else str(candidate_marlin_library)
+        ),
     }
 
     with tempfile.TemporaryDirectory(prefix="llmserve-moe-reference-") as directory:
@@ -405,6 +427,10 @@ def run_comparison(args: argparse.Namespace) -> dict:
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "seed": args.seed,
+            "candidate_gptq_backend": args.candidate_gptq_backend,
+            "candidate_marlin_library": (
+                None if candidate_marlin_library is None else str(candidate_marlin_library)
+            ),
         },
         "reference": reference,
         "candidate": candidate,
@@ -425,6 +451,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=20260819)
+    parser.add_argument(
+        "--candidate-gptq-backend",
+        choices=("tinygemm", "marlin"),
+        default="tinygemm",
+    )
+    parser.add_argument("--candidate-marlin-library")
     parser.add_argument("--output", type=Path, required=True)
     return parser
 

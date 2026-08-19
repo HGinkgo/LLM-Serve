@@ -93,6 +93,26 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmarks.moe_reference \
   --max-num-batched-tokens 128
 ```
 
+默认候选实现使用 LLM-Serve 的 `tinygemm` 后端。验证可选 Marlin provider 时，显式
+传入 vLLM `0.9.1` 已安装包中的 `_C.abi3.so`，候选子进程只通过 `torch.ops.load_library`
+加载该算子库，不导入完整 vLLM Python runtime：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.moe_reference \
+  --model /path/to/Qwen3-30B-A3B-GPTQ-Int4 \
+  --reference-package-dir /path/to/isolate/vllm-0.9.1 \
+  --candidate-gptq-backend marlin \
+  --candidate-marlin-library /path/to/isolate/vllm-0.9.1/vllm/_C.abi3.so \
+  --output /tmp/llmserve-moe-gptq-marlin-parity.json \
+  --prompts-file benchmarks/fixtures/qwen3_moe_gptq_parity.json \
+  --max-new-tokens 16 \
+  --max-model-len 512 \
+  --max-num-batched-tokens 128
+```
+
+该 provider ABI 固定为已验证的 vLLM `0.9.1`；切换 vLLM 版本需要重新完成数值对照，
+并在结果 JSON 中保留 `runtime_config` 的候选后端与动态库路径。
+
 fixture 包含英文、中文、Python、算术和较长上下文，顺序与 case ID 是验收契约。工具先由
 checkpoint tokenizer 编码每个 prompt，并把同一份 token IDs 传给两个运行时。两侧都固定
 greedy、`ignore_eos` 和相同的生成长度；每个运行时只加载一次模型，随后按 case 顺序以

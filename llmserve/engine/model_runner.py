@@ -51,7 +51,15 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = select_model_class(config)(hf_config)
+        model_class = select_model_class(config)
+        if config.quantization is None:
+            self.model = model_class(hf_config)
+        else:
+            self.model = model_class(
+                hf_config,
+                gptq_backend=config.gptq_backend,
+                marlin_library=config.marlin_library,
+            )
         load_model(self.model, config.model)
         if config.quantization is not None:
             self.model.prepare_for_runtime()

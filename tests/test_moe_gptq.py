@@ -16,6 +16,7 @@ from llmserve.config import Config
 from llmserve.layers.quantized import (
     GPTQLinear,
     gptq_qzeros_to_tinygemm_offset,
+    marlin_permute_scales,
     unpack_gptq_qweight,
 )
 from llmserve.engine.model_runner import select_model_class
@@ -125,6 +126,29 @@ class GPTQConfigTest(unittest.TestCase):
             return_value=hf_config,
         ), self.assertRaisesRegex(ValueError, "enforce_eager=True"):
             Config(model=model_dir)
+
+    def test_config_requires_a_provider_library_for_marlin(self):
+        hf_config = SimpleNamespace(
+            model_type="qwen3_moe",
+            max_position_embeddings=4096,
+            quantization_config={
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "desc_act": False,
+                "checkpoint_format": "gptq",
+            },
+        )
+        with tempfile.TemporaryDirectory() as model_dir, patch(
+            "llmserve.config.AutoConfig.from_pretrained",
+            return_value=hf_config,
+        ), self.assertRaisesRegex(ValueError, "marlin_library"):
+            Config(
+                model=model_dir,
+                enforce_eager=True,
+                gptq_backend="marlin",
+            )
 
     def test_config_rejects_speculative_decoding_for_gptq_moe(self):
         hf_config = SimpleNamespace(
@@ -243,6 +267,25 @@ class SparseMoeBlockTest(unittest.TestCase):
 
 class GPTQLinearTest(unittest.TestCase):
 
+    def test_marlin_scale_permutation_uses_the_single_group_kernel_layout(self):
+        scales = torch.arange(256, dtype=torch.float16).reshape(1, 256)
+
+        actual = marlin_permute_scales(
+            scales,
+            input_size=128,
+            output_size=256,
+            group_size=128,
+        )
+
+        permutation = torch.tensor([
+            2 * index + offset
+            for index in range(4)
+            for offset in (0, 1, 8, 9, 16, 17, 24, 25)
+        ])
+        expected = scales.reshape(-1, 32).index_select(1, permutation).reshape(1, 256)
+        self.assertTrue(torch.equal(actual, expected))
+
+
     def test_unpacks_columns_and_gptq_zero_points_before_matmul(self):
         linear = GPTQLinear(8, 8, group_size=4)
         linear.qweight.data.copy_(torch.tensor([[0x22221111] * 8]))
@@ -341,6 +384,43 @@ class GPTQLinearTest(unittest.TestCase):
         linear.qzeros.data.fill_(0x77777777)
         linear.scales.data.uniform_(0.001, 0.1)
         hidden_states = torch.randn(3, input_size, dtype=torch.float16, device="cuda")
+
+        reference = linear(hidden_states)
+        linear.prepare_for_runtime()
+        actual = linear(hidden_states)
+
+        self.assertTrue(torch.allclose(actual, reference, rtol=2e-2, atol=2e-2))
+        self.assertEqual(linear.qweight.numel(), 0)
+        self.assertEqual(linear.qzeros.numel(), 0)
+        self.assertEqual(linear.scales.numel(), 0)
+        self.assertEqual(linear.g_idx.numel(), 0)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and os.environ.get("LLMSERVE_TEST_MARLIN_LIBRARY"),
+        "set LLMSERVE_TEST_MARLIN_LIBRARY and make CUDA available",
+    )
+    def test_marlin_cuda_provider_matches_reference_and_releases_source_tensors(self):
+        linear = GPTQLinear(
+            128,
+            256,
+            group_size=128,
+            backend="marlin",
+            marlin_library=os.environ["LLMSERVE_TEST_MARLIN_LIBRARY"],
+        ).cuda()
+        codes = torch.randint(
+            0,
+            16,
+            (128, 256),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        shifts = torch.arange(8, dtype=torch.int32, device="cuda") * 4
+        linear.qweight.data.copy_(
+            (codes.reshape(16, 8, 256) << shifts.view(1, 8, 1)).sum(dim=1)
+        )
+        linear.qzeros.data.fill_(0x77777777)
+        linear.scales.data.uniform_(0.001, 0.1)
+        hidden_states = torch.randn(3, 128, dtype=torch.float16, device="cuda")
 
         reference = linear(hidden_states)
         linear.prepare_for_runtime()

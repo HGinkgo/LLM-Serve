@@ -77,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--max-num-seqs", type=_positive_int, default=512)
     generate.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     generate.add_argument(
+        "--gptq-backend",
+        choices=("tinygemm", "marlin"),
+        default="tinygemm",
+    )
+    generate.add_argument(
+        "--marlin-library",
+        help="vLLM 0.9.1 CUDA extension exposing the GPTQ-Marlin ABI",
+    )
+    generate.add_argument(
         "--enforce-eager",
         action="store_true",
         help="disable CUDA Graph execution",
@@ -263,6 +272,8 @@ def _run_generate(args: argparse.Namespace, stdout: TextIO) -> int:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        gptq_backend=args.gptq_backend,
+        marlin_library=args.marlin_library,
         enforce_eager=args.enforce_eager,
     )
     try:

@@ -2,9 +2,52 @@ import unittest
 import json
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 
 class MoeReferenceParityTest(unittest.TestCase):
+
+    def test_candidate_worker_forwards_marlin_provider_to_llmserve(self):
+        from benchmarks.moe_reference import _run_llmserve_worker
+
+        calls = {}
+
+        class FakeEngine:
+            def __init__(self, model, **kwargs):
+                calls["model"] = model
+                calls["kwargs"] = kwargs
+                self.model_runner = type("Runner", (), {})()
+
+            def generate(self, prompts, sampling_params, use_tqdm):
+                del prompts, sampling_params, use_tqdm
+                return [{"token_ids": [101, 102]}]
+
+            def exit(self):
+                calls["exited"] = True
+
+        payload = {
+            "model": "/models/qwen3-moe-gptq",
+            "cases": [{"id": "case", "prompt_token_ids": [1, 2]}],
+            "max_new_tokens": 2,
+            "max_model_len": 256,
+            "max_num_batched_tokens": 128,
+            "gpu_memory_utilization": 0.85,
+            "seed": 7,
+            "candidate_gptq_backend": "marlin",
+            "candidate_marlin_library": "/opt/vllm/_C.abi3.so",
+        }
+
+        with patch("llmserve.LLM", FakeEngine):
+            result = _run_llmserve_worker(payload)
+
+        self.assertEqual(calls["model"], payload["model"])
+        self.assertEqual(calls["kwargs"]["gptq_backend"], "marlin")
+        self.assertEqual(
+            calls["kwargs"]["marlin_library"],
+            "/opt/vllm/_C.abi3.so",
+        )
+        self.assertTrue(calls["exited"])
+        self.assertEqual(result["cases"][0]["generated_token_ids"], [101, 102])
 
     def test_load_prompt_cases_preserves_fixture_order_and_token_ids(self):
         from benchmarks.moe_reference import load_prompt_cases
