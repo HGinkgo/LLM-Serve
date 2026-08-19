@@ -113,6 +113,30 @@ CUDA_VISIBLE_DEVICES=0 python -m benchmarks.moe_reference \
 该 provider ABI 固定为已验证的 vLLM `0.9.1`；切换 vLLM 版本需要重新完成数值对照，
 并在结果 JSON 中保留 `runtime_config` 的候选后端与动态库路径。
 
+## MoE 后端性能基线
+
+`moe_backend` 在独立子进程中顺序运行 TinyGEMM 和 Marlin，保证两次运行不共享
+CUDA allocator 或模型进程。父进程先用同一个 checkpoint tokenizer 编码 prompt，
+再把固定 token trace 传给两个 worker；每个 worker 只加载一次模型，按相同 batch
+size 和输出长度运行。结果记录 output/request throughput、TTFT、TPOT、完成/失败数、
+请求级摘要和 CUDA allocated/reserved 峰值，不报告 E2E 或 HTTP 指标。
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n LLM-Serve \
+  python -m benchmarks.moe_backend \
+  --model /path/to/Qwen3-30B-A3B-GPTQ-Int4 \
+  --prompts-file benchmarks/fixtures/qwen3_moe_gptq_parity.json \
+  --backends tinygemm,marlin \
+  --marlin-library /path/to/isolate/vllm-0.9.1/vllm/_C.abi3.so \
+  --batch-sizes 1,4 --repeats 1 \
+  --max-new-tokens 16 --max-model-len 512 \
+  --max-num-batched-tokens 128 \
+  --output experiment-data/YYYY-MM-DD_moe-backend-baseline/baseline.json
+```
+
+该基线固定 `enforce_eager=True`，不启用 CUDA Graph；这是为了隔离 GPTQ 后端与
+MoE dispatch 的成本。拿到数据后再用 profiler 判断是否值得改 dispatch 或 kernel。
+
 fixture 包含英文、中文、Python、算术和较长上下文，顺序与 case ID 是验收契约。工具先由
 checkpoint tokenizer 编码每个 prompt，并把同一份 token IDs 传给两个运行时。两侧都固定
 greedy、`ignore_eos` 和相同的生成长度；每个运行时只加载一次模型，随后按 case 顺序以

@@ -23,6 +23,7 @@ class TestTierTests(unittest.TestCase):
         self.assertEqual(len(extended), len(modules_for_tier("extended")))
         self.assertIn("tests.test_benchmark_serve", extended)
         self.assertIn("tests.test_moe_reference_parity", extended)
+        self.assertIn("tests.test_moe_backend_benchmark", extended)
         self.assertIn("tests.test_service_overload_benchmark", extended)
         self.assertIn("tests.test_service_startup", extended)
         self.assertIn("tests.test_moe_gptq", extended)

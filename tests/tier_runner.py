@@ -48,6 +48,7 @@ EXTENDED_ONLY_MODULES = (
     "tests.test_benchmark_serve",
     "tests.test_benchmark_suite",
     "tests.test_moe_reference_parity",
+    "tests.test_moe_backend_benchmark",
     "tests.test_optional_dependencies",
     "tests.test_pd_batch_example",
     "tests.test_service_overload_benchmark",
