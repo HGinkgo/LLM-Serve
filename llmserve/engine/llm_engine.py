@@ -486,6 +486,7 @@ class LLMEngine:
         first_token_seq_ids = []
         decode_seq_ids = []
         finished_seq_ids = []
+        emitted_token_ids_by_seq = {}
         for seq in seqs:
             metric = self.request_metrics.get(seq.seq_id)
             if metric is None:
@@ -493,6 +494,9 @@ class LLMEngine:
             before = before_completion_tokens[seq.seq_id]
             after = seq.num_completion_tokens
             if after > before:
+                emitted_token_ids_by_seq[seq.seq_id] = list(
+                    seq.completion_token_ids[before:after]
+                )
                 if metric["first_token_time"] is None:
                     metric["first_token_time"] = step_end
                     first_token_seq_ids.append(seq.seq_id)
@@ -515,6 +519,7 @@ class LLMEngine:
             "first_token_seq_ids": first_token_seq_ids,
             "decode_seq_ids": decode_seq_ids,
             "finished_seq_ids": finished_seq_ids,
+            "emitted_token_ids_by_seq": emitted_token_ids_by_seq,
             "waiting_queue_size": len(getattr(self.scheduler, "waiting", ())),
             "running_queue_size": len(getattr(self.scheduler, "running", ())),
         }
@@ -601,6 +606,7 @@ class LLMEngine:
         first_token_seq_ids = []
         decode_seq_ids = []
         finished_seq_ids = []
+        emitted_token_ids_by_seq = {}
         debug_by_seq = {}
         total_draft_tokens = 0
         total_accepted_tokens = 0
@@ -620,6 +626,9 @@ class LLMEngine:
                     step_end - step_start
                 )
                 if emitted_tokens > 0:
+                    emitted_token_ids_by_seq[seq.seq_id] = list(
+                        seq.completion_token_ids[before:after]
+                    )
                     if metric["first_token_time"] is None:
                         metric["first_token_time"] = step_end
                         first_token_seq_ids.append(seq.seq_id)
@@ -671,6 +680,7 @@ class LLMEngine:
             "first_token_seq_ids": first_token_seq_ids,
             "decode_seq_ids": decode_seq_ids,
             "finished_seq_ids": finished_seq_ids,
+            "emitted_token_ids_by_seq": emitted_token_ids_by_seq,
             "waiting_queue_size": len(getattr(self.scheduler, "waiting", ())),
             "running_queue_size": len(getattr(self.scheduler, "running", ())),
             "speculative": True,

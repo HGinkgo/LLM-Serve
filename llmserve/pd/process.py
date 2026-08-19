@@ -13,6 +13,12 @@ def _handle_termination(signum, _frame):
     raise SystemExit(128 + signum)
 
 
+def _install_worker_signal_handlers():
+    """Route terminal signals through worker cleanup instead of tracebacks."""
+    signal.signal(signal.SIGTERM, _handle_termination)
+    signal.signal(signal.SIGINT, _handle_termination)
+
+
 def _destroy_process_group(distributed=None):
     """Release a partially initialized worker process group."""
     if distributed is None:
@@ -119,7 +125,7 @@ def worker_main(
     CUDA_VISIBLE_DEVICES is set before importing the engine so each worker sees
     its assigned physical GPU as local device 0.
     """
-    signal.signal(signal.SIGTERM, _handle_termination)
+    _install_worker_signal_handlers()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     engine = None
     runtime = None

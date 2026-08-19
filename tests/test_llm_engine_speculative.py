@@ -282,6 +282,10 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         self.assertEqual(engine.last_step_events["speculative_num_accepted"], 2)
         self.assertFalse(engine.last_step_events["speculative_accepted_all"])
         self.assertEqual(engine.last_step_events["speculative_emitted_tokens"], 3)
+        self.assertEqual(
+            engine.last_step_events["emitted_token_ids_by_seq"],
+            {seq.seq_id: [10, 11, 12]},
+        )
         self.assertEqual(engine.last_step_events["speculative_debug"]["draft_token_ids"], [11, 12])
 
         metrics = LLMEngine.get_metrics(engine)
@@ -351,6 +355,10 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         self.assertEqual(len(engine.request_metrics[seq.seq_id]["output_event_times"]), 1)
         self.assertEqual(engine.last_step_events["waiting_queue_size"], 2)
         self.assertEqual(engine.last_step_events["running_queue_size"], 1)
+        self.assertEqual(
+            engine.last_step_events["emitted_token_ids_by_seq"],
+            {seq.seq_id: [10]},
+        )
 
     def test_step_passes_explicit_groups_for_mixed_batch(self):
         prefill = Sequence([1, 2, 3])
@@ -413,6 +421,13 @@ class LLMEngineSpeculativeTest(unittest.TestCase):
         self.assertEqual(engine.last_step_events["scheduled_seq_ids"], [seq1.seq_id, seq2.seq_id])
         self.assertEqual(engine.last_step_events["speculative_num_accepted"], 3)
         self.assertEqual(engine.last_step_events["speculative_emitted_tokens"], 5)
+        self.assertEqual(
+            engine.last_step_events["emitted_token_ids_by_seq"],
+            {
+                seq1.seq_id: [10, 11, 12],
+                seq2.seq_id: [20, 21],
+            },
+        )
         self.assertEqual(
             engine.last_step_events["speculative_debug_by_seq"][seq1.seq_id]["draft_token_ids"],
             [11, 12, 13],

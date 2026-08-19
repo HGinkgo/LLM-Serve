@@ -9,6 +9,7 @@ from llmserve.pd.process import (
     _cleanup_worker_resources,
     _destroy_process_group,
     _handle_termination,
+    _install_worker_signal_handlers,
     _report_startup_progress,
 )
 
@@ -90,6 +91,18 @@ class TestPDProcessCleanup(unittest.TestCase):
             _handle_termination(signal.SIGTERM, None)
 
         self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+
+    def test_worker_installs_the_same_cleanup_handler_for_sigint_and_sigterm(self):
+        with patch("llmserve.pd.process.signal.signal") as register_handler:
+            _install_worker_signal_handlers()
+
+        self.assertEqual(
+            register_handler.call_args_list,
+            [
+                ((signal.SIGTERM, _handle_termination),),
+                ((signal.SIGINT, _handle_termination),),
+            ],
+        )
 
     def test_destroys_initialized_process_group(self):
         distributed = FakeDistributed(initialized=True)

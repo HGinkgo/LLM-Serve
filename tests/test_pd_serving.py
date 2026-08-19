@@ -93,6 +93,7 @@ class FakePDCoordinator:
                 "last_step_events": {
                     "step_end": 1.0,
                     "scheduled_seq_ids": [100, 101],
+                    "emitted_token_ids_by_seq": {100: [200], 101: [201]},
                     "waiting_queue_size": 0,
                     "running_queue_size": 2,
                 },
@@ -104,6 +105,7 @@ class FakePDCoordinator:
             "last_step_events": {
                 "step_end": float(self.decode_calls),
                 "scheduled_seq_ids": [100 + request_id],
+                "emitted_token_ids_by_seq": {100 + request_id: [200 + request_id]},
                 "waiting_queue_size": 0,
                 "running_queue_size": 1,
             },
@@ -193,6 +195,7 @@ class MultiDecodeCoordinator(FakePDCoordinator):
                 "num_tokens": 1,
                 "last_step_events": {
                     "scheduled_seq_ids": [0],
+                    "emitted_token_ids_by_seq": {0: [200 + index]},
                     "waiting_queue_size": 0,
                     "running_queue_size": 1,
                 },
@@ -282,6 +285,10 @@ class TestPDServingEngine(unittest.TestCase):
         self.assertEqual((first, second), (0, 1))
         self.assertEqual(outputs, [(0, [200]), (1, [201])])
         self.assertEqual(num_tokens, 2)
+        self.assertEqual(
+            engine.last_step_events["emitted_token_ids_by_seq"],
+            {first: [200], second: [201]},
+        )
         self.assertEqual(len(coordinator.prefill_calls), 1)
         self.assertEqual(len(coordinator.admit_calls), 1)
         self.assertEqual(coordinator.decode_calls, 1)
@@ -297,6 +304,10 @@ class TestPDServingEngine(unittest.TestCase):
 
         self.assertEqual(outputs, [(first, [200]), (second, [201])])
         self.assertEqual(num_tokens, 2)
+        self.assertEqual(
+            engine.last_step_events["emitted_token_ids_by_seq"],
+            {first: [200], second: [201]},
+        )
         self.assertEqual(coordinator.prefill_targets, ["decode-0", "decode-1"])
         self.assertEqual(coordinator.admitted_by_worker["decode-0"], [first])
         self.assertEqual(coordinator.admitted_by_worker["decode-1"], [second])

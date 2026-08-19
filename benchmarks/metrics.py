@@ -34,7 +34,7 @@ def summarize_values(values: Sequence[float]):
     }
 
 
-def _request_latency(request: Mapping):
+def _request_latency(request: Mapping, *, include_e2e: bool = True):
     arrival_time = request["arrival_time"]
     first_token_time = request["first_token_time"]
     finish_time = request["finish_time"]
@@ -42,11 +42,13 @@ def _request_latency(request: Mapping):
     token_times = request.get("token_times", [])
 
     ttft = first_token_time - arrival_time
-    e2e = finish_time - arrival_time
     if output_tokens > 1:
-        tpot = (finish_time - first_token_time) / (output_tokens - 1)
+        last_token_time = request.get("last_token_time")
+        if last_token_time is None:
+            last_token_time = token_times[-1] if token_times else finish_time
+        tpot = (last_token_time - first_token_time) / (output_tokens - 1)
     else:
-        tpot = 0.0
+        tpot = None
     burst_itl = request.get("burst_itl")
     if burst_itl is None:
         burst_itl = [
@@ -60,7 +62,7 @@ def _request_latency(request: Mapping):
             output_event_times[index] - output_event_times[index - 1]
             for index in range(1, len(output_event_times))
         ]
-    return {
+    latency = {
         "ttft": ttft,
         "tpot": tpot,
         "burst_itl": burst_itl,
@@ -68,22 +70,32 @@ def _request_latency(request: Mapping):
         "speculative_step_latency": request.get(
             "speculative_step_latency", []
         ),
-        "e2e": e2e,
     }
+    if include_e2e:
+        latency["e2e"] = finish_time - arrival_time
+    return latency
 
 
-def _latency_summary(requests: Sequence[Mapping]):
-    scalar_names = ("ttft", "tpot", "e2e")
+def _latency_summary(
+    requests: Sequence[Mapping],
+    *,
+    include_e2e: bool = True,
+    include_auxiliary_latency: bool = True,
+):
+    scalar_names = ("ttft", "tpot")
+    if include_e2e:
+        scalar_names += ("e2e",)
     sample_names = (
         "burst_itl",
         "output_event_latency",
         "speculative_step_latency",
-    )
+    ) if include_auxiliary_latency else ()
     values = {name: [] for name in scalar_names + sample_names}
     for request in requests:
-        latency = _request_latency(request)
+        latency = _request_latency(request, include_e2e=include_e2e)
         for name in scalar_names:
-            values[name].append(latency[name])
+            if latency[name] is not None:
+                values[name].append(latency[name])
         for name in sample_names:
             values[name].extend(latency[name])
     return {name: summarize_values(samples) for name, samples in values.items()}
@@ -149,7 +161,10 @@ def _goodput_summary(
     good = 0
     for request in requests:
         latency = _request_latency(request)
-        if all(latency[name] <= threshold for name, threshold in thresholds.items()):
+        if all(
+            latency[name] is None or latency[name] <= threshold
+            for name, threshold in thresholds.items()
+        ):
             good += 1
     return {
         "completed": good,
@@ -162,6 +177,9 @@ def summarize_serving_run(
     requests: Sequence[Mapping],
     duration: float,
     slo_ms: Mapping[str, float] | None = None,
+    *,
+    include_e2e: bool = True,
+    include_auxiliary_latency: bool = True,
 ):
     if duration <= 0:
         raise ValueError("duration must be positive")
@@ -190,7 +208,11 @@ def summarize_serving_run(
             "total_tokens_per_second": (input_tokens + output_tokens) / duration,
         },
         "latency": {
-            name: _latency_summary(group_requests)
+            name: _latency_summary(
+                group_requests,
+                include_e2e=include_e2e,
+                include_auxiliary_latency=include_auxiliary_latency,
+            )
             for name, group_requests in groups.items()
         },
         "goodput": (

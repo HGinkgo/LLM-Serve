@@ -2,7 +2,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from llmserve import cli
 
@@ -193,6 +193,48 @@ class CLITest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertTrue(calls["exited"])
         self.assertIn("RuntimeError: generation failed", stderr.getvalue())
+
+    def test_serve_builds_pd_shared_runtime_and_closes_it_after_server_exit(self):
+        runtime = Mock()
+        app = object()
+        with tempfile.TemporaryDirectory() as model_dir:
+            with (
+                patch("llmserve.cli._cuda_is_available", return_value=True),
+                patch("llmserve.cli._build_service_runtime", return_value=runtime) as build_runtime,
+                patch("llmserve.cli._create_service_app", return_value=app) as create_app,
+                patch("llmserve.cli._run_uvicorn") as run_uvicorn,
+            ):
+                status = cli.main([
+                    "serve",
+                    "--model", model_dir,
+                    "--served-model-name", "Qwen3-8B",
+                    "--mode", "pd-shared",
+                    "--host", "0.0.0.0",
+                    "--port", "18000",
+                    "--max-model-len", "2048",
+                    "--max-num-batched-tokens", "1024",
+                    "--max-num-seqs", "64",
+                    "--pd-prefill-gpu", "2",
+                    "--pd-decode-gpus", "3",
+                    "--pd-prefill-batch-size", "4",
+                    "--pd-kv-slot-capacity-tokens", "8192",
+                ])
+
+        self.assertEqual(status, 0)
+        launch_config = build_runtime.call_args.args[0]
+        self.assertEqual(launch_config.mode, "pd-shared")
+        self.assertEqual(launch_config.model, model_dir)
+        self.assertEqual(launch_config.max_model_len, 2048)
+        self.assertEqual(launch_config.max_num_batched_tokens, 1024)
+        self.assertEqual(launch_config.max_num_seqs, 64)
+        self.assertEqual(launch_config.prefill_gpu, 2)
+        self.assertEqual(launch_config.decode_gpus, (3,))
+        self.assertEqual(launch_config.prefill_batch_size, 4)
+        self.assertEqual(launch_config.kv_slot_capacity_tokens, 8192)
+        runtime.start.assert_called_once_with()
+        create_app.assert_called_once_with(runtime, model_name="Qwen3-8B")
+        run_uvicorn.assert_called_once_with(app, host="0.0.0.0", port=18000)
+        runtime.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

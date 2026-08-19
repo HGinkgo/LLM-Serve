@@ -16,10 +16,16 @@ dependencies = [
     "ninja",
     "triton>=3.0.0",
     "transformers>=4.51.0,<5.0.0",
-    "accelerate>=1.0.0",
     "flash-attn",
     "packaging>=20.0",
     "xxhash",
+]
+
+[project.optional-dependencies]
+serve = [
+    "fastapi>=0.115,<1.0",
+    "httpx2>=2.0,<3.0",
+    "uvicorn[standard]>=0.30,<1.0",
 ]
 
 [project.scripts]
@@ -31,6 +37,3 @@ Homepage="https://github.com/HGinkgo/LLM-Serve"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["llmserve*", "benchmarks*"]
-
-[tool.setuptools.package-data]
-llmserve = ["layers/quantization/csrc/*.cu"]

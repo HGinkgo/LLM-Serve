@@ -241,6 +241,48 @@ class BenchmarkMetricTests(unittest.TestCase):
         self.assertIsNone(result["latency"]["overall"]["ttft"]["p50"])
         self.assertIsNone(result["goodput"])
 
+    def test_single_output_token_has_no_tpot_sample(self):
+        from benchmarks.metrics import summarize_serving_run
+
+        result = summarize_serving_run(
+            [{
+                "request_class": "short",
+                "prompt_tokens": 10,
+                "output_tokens": 1,
+                "success": True,
+                "arrival_time": 0.0,
+                "first_token_time": 1.0,
+                "token_times": [1.0],
+                "finish_time": 1.0,
+            }],
+            duration=1.0,
+            slo_ms={"ttft": 2000, "tpot": 1, "e2e": 2000},
+        )
+
+        self.assertEqual(result["latency"]["overall"]["tpot"]["count"], 0)
+        self.assertIsNone(result["latency"]["overall"]["tpot"]["p50"])
+        self.assertEqual(result["goodput"]["completed"], 1)
+
+    def test_streaming_summary_omits_e2e_latency(self):
+        from benchmarks.metrics import summarize_serving_run
+
+        result = summarize_serving_run(
+            [{
+                "request_class": "short",
+                "prompt_tokens": 10,
+                "output_tokens": 2,
+                "success": True,
+                "arrival_time": 0.0,
+                "first_token_time": 1.0,
+                "token_times": [1.0, 2.0],
+                "finish_time": 2.0,
+            }],
+            duration=1.0,
+            include_e2e=False,
+        )
+
+        self.assertNotIn("e2e", result["latency"]["overall"])
+
     def test_serving_summary_reports_cancellation_separately_from_failure(self):
         from benchmarks.metrics import summarize_serving_run
 

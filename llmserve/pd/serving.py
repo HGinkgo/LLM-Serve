@@ -762,6 +762,14 @@ class PDServingEngine:
                 decode_started_at,
                 decode_finished_at,
             )
+        emitted_token_ids_by_seq = {}
+        for decode_seq_id, token_ids in raw_events.get(
+            "emitted_token_ids_by_seq", {}
+        ).items():
+            request_id = self._active_by_decode_seq.get(decode_seq_id)
+            if request_id is not None:
+                emitted_token_ids_by_seq[request_id] = list(token_ids)
+
         outputs = []
         for decode_seq_id, token_ids in result.get("outputs", ()):
             request_id = self._active_by_decode_seq.pop(decode_seq_id, None)
@@ -781,6 +789,7 @@ class PDServingEngine:
             request["lifecycle"].transition(RequestState.FINISHED)
             outputs.append((request_id, list(token_ids)))
         events = deepcopy(raw_events)
+        events["emitted_token_ids_by_seq"] = emitted_token_ids_by_seq
         scheduled_ids = events.get("scheduled_seq_ids", ())
         events["scheduled_seq_ids"] = [
             self._active_by_decode_seq.get(seq_id, seq_id)
@@ -883,6 +892,7 @@ class PDServingEngine:
             self._admit_pending_handoff_batch_pool()
             active_worker_ids = self._active_decode_worker_ids()
             results = self.coordinator.decode_step_all(active_worker_ids)
+        emitted_token_ids_by_seq = {}
         outputs = []
         total_num_tokens = 0
         pooled_events = {}
@@ -892,6 +902,13 @@ class PDServingEngine:
             self._record_completed_transfers(result.get("completed_transfers") or ())
             raw_events = result.get("last_step_events") or {}
             pooled_events[worker_id] = deepcopy(raw_events)
+            for decode_seq_id, token_ids in raw_events.get(
+                "emitted_token_ids_by_seq", {}
+            ).items():
+                active_key = (worker_id, decode_seq_id)
+                request_id = self._active_by_decode_seq.get(active_key)
+                if request_id is not None:
+                    emitted_token_ids_by_seq[request_id] = list(token_ids)
             for decode_seq_id, token_ids in result.get("outputs", ()):
                 active_key = (worker_id, decode_seq_id)
                 request_id = self._active_by_decode_seq.pop(active_key, None)
@@ -914,6 +931,7 @@ class PDServingEngine:
         )
         self.last_step_events = {
             "decode_worker_events": pooled_events,
+            "emitted_token_ids_by_seq": emitted_token_ids_by_seq,
             "scheduled_seq_ids": [
                 request_id
                 for worker_id, events in pooled_events.items()

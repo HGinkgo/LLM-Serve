@@ -27,6 +27,30 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _gpu_ids(value: str) -> tuple[int, ...]:
+    try:
+        gpu_ids = tuple(_non_negative_int(item.strip()) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a comma-separated GPU id list") from error
+    if not gpu_ids:
+        raise argparse.ArgumentTypeError("must contain at least one GPU id")
+    return gpu_ids
+
+
+def _endpoints(value: str) -> tuple[str, ...]:
+    endpoints = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not endpoints:
+        raise argparse.ArgumentTypeError("must contain at least one endpoint")
+    return endpoints
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llmserve",
@@ -54,6 +78,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable CUDA Graph execution",
     )
     generate.set_defaults(handler=_run_generate)
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="start an OpenAI-compatible single-host HTTP service",
+    )
+    serve.add_argument("--model", required=True, help="local model directory")
+    serve.add_argument(
+        "--served-model-name",
+        help="model name exposed by the HTTP API (defaults to the directory name)",
+    )
+    serve.add_argument(
+        "--mode",
+        choices=("collocated", "pd-shared"),
+        default="collocated",
+        help="single-GPU Runtime or explicit Prefill/Decode Shared-KV deployment",
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=_positive_int, default=8000)
+    serve.add_argument("--max-model-len", type=_positive_int, default=4096)
+    serve.add_argument("--max-num-batched-tokens", type=_positive_int, default=1024)
+    serve.add_argument("--max-num-seqs", type=_positive_int, default=128)
+    serve.add_argument(
+        "--max-inflight-requests",
+        type=_positive_int,
+        help="service-level limit for queued and active requests (defaults to serving capacity)",
+    )
+    serve.add_argument(
+        "--request-timeout-seconds",
+        type=_positive_float,
+        help="optional end-to-end request deadline; expiry is enforced at an Engine step boundary",
+    )
+    serve.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    serve.add_argument("--disable-chunked-prefill", action="store_true")
+    serve.add_argument("--disable-kv-capacity-admission", action="store_true")
+    serve.add_argument("--enforce-eager", action="store_true")
+    serve.add_argument("--speculative-model", help="local EAGLE3 draft-model directory")
+    serve.add_argument("--speculative-gamma", type=_positive_int, default=3)
+    serve.add_argument("--pd-prefill-gpu", type=_non_negative_int, default=0)
+    serve.add_argument("--pd-decode-gpus", type=_gpu_ids, default=(1,))
+    serve.add_argument("--pd-prefill-batch-size", type=_positive_int, default=4)
+    serve.add_argument("--pd-kv-slot-count", type=_positive_int, default=2)
+    serve.add_argument(
+        "--pd-kv-slot-capacity-tokens",
+        type=_positive_int,
+        default=8192,
+    )
+    serve.add_argument(
+        "--pd-prefill-init-method",
+        default="tcp://127.0.0.1:24431",
+    )
+    serve.add_argument("--pd-decode-init-methods", type=_endpoints, default=())
+    serve.add_argument(
+        "--pd-startup-timeout-seconds",
+        type=_positive_float,
+        default=300.0,
+    )
+    serve.set_defaults(handler=_run_serve)
     return parser
 
 
@@ -182,6 +263,75 @@ def _run_generate(args: argparse.Namespace, stdout: TextIO) -> int:
     finally:
         llm.exit()
     print(outputs[0]["text"], file=stdout)
+    return 0
+
+
+def _build_service_runtime(launch_config):
+    from llmserve.service.factory import build_service_runtime
+
+    return build_service_runtime(launch_config)
+
+
+def _create_service_app(runtime, *, model_name: str):
+    from llmserve.service.api import create_app
+
+    return create_app(runtime, model_name=model_name)
+
+
+def _run_uvicorn(app, *, host: str, port: int):
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def _run_serve(args: argparse.Namespace, stdout: TextIO) -> int:
+    model_path = str(Path(args.model).expanduser())
+    if not Path(model_path).is_dir():
+        raise CLIError(f"model directory does not exist: {model_path}")
+    if not _cuda_is_available():
+        raise CLIError("CUDA is unavailable; run 'llmserve check' for details")
+
+    from llmserve.service.factory import ServiceLaunchConfig
+
+    try:
+        launch_config = ServiceLaunchConfig(
+            model=model_path,
+            mode=args.mode,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            max_inflight_requests=args.max_inflight_requests,
+            request_timeout_seconds=args.request_timeout_seconds,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_chunked_prefill=not args.disable_chunked_prefill,
+            enable_kv_capacity_admission=not args.disable_kv_capacity_admission,
+            enforce_eager=args.enforce_eager,
+            speculative_model=args.speculative_model,
+            speculative_gamma=args.speculative_gamma,
+            prefill_gpu=args.pd_prefill_gpu,
+            decode_gpus=tuple(args.pd_decode_gpus),
+            prefill_batch_size=args.pd_prefill_batch_size,
+            kv_slot_count=args.pd_kv_slot_count,
+            kv_slot_capacity_tokens=args.pd_kv_slot_capacity_tokens,
+            prefill_init_method=args.pd_prefill_init_method,
+            decode_init_methods=tuple(args.pd_decode_init_methods),
+            startup_timeout_seconds=args.pd_startup_timeout_seconds,
+        )
+    except ValueError as error:
+        raise CLIError(str(error)) from error
+
+    runtime = _build_service_runtime(launch_config)
+    try:
+        runtime.start()
+        served_model_name = args.served_model_name or Path(model_path).name
+        app = _create_service_app(runtime, model_name=served_model_name)
+        print(
+            f"serving {served_model_name} at http://{args.host}:{args.port}",
+            file=stdout,
+        )
+        _run_uvicorn(app, host=args.host, port=args.port)
+    finally:
+        runtime.close()
     return 0
 
 

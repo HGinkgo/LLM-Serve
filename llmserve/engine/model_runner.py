@@ -46,7 +46,6 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(
             hf_config,
-            quant_config=config.quant_config,
         )
         load_model(self.model, config.model)
         self.speculative_executor = SpeculativeExecutor(self)

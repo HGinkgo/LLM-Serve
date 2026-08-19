@@ -67,9 +67,6 @@ class BenchmarkSuiteTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in suite_paths},
             {
-                "awq-capacity-confirm.json",
-                "pd-phase-map-smoke.json",
-                "pd-resource-equivalent-formal.json",
                 "smoke.json",
                 "stage8-graph-formal.json",
             },
@@ -81,48 +78,6 @@ class BenchmarkSuiteTests(unittest.TestCase):
             self.assertEqual(
                 len({point["point_id"] for point in points}), len(points)
             )
-            if path.name == "awq-capacity-confirm.json":
-                self.assertEqual(suite["runs"], 3)
-                self.assertEqual(len(points), 12)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {48, 64, 96, 128},
-                )
-                self.assertTrue(all(
-                    point["warmup_seconds"] == 45
-                    and point["measurement_seconds"] == 120
-                    for point in points
-                ))
-                self.assertTrue(all(
-                    point["runtime"]["enable_kv_capacity_admission"]
-                    for point in points
-                ))
-            if path.name == "pd-phase-map-smoke.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 24)
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"dual-collocated", "pd-shared-1p1d"},
-                )
-                self.assertEqual(
-                    {point["request_rate"] for point in points}, {2, 4, 6}
-                )
-                self.assertTrue(all(
-                    point["warmup_seconds"] == 10
-                    and point["measurement_seconds"] == 20
-                    for point in points
-                ))
-            if path.name == "pd-resource-equivalent-formal.json":
-                self.assertEqual(suite["runs"], 1)
-                self.assertEqual(len(points), 6)
-                self.assertEqual(
-                    {point["max_concurrency"] for point in points},
-                    {64},
-                )
-                self.assertEqual(
-                    {point["variant"] for point in points},
-                    {"strong-collocated", "dual-collocated", "pd-shared"},
-                )
 
     def test_expand_suite_pairs_variants_with_identical_randomness(self):
         self.assertIsNotNone(importlib.util.find_spec("benchmarks.suite"))

@@ -54,8 +54,3 @@ def load_model(model: nn.Module, path: str):
             missing.append(param_name)
     if missing:
         raise RuntimeError(f"missing checkpoint parameters or shards: {missing}")
-
-    for module in model.modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is not None:
-            quant_method.process_weights_after_loading(module)

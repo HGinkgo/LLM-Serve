@@ -42,28 +42,6 @@ git diff --check
 
 Poisson 与 closed-loop suite 分别使用一张 RTX 3090；双卡只用于并行执行独立 suite，不是 tensor parallel。
 
-## AWQ 收口验证
-
-验证日期：2026-07-24。AWQ 容量结果对应 dirty source commit `b32ba391160fb21e020bbaa7df5f287f38705460`，公开 metadata 保留该事实。
-
-```bash
-CUDA_VISIBLE_DEVICES="" conda run -n LLM-Serve \
-  python -m unittest discover -s tests
-
-CUDA_VISIBLE_DEVICES=0 conda run -n LLM-Serve python -m unittest \
-  tests.test_awq_reference tests.test_awq_linear_backend \
-  tests.test_awq_linear_profile tests.test_awq_triton tests.test_awq_cuda \
-  tests.test_awq_quality tests.test_awq_quantizer \
-  tests.test_qwen3_awq_calibration tests.test_quantize_qwen3_awq_cli \
-  tests.test_linear_profile -v
-```
-
-结果：CPU 回归 `198 tests, skipped=15`；AWQ/CUDA/量化器定向回归 `61 tests`，零失败。`compileall`、`git diff --check` 和 AWQ 公开 CSV/JSON 自校验均以状态码 0 结束。
-
-- LLM-Serve 容量矩阵 BF16/AWQ 共 `24/24` points，零失败，每个 point 都有非零 latency cohort。
-- vLLM Marlin 控制实验共 `24/24` points，12 个 AWQ log 均确认 `awq_marlin`。
-- `awq-w4a16/` 未包含绝对模型路径、校准文本、checkpoint、逐层 cache 或原始日志。
-
 ## Stage 8 Target Verify CUDA Graph
 
 验证日期：2026-07-29。正式 Graph 对照对应 commit `3bb5d21ad5fd9ae0044943d93255a4542cc5ca75`，使用 Qwen3-8B、EAGLE3 draft、RTX 3090 和 CUDA 12.8。
@@ -85,3 +63,16 @@ CUDA_VISIBLE_DEVICES=0 conda run -n LLM-Serve python -m unittest \
 - 9 个 shared points 均未触发 inline fallback；每个 run 最终为 `free_slots=2`、`pending_transfers=0`，无 OOM、worker timeout 或 Graph capture failure。
 - 18 个公开 run 删除重复的 request records 和 per-batch timing detail，保留 suite 聚合指标、Queue/slot samples、Graph counters 与 worker health；扫描未发现绝对路径、prompt token IDs、traceback 或凭据。
 - 合并前 CPU 回归：`274 tests, skipped=5, OK`；真实双卡 4-request smoke 的 token IDs 与 inline 基线完全一致。
+
+## Service Overload Governance
+
+验证日期：2026-08-19。正式结果对应 dirty source commit
+`f64e8f0b1e1c2bee6520888abc2a01976286eb2e`，使用 Qwen3-8B、单张 RTX 3090、CUDA 12.8。
+
+- `service-overload-governance/summary.csv`：固定 trace 的 `unbounded` 与 `limit-64` 两个
+  points，`2/2` 完成，trace seed `20260818`，trace hash
+  `ad9598cb2100149a164484be4ec4dfed9c493c063fec4c06fc59e14c298ba972`。
+- 服务基准直接驱动 `EngineServiceRuntime`；指标契约只包含输出/请求吞吐、TTFT、TPOT、
+  队列分位数和 admission outcomes，E2E、goodput 与 HTTP 网络开销不在该结果中。
+- 本次运行后 GPU1 回到 3 MiB、0% 利用率；GPU0 的外部 PID 770954 仍占用约 350 MiB，
+  与本次 benchmark 无关。
