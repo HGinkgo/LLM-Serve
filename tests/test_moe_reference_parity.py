@@ -35,6 +35,7 @@ class MoeReferenceParityTest(unittest.TestCase):
             "seed": 7,
             "candidate_gptq_backend": "marlin",
             "candidate_marlin_library": "/opt/vllm/_C.abi3.so",
+            "candidate_enable_gate_up_fusion": True,
         }
 
         with patch("llmserve.LLM", FakeEngine):
@@ -46,6 +47,7 @@ class MoeReferenceParityTest(unittest.TestCase):
             calls["kwargs"]["marlin_library"],
             "/opt/vllm/_C.abi3.so",
         )
+        self.assertTrue(calls["kwargs"]["enable_moe_gate_up_fusion"])
         self.assertTrue(calls["exited"])
         self.assertEqual(result["cases"][0]["generated_token_ids"], [101, 102])
 

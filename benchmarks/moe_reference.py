@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 from benchmarks.environment import atomic_write_json
+from benchmarks.moe_baseline import build_moe_experiment_metadata, build_vllm_marlin_baseline
 
 DEFAULT_PROMPT = "What is 2 + 2?"
 
@@ -264,6 +265,9 @@ def _run_llmserve_worker(payload: dict) -> dict:
         random_seed=payload["seed"],
         gptq_backend=payload.get("candidate_gptq_backend", "tinygemm"),
         marlin_library=payload.get("candidate_marlin_library"),
+        enable_moe_gate_up_fusion=bool(
+            payload.get("candidate_enable_gate_up_fusion", False)
+        ),
     )
     try:
         engine.model_runner.sampler = _ArgmaxSampler()
@@ -372,6 +376,7 @@ def run_comparison(args: argparse.Namespace) -> dict:
         "candidate_marlin_library": (
             None if candidate_marlin_library is None else str(candidate_marlin_library)
         ),
+        "candidate_enable_gate_up_fusion": args.candidate_enable_gate_up_fusion,
     }
 
     with tempfile.TemporaryDirectory(prefix="llmserve-moe-reference-") as directory:
@@ -406,6 +411,15 @@ def run_comparison(args: argparse.Namespace) -> dict:
         "schema_version": 1,
         "model": str(model),
         "reference_package_dir": str(reference_package_dir),
+        **build_moe_experiment_metadata(
+            optimization="moe_gate_up_fusion",
+            enabled=args.candidate_enable_gate_up_fusion,
+            baseline=build_vllm_marlin_baseline(
+                source=reference_package_dir,
+                runtime_version=reference.get("runtime_version"),
+                role="external_reference_and_token_baseline",
+            ),
+        ),
         "input": {
             "case_count": len(prompt_cases),
             "cases": [
@@ -431,6 +445,7 @@ def run_comparison(args: argparse.Namespace) -> dict:
             "candidate_marlin_library": (
                 None if candidate_marlin_library is None else str(candidate_marlin_library)
             ),
+            "candidate_enable_gate_up_fusion": args.candidate_enable_gate_up_fusion,
         },
         "reference": reference,
         "candidate": candidate,
@@ -457,6 +472,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="tinygemm",
     )
     parser.add_argument("--candidate-marlin-library")
+    parser.add_argument(
+        "--candidate-enable-gate-up-fusion",
+        action="store_true",
+        help="enable the experimental fused Gate/Up projection in the candidate",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 

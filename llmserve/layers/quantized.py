@@ -8,6 +8,7 @@ from threading import Lock
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 
 
 GPTQ_PACK_FACTOR = 8
@@ -220,6 +221,113 @@ class GPTQLinear(nn.Module):
     def num_groups(self) -> int:
         return self.input_size // self.group_size
 
+    def configure_output_shards(self, shard_sizes: dict[str, int]) -> None:
+        """Configure checkpoint loaders for output-column shards.
+
+        GPTQ qweight/scales use output features as their second dimension,
+        while qzeros packs eight output features per column. The loader keeps
+        both layouts aligned without materializing separate source modules.
+        """
+        if not shard_sizes or sum(shard_sizes.values()) != self.output_size:
+            raise ValueError("GPTQ output shard sizes must sum to output_size")
+        if any(size % GPTQ_PACK_FACTOR for size in shard_sizes.values()):
+            raise ValueError("GPTQ output shard sizes must be divisible by 8")
+        self.output_shard_sizes = tuple(shard_sizes.items())
+        expected_shards = tuple(shard_sizes)
+        for parameter in (self.qweight, self.qzeros, self.scales, self.g_idx):
+            parameter.weight_loader = self.weight_loader
+            parameter.expected_shard_ids = expected_shards
+
+    def weight_loader(
+        self,
+        parameter: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str,
+    ) -> None:
+        if not hasattr(self, "output_shard_sizes"):
+            raise ValueError("GPTQ output shard loader is not configured")
+        offset = 0
+        shard_size = None
+        for shard_id, size in self.output_shard_sizes:
+            if shard_id == loaded_shard_id:
+                shard_size = size
+                break
+            offset += size
+        if shard_size is None:
+            raise ValueError(f"unknown GPTQ output shard: {loaded_shard_id}")
+
+        if parameter is self.qweight or parameter is self.scales:
+            target = parameter.data.narrow(1, offset, shard_size)
+        elif parameter is self.qzeros:
+            target = parameter.data.narrow(
+                1,
+                offset // GPTQ_PACK_FACTOR,
+                shard_size // GPTQ_PACK_FACTOR,
+            )
+        elif parameter is self.g_idx:
+            if tuple(loaded_weight.shape) != (self.input_size,):
+                raise ValueError("unexpected GPTQ g_idx shard shape")
+            parameter.data.copy_(loaded_weight)
+            return
+        else:
+            raise ValueError("unexpected parameter for GPTQ output shard loader")
+        if tuple(loaded_weight.shape) != tuple(target.shape):
+            raise ValueError(
+                f"unexpected GPTQ shard shape: expected {tuple(target.shape)}, "
+                f"got {tuple(loaded_weight.shape)}"
+            )
+        target.copy_(loaded_weight)
+
+    @classmethod
+    @torch.no_grad()
+    def concatenate_output(cls, first: "GPTQLinear", second: "GPTQLinear") -> "GPTQLinear":
+        """Concatenate two unprepared GPTQ linears along their output axis."""
+        if first.input_size != second.input_size:
+            raise ValueError("GPTQ linears must have the same input size")
+        if first.group_size != second.group_size:
+            raise ValueError("GPTQ linears must have the same group size")
+        if first.backend != second.backend:
+            raise ValueError("GPTQ linears must use the same backend")
+        if first.marlin_library != second.marlin_library:
+            raise ValueError("GPTQ Marlin linears must use the same provider library")
+        if bool(first.runtime_ready) or bool(second.runtime_ready):
+            raise RuntimeError("cannot concatenate prepared GPTQ linears")
+        if not torch.equal(first.g_idx, second.g_idx):
+            raise ValueError("GPTQ linears must use the same contiguous group mapping")
+
+        source_device = first.qweight.device
+        if second.qweight.device != source_device:
+            raise ValueError("GPTQ linears must be on the same device")
+        # Model construction runs with CUDA as the default device. Move this
+        # pair to CPU first so the target fused module does not overlap both
+        # source GPU allocations while the full checkpoint is resident.
+        for linear in (first, second):
+            for name in ("qweight", "qzeros", "scales", "g_idx"):
+                parameter = getattr(linear, name)
+                parameter.data = parameter.detach().cpu()
+        with torch.device("cpu"):
+            fused = cls(
+                first.input_size,
+                first.output_size + second.output_size,
+                group_size=first.group_size,
+                backend=first.backend,
+                marlin_library=first.marlin_library,
+            )
+        fused.qweight = nn.Parameter(
+            torch.cat((first.qweight, second.qweight), dim=1).contiguous(),
+            requires_grad=False,
+        )
+        fused.qzeros = nn.Parameter(
+            torch.cat((first.qzeros, second.qzeros), dim=1).contiguous(),
+            requires_grad=False,
+        )
+        fused.scales = nn.Parameter(
+            torch.cat((first.scales, second.scales), dim=1).contiguous(),
+            requires_grad=False,
+        )
+        fused.g_idx = nn.Parameter(first.g_idx.detach().clone(), requires_grad=False)
+        return fused
+
     def validate_group_mapping(self) -> None:
         expected = torch.arange(
             self.input_size,
@@ -351,34 +459,36 @@ class GPTQLinear(nn.Module):
                 f"expected hidden size {self.input_size}, got {original_shape[-1]}"
             )
         if self.backend == "tinygemm":
-            inputs = hidden_states.reshape(-1, self.input_size).to(torch.bfloat16).contiguous()
-            output = torch.ops.aten._weight_int4pack_mm(
-                inputs,
-                self.packed_weight,
-                self.group_size,
-                self.scales_and_zeros,
-            )
+            with record_function("llmserve.gptq.tinygemm"):
+                inputs = hidden_states.reshape(-1, self.input_size).to(torch.bfloat16).contiguous()
+                output = torch.ops.aten._weight_int4pack_mm(
+                    inputs,
+                    self.packed_weight,
+                    self.group_size,
+                    self.scales_and_zeros,
+                )
         else:
-            inputs = hidden_states.reshape(-1, self.input_size).to(
-                self.marlin_scales.dtype,
-            ).contiguous()
-            output = torch.ops._C.gptq_marlin_gemm(
-                inputs,
-                None,
-                self.marlin_weight,
-                self.marlin_scales,
-                None,
-                self.marlin_empty,
-                self.marlin_empty,
-                self.marlin_empty,
-                self.marlin_workspace,
-                VLLM_UINT4B8_TYPE_ID,
-                inputs.shape[0],
-                self.output_size,
-                self.input_size,
-                True,
-                False,
-                True,
-                False,
-            )
+            with record_function("llmserve.gptq.marlin"):
+                inputs = hidden_states.reshape(-1, self.input_size).to(
+                    self.marlin_scales.dtype,
+                ).contiguous()
+                output = torch.ops._C.gptq_marlin_gemm(
+                    inputs,
+                    None,
+                    self.marlin_weight,
+                    self.marlin_scales,
+                    None,
+                    self.marlin_empty,
+                    self.marlin_empty,
+                    self.marlin_empty,
+                    self.marlin_workspace,
+                    VLLM_UINT4B8_TYPE_ID,
+                    inputs.shape[0],
+                    self.output_size,
+                    self.input_size,
+                    True,
+                    False,
+                    True,
+                    False,
+                )
         return output.reshape(*original_shape[:-1], self.output_size).to(hidden_states.dtype)

@@ -5,6 +5,8 @@
 - `stage8-graph-formal/`：EAGLE Target Verify CUDA Graph 对照。
 - `service-overload-governance/`：固定 Poisson trace 下无界入队与 64-request admission
   bound 的单机服务治理对照，只报告输出/请求吞吐、TTFT、TPOT、队列和 admission outcomes。
+- `moe-gate-up-fusion/`：Qwen3-30B-A3B GPTQ-Int4 单卡 MoE 的 Marlin baseline 与 Gate/Up
+  fusion A/B 对照，记录 token parity、吞吐和 kernel/profile 证据。
 
 早期非 Chunked 单卡基线、Inline Queue 对照、双 Collocated 实验运行时和旧的有限
 请求 Poisson 数据均已移除。它们不能代表当前强 Collocated 基线或 Shared KV 默认路径。

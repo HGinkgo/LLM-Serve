@@ -3,6 +3,26 @@ import unittest
 
 class MoeBackendBenchmarkTest(unittest.TestCase):
 
+    def test_vllm_marlin_baseline_provenance_is_explicit(self):
+        from benchmarks.moe_baseline import (
+            build_moe_experiment_metadata,
+            build_vllm_marlin_baseline,
+        )
+
+        baseline = build_vllm_marlin_baseline(
+            source="/opt/.reference-vllm-0.9.1/vllm/_C.abi3.so"
+        )
+        report_metadata = build_moe_experiment_metadata(
+            optimization="moe_gate_up_fusion",
+            enabled=True,
+            baseline=baseline,
+        )
+
+        self.assertEqual(baseline["runtime"], "vllm")
+        self.assertEqual(baseline["backend"], "gptq_marlin")
+        self.assertEqual(baseline["runtime_version"], "0.9.1")
+        self.assertTrue(report_metadata["optimization"]["enabled"])
+
     def test_parse_backends_deduplicates_and_rejects_unknown_values(self):
         from benchmarks.moe_backend import parse_backends
 
@@ -27,6 +47,23 @@ class MoeBackendBenchmarkTest(unittest.TestCase):
         self.assertEqual(kwargs["gptq_backend"], "marlin")
         self.assertEqual(kwargs["marlin_library"], "/opt/vllm/_C.abi3.so")
         self.assertTrue(kwargs["enforce_eager"])
+        self.assertFalse(kwargs["enable_moe_gate_up_fusion"])
+
+    def test_build_engine_kwargs_can_enable_gate_up_fusion_for_ab(self):
+        from benchmarks.moe_backend import build_engine_kwargs
+
+        kwargs = build_engine_kwargs(
+            {
+                "max_model_len": 512,
+                "max_num_batched_tokens": 128,
+                "max_num_seqs": 4,
+                "gpu_memory_utilization": 0.85,
+                "enable_moe_gate_up_fusion": True,
+            },
+            backend="tinygemm",
+        )
+
+        self.assertTrue(kwargs["enable_moe_gate_up_fusion"])
 
     def test_summarize_batch_metrics_uses_last_token_for_tpot(self):
         from benchmarks.moe_backend import summarize_batch_metrics

@@ -30,6 +30,7 @@ class Config:
     random_seed: int | None = None
     gptq_backend: str = "tinygemm"
     marlin_library: str | None = None
+    enable_moe_gate_up_fusion: bool = False
     hf_config: AutoConfig | None = None
     quantization: GPTQConfig | None = None
     eos: int = -1

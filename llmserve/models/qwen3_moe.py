@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 
 from llmserve.layers.attention import Attention
 from llmserve.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -86,14 +87,52 @@ class Qwen3MoeAttention(nn.Module):
 
 class Qwen3MoeExpert(nn.Module):
 
-    def __init__(self, hidden_size: int, intermediate_size: int, group_size: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        group_size: int,
+        *,
+        fuse_gate_up: bool = False,
+    ) -> None:
         super().__init__()
-        self.gate_proj = GPTQLinear(hidden_size, intermediate_size, group_size=group_size)
-        self.up_proj = GPTQLinear(hidden_size, intermediate_size, group_size=group_size)
+        if fuse_gate_up:
+            self.gate_up_proj = GPTQLinear(
+                hidden_size,
+                intermediate_size * 2,
+                group_size=group_size,
+            )
+            self.gate_up_proj.configure_output_shards({
+                "gate": intermediate_size,
+                "up": intermediate_size,
+            })
+        else:
+            self.gate_proj = GPTQLinear(hidden_size, intermediate_size, group_size=group_size)
+            self.up_proj = GPTQLinear(hidden_size, intermediate_size, group_size=group_size)
         self.down_proj = GPTQLinear(intermediate_size, hidden_size, group_size=group_size)
 
+    @torch.no_grad()
+    def fuse_gate_up(self) -> None:
+        if hasattr(self, "gate_up_proj"):
+            return
+        source_device = self.gate_proj.qweight.device
+        fused = GPTQLinear.concatenate_output(self.gate_proj, self.up_proj)
+        del self.gate_proj
+        del self.up_proj
+        if source_device.type == "cuda":
+            torch.cuda.empty_cache()
+        for name in ("qweight", "qzeros", "scales", "g_idx"):
+            parameter = getattr(fused, name)
+            parameter.data = parameter.detach().to(device=source_device)
+        self.gate_up_proj = fused
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        if hasattr(self, "gate_up_proj"):
+            gate, up = self.gate_up_proj(hidden_states).chunk(2, dim=-1)
+        else:
+            gate = self.gate_proj(hidden_states)
+            up = self.up_proj(hidden_states)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -103,7 +142,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     semantics explicit while quantized GEMMs use the native CUDA provider.
     """
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, enable_gate_up_fusion: bool = False) -> None:
         super().__init__()
         group_size = config.quantization_config["group_size"]
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
@@ -113,46 +152,58 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             normalize_topk=config.norm_topk_prob,
         )
         self.experts = nn.ModuleList([
-            Qwen3MoeExpert(config.hidden_size, config.moe_intermediate_size, group_size)
+            Qwen3MoeExpert(
+                config.hidden_size,
+                config.moe_intermediate_size,
+                group_size,
+                fuse_gate_up=enable_gate_up_fusion,
+            )
             for _ in range(config.num_experts)
         ])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        routing_weights, expert_ids = self.router(hidden_states, self.gate.weight)
+        with record_function("llmserve.moe.router"):
+            routing_weights, expert_ids = self.router(hidden_states, self.gate.weight)
         num_tokens, top_k = expert_ids.shape
-        flat_experts = expert_ids.reshape(-1)
-        flat_tokens = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
-        flat_weights = routing_weights.reshape(-1)
-        order = flat_experts.argsort(stable=True)
-        sorted_experts = flat_experts.index_select(0, order)
-        sorted_tokens = flat_tokens.index_select(0, order)
-        sorted_weights = flat_weights.index_select(0, order)
-        active_experts, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
-        # The current one-GPU implementation dispatches each active expert from
-        # Python. Move both grouping vectors together to avoid two device syncs.
-        groups = torch.stack((active_experts, counts), dim=1).tolist()
+        with record_function("llmserve.moe.dispatch"):
+            flat_experts = expert_ids.reshape(-1)
+            flat_tokens = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+            flat_weights = routing_weights.reshape(-1)
+            order = flat_experts.argsort(stable=True)
+            sorted_experts = flat_experts.index_select(0, order)
+            sorted_tokens = flat_tokens.index_select(0, order)
+            sorted_weights = flat_weights.index_select(0, order)
+            active_experts, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
+            # The current one-GPU implementation dispatches each active expert from
+            # Python. Move both grouping vectors together to avoid two device syncs.
+            groups = torch.stack((active_experts, counts), dim=1).tolist()
 
         output = torch.zeros_like(hidden_states)
         offset = 0
-        for expert_id, count in groups:
-            next_offset = offset + count
-            token_ids = sorted_tokens[offset:next_offset]
-            expert_output = self.experts[expert_id](hidden_states.index_select(0, token_ids))
-            output.index_add_(
-                0,
-                token_ids,
-                expert_output * sorted_weights[offset:next_offset].unsqueeze(-1),
-            )
-            offset = next_offset
+        with record_function("llmserve.moe.expert_loop"):
+            for expert_id, count in groups:
+                next_offset = offset + count
+                token_ids = sorted_tokens[offset:next_offset]
+                expert_output = self.experts[expert_id](hidden_states.index_select(0, token_ids))
+                with record_function("llmserve.moe.combine"):
+                    output.index_add_(
+                        0,
+                        token_ids,
+                        expert_output * sorted_weights[offset:next_offset].unsqueeze(-1),
+                    )
+                offset = next_offset
         return output
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, enable_gate_up_fusion: bool = False) -> None:
         super().__init__()
         self.self_attn = Qwen3MoeAttention(config)
-        self.mlp = Qwen3MoeSparseMoeBlock(config)
+        self.mlp = Qwen3MoeSparseMoeBlock(
+            config,
+            enable_gate_up_fusion=enable_gate_up_fusion,
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -173,11 +224,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 class Qwen3MoeModel(nn.Module):
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, enable_gate_up_fusion: bool = False) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen3MoeDecoderLayer(config)
+            Qwen3MoeDecoderLayer(
+                config,
+                enable_gate_up_fusion=enable_gate_up_fusion,
+            )
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -199,10 +253,19 @@ class Qwen3MoeForCausalLM(nn.Module):
         *,
         gptq_backend: str = "tinygemm",
         marlin_library: str | None = None,
+        enable_moe_gate_up_fusion: bool = False,
     ) -> None:
         super().__init__()
-        self.model = Qwen3MoeModel(config)
+        self.enable_moe_gate_up_fusion = bool(enable_moe_gate_up_fusion)
+        self.model = Qwen3MoeModel(
+            config,
+            enable_gate_up_fusion=self.enable_moe_gate_up_fusion,
+        )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.packed_modules_mapping = ({
+            "gate_proj": ("gate_up_proj", "gate"),
+            "up_proj": ("gate_up_proj", "up"),
+        } if self.enable_moe_gate_up_fusion else {})
         for module in self.modules():
             if isinstance(module, GPTQLinear):
                 module.configure_backend(gptq_backend, marlin_library)
@@ -212,6 +275,10 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     @torch.no_grad()
     def prepare_for_runtime(self) -> None:
+        if self.enable_moe_gate_up_fusion:
+            for module in tuple(self.modules()):
+                if isinstance(module, Qwen3MoeExpert) and hasattr(module, "gate_proj"):
+                    module.fuse_gate_up()
         for module in self.modules():
             if isinstance(module, GPTQLinear):
                 module.prepare_for_runtime()

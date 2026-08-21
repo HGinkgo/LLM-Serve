@@ -59,6 +59,7 @@ class ModelRunner:
                 hf_config,
                 gptq_backend=config.gptq_backend,
                 marlin_library=config.marlin_library,
+                enable_moe_gate_up_fusion=config.enable_moe_gate_up_fusion,
             )
         load_model(self.model, config.model)
         if config.quantization is not None:

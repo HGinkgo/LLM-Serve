@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "validation_date": "2026-08-20",
+  "source_commit": "578feb19a506aa3850227bd81b579104e3915d80",
+  "source_worktree_dirty": true,
+  "model": "Qwen3-30B-A3B-GPTQ-Int4",
+  "visible_gpu": "1",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "torch_version": "2.7.1+cu128",
+  "cuda_runtime": "12.8",
+  "baseline": {
+    "runtime": "vllm",
+    "runtime_version": "0.9.1",
+    "backend": "gptq_marlin",
+    "role": "external_reference_and_token_baseline",
+    "provider": "/root/hpf/workspace/LLM-Serving/.reference-vllm-0.9.1/vllm/_C.abi3.so"
+  },
+  "optimization": {
+    "name": "moe_gate_up_fusion",
+    "control": "enable_moe_gate_up_fusion=false",
+    "optimized": "enable_moe_gate_up_fusion=true"
+  },
+  "workload": {
+    "prompt_cases": 5,
+    "prompt_token_sha256": "f89b7f00654ccab42d3be2c1f1eb486df8343ae6724f91a5e8139064d2a337ae",
+    "seed": 20260819,
+    "batch_sizes": [1, 4],
+    "repeats": 3,
+    "max_new_tokens": 16,
+    "max_model_len": 512,
+    "max_num_batched_tokens": 128,
+    "gpu_memory_utilization": 0.85
+  },
+  "raw_local_directory": "experiment-data/2026-08-20_moe-gate-up-fusion-r1",
+  "raw_files": {
+    "unfused.json": "5df6fbd80d0d9b84da66c2fbeb0713e1e3dbbb3a52709a464e232e0c8f412f20",
+    "fused.json": "c21896e4db999e23a9b73134fea8d07852224c9c3be6d8f534f77f97eb1f9c36",
+    "summary.json": "cbcb1a4e1b26c13bbe0d6137e09cd7c9b81e2fe44073e4e576490e8c47e5fc66"
+  },
+  "profile": {
+    "raw_local_directory": "experiment-data/2026-08-20_moe-gate-up-profile-r1",
+    "backend": "marlin",
+    "batch_size": 4,
+    "max_new_tokens": 4,
+    "warmup_tokens": 2,
+    "control_fusion": false,
+    "optimized_fusion": true,
+    "control_json_sha256": "c7faa108167f373e62b6d73d0aaa7b497ab20623b783ce71155b49bf646a4da2",
+    "optimized_json_sha256": "dfcbf13027976569c405cb3bdc5431788a6431e7545e3bf572832bd8b6dfb03b",
+    "control_trace_sha256": "53970842f8c3abccd9375ae2ddfe9c41806a6b0daafa1190e5b7e3055d89454b",
+    "optimized_trace_sha256": "37659b0f1e97b7e7b424aff4f412e560ec11e0721a99991d5b5443f04491806f",
+    "marlin_calls": {"control": 24489, "optimized": 16580},
+    "marlin_cuda_ms": {"control": 247.313422, "optimized": 149.341199},
+    "expert_loop_cuda_ms": {"control": 5862.38325, "optimized": 4629.169277},
+    "dispatch_cuda_ms": {"control": 70.392111, "optimized": 69.820088},
+    "combine_cuda_ms": {"control": 196.68197, "optimized": 189.607507}
+  },
+  "metrics_contract": [
+    "output_throughput",
+    "request_throughput",
+    "ttft_p50_p99",
+    "tpot_p50_p99",
+    "peak_allocated_bytes",
+    "peak_reserved_bytes"
+  ]
+}

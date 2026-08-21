@@ -11,7 +11,11 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from llmserve.quantization.gptq import GPTQConfig
-from llmserve.models.qwen3_moe import ExpertRouter, Qwen3MoeSparseMoeBlock
+from llmserve.models.qwen3_moe import (
+    ExpertRouter,
+    Qwen3MoeExpert,
+    Qwen3MoeSparseMoeBlock,
+)
 from llmserve.config import Config
 from llmserve.layers.quantized import (
     GPTQLinear,
@@ -243,6 +247,128 @@ class SparseMoeBlockTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output[:, 0], expected_scale))
         self.assertTrue(torch.equal(output[:, 1:], torch.zeros(2, 127)))
+
+
+class Qwen3MoeExpertTest(unittest.TestCase):
+
+    def test_fused_expert_loads_gate_up_checkpoint_shards_directly(self):
+        class Module(nn.Module):
+            packed_modules_mapping = {
+                "gate_proj": ("gate_up_proj", "gate"),
+                "up_proj": ("gate_up_proj", "up"),
+            }
+
+            def __init__(self):
+                super().__init__()
+                self.expert = Qwen3MoeExpert(
+                    hidden_size=8,
+                    intermediate_size=8,
+                    group_size=4,
+                    fuse_gate_up=True,
+                )
+
+        checkpoint = {}
+        for projection, qweight_value, scale_value in (
+            ("gate_proj", 0x11111111, 0.25),
+            ("up_proj", 0x22222222, 0.5),
+        ):
+            checkpoint[f"expert.{projection}.qweight"] = torch.full(
+                (1, 8), qweight_value, dtype=torch.int32
+            )
+            checkpoint[f"expert.{projection}.qzeros"] = torch.zeros(
+                (2, 1), dtype=torch.int32
+            )
+            checkpoint[f"expert.{projection}.scales"] = torch.full(
+                (2, 8), scale_value
+            )
+            checkpoint[f"expert.{projection}.g_idx"] = torch.tensor(
+                [0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32
+            )
+        checkpoint.update({
+            "expert.down_proj.qweight": torch.zeros((1, 8), dtype=torch.int32),
+            "expert.down_proj.qzeros": torch.zeros((2, 1), dtype=torch.int32),
+            "expert.down_proj.scales": torch.ones((2, 8)),
+            "expert.down_proj.g_idx": torch.tensor(
+                [0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32
+            ),
+        })
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            save_file(checkpoint, f"{model_dir}/model.safetensors")
+            module = Module()
+            load_model(module, model_dir)
+
+        fused = module.expert.gate_up_proj
+        self.assertEqual(fused.output_size, 16)
+        self.assertTrue(torch.equal(
+            fused.qweight,
+            torch.cat((checkpoint["expert.gate_proj.qweight"], checkpoint["expert.up_proj.qweight"]), dim=1),
+        ))
+        self.assertTrue(torch.equal(
+            fused.scales,
+            torch.cat((checkpoint["expert.gate_proj.scales"], checkpoint["expert.up_proj.scales"]), dim=1),
+        ))
+        self.assertFalse(hasattr(module.expert, "gate_proj"))
+        self.assertFalse(hasattr(module.expert, "up_proj"))
+
+    def test_fuse_gate_up_preserves_reference_output_and_checkpoint_layout(self):
+        expert = Qwen3MoeExpert(hidden_size=128, intermediate_size=128, group_size=128)
+        expert.gate_proj.qweight.data.fill_(0x11111111)
+        expert.up_proj.qweight.data.fill_(0x22222222)
+        expert.gate_proj.qzeros.data.zero_()
+        expert.up_proj.qzeros.data.zero_()
+        expert.gate_proj.scales.data.fill_(0.25)
+        expert.up_proj.scales.data.fill_(0.5)
+        expert.down_proj.qweight.data.fill_(0x11111111)
+        expert.down_proj.qzeros.data.zero_()
+        expert.down_proj.scales.data.fill_(0.25)
+        hidden_states = torch.randn(3, 128)
+
+        expected = expert(hidden_states)
+        expected_qweight = torch.cat(
+            (expert.gate_proj.qweight, expert.up_proj.qweight), dim=1
+        )
+        expected_qzeros = torch.cat(
+            (expert.gate_proj.qzeros, expert.up_proj.qzeros), dim=1
+        )
+        expected_scales = torch.cat(
+            (expert.gate_proj.scales, expert.up_proj.scales), dim=1
+        )
+
+        expert.fuse_gate_up()
+        actual = expert(hidden_states)
+
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertFalse(hasattr(expert, "gate_proj"))
+        self.assertFalse(hasattr(expert, "up_proj"))
+        self.assertEqual(expert.gate_up_proj.output_size, 256)
+        self.assertTrue(torch.equal(expert.gate_up_proj.qweight, expected_qweight))
+        self.assertTrue(torch.equal(expert.gate_up_proj.qzeros, expected_qzeros))
+        self.assertTrue(torch.equal(expert.gate_up_proj.scales, expected_scales))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and os.environ.get("LLMSERVE_TEST_GPTQ_MOE_MODEL"),
+        "set LLMSERVE_TEST_GPTQ_MOE_MODEL and make CUDA available",
+    )
+    def test_real_expert_gate_up_fusion_matches_tinygemm_runtime(self):
+        model_file = Path(os.environ["LLMSERVE_TEST_GPTQ_MOE_MODEL"]) / "model.safetensors"
+        expert = Qwen3MoeExpert(2048, 768, 128).cuda()
+        with safe_open(str(model_file), framework="pt", device="cpu") as checkpoint:
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                module = getattr(expert, projection)
+                prefix = f"model.layers.0.mlp.experts.0.{projection}"
+                for name in ("qweight", "qzeros", "scales", "g_idx"):
+                    getattr(module, name).data.copy_(checkpoint.get_tensor(f"{prefix}.{name}"))
+
+        hidden_states = torch.randn(3, 2048, dtype=torch.float16, device="cuda")
+        reference = expert(hidden_states)
+        expert.fuse_gate_up()
+        for module in expert.modules():
+            if isinstance(module, GPTQLinear):
+                module.prepare_for_runtime()
+        actual = expert(hidden_states)
+
+        self.assertTrue(torch.allclose(actual, reference, rtol=3e-2, atol=3e-2))
 
 
 class GPTQLinearTest(unittest.TestCase):
